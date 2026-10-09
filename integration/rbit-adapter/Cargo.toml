@@ -1,0 +1,12 @@
+[package]
+name = "templartorrent-rbit-adapter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[dependencies]
+rbit = "=0.2.2"
+templartorrent-core = { path = "../../crates/templartorrent-core" }
+
+[workspace]

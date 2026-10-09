@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/templartorrent-core", "crates/templartorrent-simd", "crates/templartorrent-bench"]
+# These are separate workspaces so policy tests do not fetch GUI/network dependencies.
+exclude = ["integration/rbit-adapter", "integration/pixelkit-preview"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"

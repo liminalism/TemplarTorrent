@@ -1,0 +1,13 @@
+/target/
+/integration/*/target/
+*.mmdb
+*.ttf
+*.otf
+*.torrent
+perf-results/
+
+
+# AKR: a rebuildable cache and disposable agent notes.
+.akr/cache/
+.agent/scratch/
+.agent/handoffs/

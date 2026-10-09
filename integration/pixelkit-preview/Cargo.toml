@@ -1,0 +1,22 @@
+[package]
+name = "templartorrent-preview"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[dependencies]
+templartorrent-core = { path = "../../crates/templartorrent-core" }
+pixelkit-raster = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-shell = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-text = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-ui = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-windowing = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

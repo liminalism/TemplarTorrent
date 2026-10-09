@@ -1,0 +1,28 @@
+name: Rust reference checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  policies:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt
+      - name: Policy and SIMD tests
+        run: cargo +1.99.0 test --workspace
+      - name: Lints
+        run: cargo +1.99.0 clippy --workspace --all-targets
+      - name: rbit adapter tests
+        run: cargo +1.99.0 test --manifest-path integration/rbit-adapter/Cargo.toml
+      - name: PixelKit API compile check
+        run: cargo +1.99.0 check --manifest-path integration/pixelkit-preview/Cargo.toml
+# This is a proposed workflow, not evidence of a successful CI run.
+# Resolve/pin dependency lockfiles and required OS development packages on the
+# actual runner. Add headful UI and local-swarm jobs as the production engine lands.

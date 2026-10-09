@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TemplarTorrent
+Comment=Lightweight BitTorrent downloads
+Exec=templartorrent -- %U
+TryExec=templartorrent
+Icon=templartorrent
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=application/x-bittorrent;x-scheme-handler/magnet;
+StartupNotify=true
