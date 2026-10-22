@@ -393,7 +393,7 @@ record templartorrent.observation.complete-piece-status/11 : observation {
 
 record templartorrent.observation.complete-piece-status/12 : observation {
     title "Linux client writes layout and resume on close and pastes a magnet; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22, Linux x86_64 Ubuntu 26.04.1, kernel 7.0.0-31-generic, rustc 1.99.0, WAYLAND_DISPLAY=wayland-0, DISPLAY empty, committed on master at 66c3fea. App::on_exit, the method PixelKit close_slot calls, after one 960 by 640 render at scale 1 wrote that logical size and the inspector split, removed the activation socket, and left a resume bitmap with barrier 1 and bits 1f. The Add dialog's focused magnet field received a system-clipboard magnet on Ctrl+V through the attached clipboard worker, with no clipboard error, and the previous clipboard text was written back. These tests call on_exit and the key callbacks directly. Clippy with denied warnings was clean for the application, all targets. Preview tests, the rest of the workspace suite and the release binary were not re-run. HTTPS tracker announces remain rustls 0.23.46 with aws_lc_rs, certificates checked, ring not compiled. The resume bitmap from f1d59c5 is unchanged. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; no RTT or reliability scoring, only rates; webseed and UPnP unavailable; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows paste and a real window event loop are untested.
         """
@@ -411,6 +411,35 @@ record templartorrent.observation.complete-piece-status/12 : observation {
         @templartorrent.evidence.rate-ranking,
         @templartorrent.evidence.resume-bitmap,
         @templartorrent.evidence.resume-bitmap-gates,
+        @templartorrent.evidence.window-close,
+        @templartorrent.evidence.window-close-gates
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/13 : observation {
+    title "Linux client ranks peers by reliability and round trip; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22, Linux x86_64 Ubuntu 26.04.1, kernel 7.0.0-31-generic, i7-13700H, rustc 1.99.0, committed on master at 9b0874f. Upload-slot tests passed: manual preference, then fewer attributed hash failures, then a sole supplier of a still-wanted unverified piece, then higher payload rate, then a lower measured block round trip. An unmeasured round trip sorted after a measured one. Seeding ranked by upload rate and ignored download rate and download round trip. A localhost transfer whose first block was corrupted once showed hash_failures 1 and a measured round trip on that still-connected peer, and the recovered files matched. Clippy with denied warnings was clean for the engine, the adapter, and the application, all targets. The window-close and paste results from 66c3fea were not re-run; those tests call on_exit and the key callbacks directly. HTTPS tracker announces remain rustls 0.23.46 with aws_lc_rs, certificates checked, ring not compiled. The resume bitmap from f1d59c5 is unchanged. Request pipeline depth is still the preference cap, not an RTT bound. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; webseed and UPnP unavailable; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows paste and a real window event loop are untested. Preview tests, the rest of the workspace suite, and the release binary were not re-run.
+        """
+    observed_at git:9b0874f078a297673bc3d7d68f0f8bf009f2df66
+    method command
+    watches [ "crates/**", "integration/**", "vendor/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/12 ]
+    verified_by [
+        @templartorrent.evidence.announce-transport,
+        @templartorrent.evidence.corrupt-peer,
+        @templartorrent.evidence.https-rustls,
+        @templartorrent.evidence.https-rustls-audit,
+        @templartorrent.evidence.multi-lease-before-after,
+        @templartorrent.evidence.native-audit-after-fork,
+        @templartorrent.evidence.native-paste,
+        @templartorrent.evidence.peer-score-gates,
+        @templartorrent.evidence.rate-ranking,
+        @templartorrent.evidence.resume-bitmap,
+        @templartorrent.evidence.resume-bitmap-gates,
+        @templartorrent.evidence.slot-order,
+        @templartorrent.evidence.sole-supplier,
         @templartorrent.evidence.window-close,
         @templartorrent.evidence.window-close-gates
     ]

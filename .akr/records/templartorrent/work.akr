@@ -238,6 +238,58 @@ record templartorrent.work.peer-preference/1 : work {
     part_of [ @templartorrent.milestone.safety-and-peer-policy ]
 }
 
+record templartorrent.work.peer-score/1 : work {
+    title "Rank upload slots by reliability, rare pieces, rate, and RTT"
+    state completed
+    scope [
+        path "README.md",
+        path "crates/templartorrent-engine/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/**"
+    ]
+    intent """
+        Keep manual Prefer, Normal, and Avoid ahead of automatic order. Within a preference, rank a peer with fewer attributed hash failures first, then a peer who is the only supplier of a still-wanted piece, then verified payload rate, then a lower measured block round trip. Seeding uses upload rate and does not use download rate or download round trip. One attributed failure demotes that peer only; it does not disconnect them, and it does not blame any other peer. An unmeasured round trip never sorts as instant.
+        """
+    note """
+        No per-block resume journal, webseed, UPnP, or Windows paste. reqwest stays out of the graph. Quarantine is the rank, not a ban.
+        """
+    acceptance {
+        check corrupt-peer {
+            statement """
+                A driver transfer whose first block is corrupted once records one hash failure on that peer and a measured round trip, and the recovered files match the fixture.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --offline --test driver driver_corruption_retries_verified_piece_without_corrupting_files -- --test-threads=1"
+            verified_by [ @templartorrent.evidence.corrupt-peer/1 ]
+        }
+        check gates {
+            statement """
+                Clippy with denied warnings is clean for the engine, the rbit adapter, and the application, all targets, offline.
+                """
+            method command
+            command "cargo clippy -p templartorrent-engine -p templartorrent-rbit-adapter -p templartorrent --all-targets --offline -- -D warnings"
+            verified_by [ @templartorrent.evidence.peer-score-gates/1 ]
+        }
+        check slot-order {
+            statement """
+                Upload-slot order is preference, then fewer attributed hash failures, then a sole supplier of a still-wanted piece, then higher payload rate, then lower measured block round trip, then connection order. Seeding uses upload rate and ignores download rate and download round trip. An unmeasured round trip sorts after a measured one at the same rate.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --offline --lib slot_order -- --test-threads=1"
+            verified_by [ @templartorrent.evidence.slot-order/1 ]
+        }
+        check sole-supplier {
+            statement """
+                A peer is a sole supplier only while some still-wanted, unverified piece has availability 1 and that peer announced it. A second announcer or verification of that piece clears the flag.
+                """
+            method command
+            command "cargo test -p templartorrent-engine --offline --lib sole_wanted_supplier -- --test-threads=1"
+            verified_by [ @templartorrent.evidence.sole-supplier/1 ]
+        }
+    }
+    derived_from [ @templartorrent.observation.complete-piece-status ]
+}
+
 record templartorrent.work.picker-buckets/1 : work {
     title "Per-rank availability buckets for the live piece picker, oracle-checked"
     state completed

@@ -146,6 +146,18 @@ record templartorrent.papercut.session-set-wanted-only-re-evaluated-job/1 : pape
     created_at 2026-10-22
 }
 
+record templartorrent.papercut.the-peer-score-acceptance-command-used-cargo/1 : papercut {
+    title "The peer-score acceptance command used cargo test --test with the test…"
+    state verified
+    statement """
+        The peer-score acceptance command used cargo test --test with the test function name. Cargo treats --test as an integration-test target, so it exited 101 with no target named driver_corruption_retries_verified_piece_without_corrupting_files. The target is driver; the function name is a filter before --.
+        """
+    observed_at git:0c9c0ed8bf04f3d5fdbea28a708ecbe5b8bef368
+    about "cargo"
+    author "grok"
+    created_at 2026-10-22
+}
+
 record templartorrent.papercut.the-pinned-rbit-crate-also-uses-peer-rs-rather/1 : papercut {
     title "The pinned rbit crate also uses peer.rs rather than peer/mod.rs. The…"
     state verified

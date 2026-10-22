@@ -105,6 +105,18 @@ record templartorrent.evidence.complete-piece-wire/1 : evidence {
         """
 }
 
+record templartorrent.evidence.corrupt-peer/1 : evidence {
+    title "Corrupt block records one failure and a round trip"
+    state verified
+    result pass
+    method command
+    observed_at git:9b0874f078a297673bc3d7d68f0f8bf009f2df66
+    command "cargo test -p templartorrent-rbit-adapter --offline --test driver driver_corruption_retries_verified_piece_without_corrupting_files -- --test-threads=1"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0, commit 9b0874f. The command passed 1 test in 0.26s. While the peer was still connected, peer status showed hash_failures 1 and a measured round trip. The driver counted 1 hash failure. The recovered files matched the fixture, and the first requested piece was fetched twice. Preview tests, the rest of the workspace suite, and the release binary were not re-run.
+        """
+}
+
 record templartorrent.evidence.driver-seeding-metrics/1 : evidence {
     title "One release Linux i7-13700H/Rust 1.99.0 sample: second Driver resolved metadata and downloaded 196681 bytes from the listening Driver in 340301891 ns including final comparison/shutdown. Traced upload ownership peaked at 81920 B; sampled shared upload reservation 98368 B; sampled process RSS 5246976 B including both Drivers/fixture/Tokio. Initial seed download excluded; not app startup or an optimization comparison."
     state verified
@@ -449,6 +461,18 @@ record templartorrent.evidence.peer-preference-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.peer-score-gates/1 : evidence {
+    title "Clippy is clean for the engine, adapter, and application"
+    state verified
+    result pass
+    method command
+    observed_at git:9b0874f078a297673bc3d7d68f0f8bf009f2df66
+    command "cargo clippy -p templartorrent-engine -p templartorrent-rbit-adapter -p templartorrent --all-targets --offline -- -D warnings"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0, commit 9b0874f. cargo clippy -p templartorrent-engine -p templartorrent-rbit-adapter -p templartorrent --all-targets --offline -- -D warnings exited 0. cargo test -p templartorrent --offline --lib unknown_rates passed 1 test; unknown round trip renders as an em dash, 0 and 999 microseconds render as <1 ms, and 5000 microseconds renders as 5 ms. Preview tests, the rest of the workspace suite, and the release binary were not re-run.
+        """
+}
+
 record templartorrent.evidence.persistence-client/1 : evidence {
     title "Same host and tree: 26 production client tests passed. persist tests: record text roundtrip with Debug redacting tracker URLs; eight malformed mutations each rejected with a specific reason plus a relative destination; settings roundtrip and zero-budget rejection; store save leaves no .tmp file, second save replaces in place, corrupt text, missing torrent file, stray name and oversized record are each reported, remove is idempotent. Worker test: with a saved settings file, a saved complete job on disk and a nonsense sibling record, the worker restored limits (download_jobs 2) and the local-tracker flag, the job appeared Complete or Seeding with 70000 verified bytes and the note read Restored 1 with 1 skipped; SetLimits rewrote the settings file; Remove without data deletion removed the record and kept the files. Headless only."
     state verified
@@ -661,6 +685,30 @@ record templartorrent.evidence.resume-workspace-gates/1 : evidence {
     command "cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check"
     summary """
         Workspace green with resume: 29 core + 17 engine + 2 simd pass, clippy -D warnings clean, fmt clean
+        """
+}
+
+record templartorrent.evidence.slot-order/1 : evidence {
+    title "Slot order unit tests passed on commit 9b0874f"
+    state verified
+    result pass
+    method command
+    observed_at git:9b0874f078a297673bc3d7d68f0f8bf009f2df66
+    command "cargo test -p templartorrent-rbit-adapter --offline --lib slot_order -- --test-threads=1"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0, commit 9b0874f. The command passed 2 tests in 0.00s. Preference still outranks a faster peer, a sole supplier outranks a faster normal peer, a lower measured round trip outranks a higher one at the same rate, an unmeasured round trip sorts after a measured 0 microsecond sample, one hash failure sorts after clean peers of the same preference, and Avoid stays last. A seeding comparison ranks the higher upload rate ahead of a peer with a much higher download rate and a 1 microsecond round trip. Duplicate request stamps replace in place, a taken stamp does not return twice, and 37 stamps stay capped at 32. The preference-order and optimistic-rotation driver tests also passed, 2 tests in 3.25s. Preview tests, the rest of the workspace suite, and the release binary were not re-run.
+        """
+}
+
+record templartorrent.evidence.sole-supplier/1 : evidence {
+    title "Sole-supplier unit test passed on commit 9b0874f"
+    state verified
+    result pass
+    method command
+    observed_at git:9b0874f078a297673bc3d7d68f0f8bf009f2df66
+    command "cargo test -p templartorrent-engine --offline --lib sole_wanted_supplier -- --test-threads=1"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0, commit 9b0874f. The command passed 1 test in 0.00s. On a two-piece file, peers announcing different pieces were each a sole supplier. A second announcer cleared the peer who no longer held a unique piece. The remaining sole supplier's pick was the availability-1 piece. After that piece verified, the peer was not a sole supplier, and the verified piece still had a non-SKIP rank.
         """
 }
 
