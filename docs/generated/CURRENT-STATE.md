@@ -56,6 +56,8 @@ second backend, external torrent process or another GUI stack.
 
 **supersedes** `@templartorrent.observation.complete-piece-status/5` · **verified_by** `@templartorrent.evidence.baseline-microbench/1`, `@templartorrent.evidence.persistence-client/1`, `@templartorrent.evidence.persistence-driver/1`, `@templartorrent.evidence.persistence-gates/1`, `@templartorrent.evidence.step4-forced-crash-restart/1`
 
+> **Stale** — `watches "crates/**"` was matched by `3f1c4789`, which touched `crates/templartorrent-bench/src/main.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#committed-linux-client-through-agentsmd-step-4-with-persistence-and-recorded-baselines-remaining-boundaries).
+
 ## Assessments
 
 _(none)_
