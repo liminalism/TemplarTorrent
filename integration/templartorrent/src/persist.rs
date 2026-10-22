@@ -1,8 +1,9 @@
 //! Session persistence under the XDG data directory: one `<hash>.job` text
-//! record and one `<hash>.torrent` metainfo file per job, plus `settings`.
-//! Each write goes to a temporary file, is synced, then renamed over the
-//! target, so a crash leaves either the old or the new file. Reads are
-//! bounded and a bad record is reported with a reason, never trusted.
+//! record, one `<hash>.torrent` metainfo file and one `<hash>.resume` bitmap
+//! per job, plus `settings`. Each write goes to a temporary file, is synced,
+//! then renamed over the target, so a crash leaves either the old or the new
+//! file. Reads are bounded and a bad record is reported with a reason, never
+//! trusted. A missing resume file is not an error: the job is rechecked.
 
 use std::{
     fs,
@@ -13,13 +14,18 @@ use std::{
 };
 
 use templartorrent_core::model::{Limits, PeerPreference};
-use templartorrent_rbit_adapter::driver::JobRecord;
+use templartorrent_rbit_adapter::driver::{JobRecord, ResumeRecord};
+use templartorrent_rbit_adapter::resume::ResumeFile;
+use templartorrent_rbit_adapter::torrent::{MAX_DRIVER_FILES, MAX_DRIVER_PIECES};
 
 pub const RECORD_HEADER: &str = "templartorrent-job 1";
+pub const RESUME_HEADER: &str = "templartorrent-resume 1";
 pub const SETTINGS_HEADER: &str = "templartorrent-settings 1";
 pub const UI_HEADER: &str = "templartorrent-ui 1";
 pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
 pub const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
+/// 262144 pieces encode to 64 KiB of hex, plus one line per file.
+pub const MAX_RESUME_BYTES: u64 = 128 * 1024;
 const MAX_TRACKERS: usize = 12;
 const MAX_PREFERENCES: usize = 256;
 const MAX_FILES: usize = 128;
@@ -98,6 +104,10 @@ impl SessionStore {
         self.dir.join(format!("{}.torrent", hex(hash)))
     }
 
+    fn resume_path(&self, hash: &[u8; 20]) -> PathBuf {
+        self.dir.join(format!("{}.resume", hex(hash)))
+    }
+
     pub fn save_job(&self, record: &JobRecord) -> Result<(), String> {
         self.ensure_dir()?;
         if record.torrent.len() as u64 > MAX_TORRENT_BYTES {
@@ -110,8 +120,35 @@ impl SessionStore {
         )
     }
 
+    pub fn save_resume(&self, hash: &[u8; 20], resume: &ResumeRecord) -> Result<(), String> {
+        self.ensure_dir()?;
+        let text = encode_resume(resume);
+        if text.len() as u64 > MAX_RESUME_BYTES {
+            return Err("resume bitmap exceeds the 128 KiB record limit".into());
+        }
+        write_atomic(&self.resume_path(hash), text.as_bytes())
+    }
+
+    /// `Ok(None)` when no bitmap was saved. A present but unreadable file is
+    /// an error so the caller can say why it fell back to a full recheck.
+    pub fn load_resume(&self, hash: &[u8; 20]) -> Result<Option<ResumeRecord>, String> {
+        let path = self.resume_path(hash);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+            Ok(_) => {}
+        }
+        let text = read_bounded(&path, MAX_RESUME_BYTES)?;
+        let text = String::from_utf8(text).map_err(|_| "resume bitmap is not UTF-8".to_string())?;
+        decode_resume(&text).map(Some)
+    }
+
     pub fn remove_job(&self, hash: &[u8; 20]) -> Result<(), String> {
-        for path in [self.job_path(hash), self.torrent_path(hash)] {
+        for path in [
+            self.job_path(hash),
+            self.torrent_path(hash),
+            self.resume_path(hash),
+        ] {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -341,6 +378,137 @@ pub fn decode_record(
         order,
         trackers,
         preferences,
+    })
+}
+
+pub fn encode_resume(resume: &ResumeRecord) -> String {
+    let mut out = String::new();
+    out.push_str(RESUME_HEADER);
+    out.push('\n');
+    out.push_str(&format!("pieces {}\n", resume.pieces));
+    out.push_str(&format!("barrier {}\n", u8::from(resume.barrier)));
+    out.push_str(&format!("bits {}\n", hex(&resume.bits)));
+    for (index, file) in resume.files.iter().enumerate() {
+        out.push_str(&format!(
+            "file {index} {} {} {} {} {}\n",
+            file.dev, file.ino, file.size, file.mtime_sec, file.mtime_nsec
+        ));
+    }
+    out
+}
+
+pub fn decode_resume(text: &str) -> Result<ResumeRecord, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(RESUME_HEADER) {
+        return Err("unknown resume version".into());
+    }
+    let mut pieces = None;
+    let mut barrier = None;
+    let mut bits = None;
+    let mut files: Vec<Option<ResumeFile>> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed line: {line}"))?;
+        match key {
+            "pieces" => {
+                if pieces.is_some() {
+                    return Err("duplicate pieces".into());
+                }
+                let count = value
+                    .parse::<usize>()
+                    .map_err(|_| "pieces must be numeric".to_string())?;
+                if count > MAX_DRIVER_PIECES {
+                    return Err("too many pieces".into());
+                }
+                pieces = Some(count);
+            }
+            "barrier" => {
+                if barrier.is_some() {
+                    return Err("duplicate barrier".into());
+                }
+                barrier = Some(flag(value)?);
+            }
+            "bits" => {
+                if bits.is_some() {
+                    return Err("duplicate bits".into());
+                }
+                bits = Some(unhex(value)?);
+            }
+            "file" => {
+                let mut parts = value.split(' ');
+                let index = parts
+                    .next()
+                    .ok_or_else(|| "resume file needs an index".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "resume file index must be numeric".to_string())?;
+                if index >= MAX_DRIVER_FILES {
+                    return Err("too many resume files".into());
+                }
+                let number = |parts: &mut std::str::Split<'_, char>, label: &str| {
+                    parts
+                        .next()
+                        .ok_or_else(|| format!("resume file needs {label}"))?
+                        .parse::<u64>()
+                        .map_err(|_| format!("resume file {label} must be numeric"))
+                };
+                let dev = number(&mut parts, "device")?;
+                let ino = number(&mut parts, "inode")?;
+                let size = number(&mut parts, "size")?;
+                let mtime_sec = parts
+                    .next()
+                    .ok_or_else(|| "resume file needs mtime".to_string())?
+                    .parse::<i64>()
+                    .map_err(|_| "resume file mtime must be numeric".to_string())?;
+                let mtime_nsec = parts
+                    .next()
+                    .ok_or_else(|| "resume file needs mtime_nsec".to_string())?
+                    .parse::<i64>()
+                    .map_err(|_| "resume file mtime_nsec must be numeric".to_string())?;
+                if parts.next().is_some() {
+                    return Err("resume file has trailing fields".into());
+                }
+                if !(0..1_000_000_000).contains(&mtime_nsec) {
+                    return Err("resume file mtime_nsec is out of range".into());
+                }
+                if files.len() <= index {
+                    files.resize_with(index + 1, || None);
+                }
+                if files[index].is_some() {
+                    return Err("duplicate resume file".into());
+                }
+                files[index] = Some(ResumeFile {
+                    dev,
+                    ino,
+                    size,
+                    mtime_sec,
+                    mtime_nsec,
+                });
+            }
+            other => return Err(format!("unknown field {other}")),
+        }
+    }
+    let pieces = pieces.ok_or_else(|| "pieces missing".to_string())?;
+    let bits = bits.ok_or_else(|| "bits missing".to_string())?;
+    let expected = pieces.div_ceil(8);
+    if bits.len() != expected {
+        return Err("resume bitfield length does not match the piece count".into());
+    }
+    if !pieces.is_multiple_of(8) && expected > 0 && bits[expected - 1] >> (pieces % 8) != 0 {
+        return Err("resume bitfield has spare bits set".into());
+    }
+    if files.iter().any(Option::is_none) {
+        return Err("resume file list has a gap".into());
+    }
+    Ok(ResumeRecord {
+        pieces,
+        // A missing barrier line trusts nothing. The driver rechecks.
+        barrier: barrier.unwrap_or(false),
+        bits,
+        files: files.into_iter().flatten().collect(),
     })
 }
 
@@ -733,5 +901,69 @@ mod tests {
             })
             .unwrap();
         assert!(store.load_settings().unwrap().unwrap().allow_local_trackers);
+    }
+
+    fn sample_resume() -> ResumeRecord {
+        ResumeRecord {
+            pieces: 9,
+            barrier: true,
+            bits: vec![0xff, 0x01],
+            files: vec![
+                ResumeFile {
+                    dev: 1,
+                    ino: 2,
+                    size: 3,
+                    mtime_sec: -4,
+                    mtime_nsec: 5,
+                },
+                ResumeFile {
+                    dev: 8,
+                    ino: 9,
+                    size: 10,
+                    mtime_sec: 11,
+                    mtime_nsec: 12,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn resume_bitmap_roundtrips_and_rejects_a_bad_record() {
+        let resume = sample_resume();
+        let text = encode_resume(&resume);
+        assert_eq!(decode_resume(&text).unwrap(), resume);
+        let dropped: String = text
+            .lines()
+            .filter(|line| !line.starts_with("barrier"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let open = decode_resume(&dropped).unwrap();
+        assert!(!open.barrier, "a missing barrier trusts nothing");
+        for (mutation, reason) in [
+            (
+                text.replace(RESUME_HEADER, "templartorrent-resume 9"),
+                "version",
+            ),
+            (text.replace("barrier 1", "barrier 2"), "flag"),
+            (text.replace("bits ff01", "bits ff03"), "spare"),
+            (text.replace("bits ff01", "bits ff"), "length"),
+            (format!("{text}colour blue\n"), "unknown"),
+            (format!("{text}file 3 1 2 3 4 5\n"), "gap"),
+            (
+                text.replace("file 0 1 2 3 -4 5", "file 0 1 2 3 -4 1000000000"),
+                "nsec",
+            ),
+        ] {
+            let error = decode_resume(&mutation).unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+        let dir = Dir::new("resume");
+        let store = SessionStore::new(dir.0.join("session"));
+        let hash = [7u8; 20];
+        assert!(store.load_resume(&hash).unwrap().is_none());
+        store.save_resume(&hash, &resume).unwrap();
+        assert_eq!(store.load_resume(&hash).unwrap().unwrap(), resume);
+        store.remove_job(&hash).unwrap();
+        assert!(store.load_resume(&hash).unwrap().is_none());
     }
 }

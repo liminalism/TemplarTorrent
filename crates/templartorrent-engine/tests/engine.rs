@@ -807,3 +807,65 @@ fn seed_slots_and_upload_accounting_do_not_claim_queued_bytes() {
     assert!(!session.upload_admitted(id));
     assert!(session.reserve_upload(id, 0, 0, 1, 0).unwrap().is_none());
 }
+
+#[derive(Clone)]
+struct CountingReader {
+    inner: SharedSink,
+    reads: Arc<Mutex<Vec<u32>>>,
+}
+
+impl PieceReader for CountingReader {
+    fn read_piece(
+        &self,
+        torrent: TorrentId,
+        piece: u32,
+        expected_len: usize,
+    ) -> Result<Option<Vec<u8>>, SinkError> {
+        self.reads.lock().unwrap().push(piece);
+        self.inner.read_piece(torrent, piece, expected_len)
+    }
+}
+
+#[test]
+fn trusted_pieces_are_not_read_on_the_following_recheck() {
+    let sink = SharedSink::default();
+    let mut session = session_with_sink(sink.clone());
+    let id = session.add(spec()).unwrap();
+    for (piece, len) in [(0, 16384), (1, 16384), (2, 16384), (3, 848)] {
+        sink.pieces
+            .lock()
+            .unwrap()
+            .insert((id.0, piece), vec![piece as u8; len]);
+    }
+    let reader = CountingReader {
+        inner: sink,
+        reads: Arc::new(Mutex::new(Vec::new())),
+    };
+    assert_eq!(session.adopt_trusted(id, &[0, 1]).unwrap(), 2);
+    assert!(reader.reads.lock().unwrap().is_empty());
+    let report = session.recheck(id, &reader, &AcceptAll).unwrap();
+    assert_eq!(report.checked, 2);
+    assert_eq!(report.verified, 2);
+    assert_eq!(reader.reads.lock().unwrap().as_slice(), &[2, 3]);
+    assert_eq!(session.snapshot().jobs[0].verified_bytes, 50_000);
+    assert_eq!(session.snapshot().jobs[0].state, JobState::Seeding);
+    assert_eq!(session.adopt_trusted(id, &[0, 1, 2, 3]).unwrap(), 0);
+    assert!(matches!(
+        session.adopt_trusted(id, &[0, 99]),
+        Err(EngineError::Sequence(_))
+    ));
+    assert!(session.adopt_trusted(TorrentId(99), &[0]).is_err());
+}
+
+#[test]
+fn trusted_adopt_skips_a_piece_that_is_still_leased() {
+    let mut session = session();
+    let id = session.add(spec()).unwrap();
+    let _peer = ready_peer(&mut session, id);
+    let report = session.update(0, &AcceptAll);
+    let leased = requests_of(&report);
+    assert_eq!(leased.len(), 4);
+    let pieces: Vec<u32> = leased.iter().map(|(piece, _, _)| *piece).collect();
+    assert_eq!(session.adopt_trusted(id, &pieces).unwrap(), 0);
+    assert_eq!(session.snapshot().jobs[0].verified_bytes, 0);
+}

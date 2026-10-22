@@ -13,9 +13,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use templartorrent_core::model::{JobState, Limits, PeerPreference};
+use templartorrent_core::model::{JobState, Limits, PeerPreference, TorrentRow};
 use templartorrent_rbit_adapter::{
-    driver::{Driver, ExistingData, PeerOrigin, PeerSource},
+    driver::{Driver, ExistingData, JobRecord, PeerOrigin, PeerSource, ResumeRecord, ResumeScan},
     metadata::OUR_MD_ID,
 };
 use tokio::{
@@ -2133,6 +2133,114 @@ async fn driver_large_piece_count_scenario_metrics() {
         driver.shutdown().await;
         a.close().await;
         b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+async fn restore_with(record: JobRecord, resume: Option<ResumeRecord>) -> (ResumeScan, TorrentRow) {
+    let mut driver = driver();
+    let id = driver
+        .restore_job_with_resume(&record, resume.as_ref())
+        .await
+        .unwrap();
+    let scan = driver.resume_scan(id).unwrap();
+    let row = driver.snapshot().jobs[0].clone();
+    driver.remove(id, false).await.unwrap();
+    (scan, row)
+}
+
+#[tokio::test]
+async fn driver_resume_bitmap_trusts_unchanged_files_only() {
+    timeout(Duration::from_secs(30), async {
+        let root = Root::new();
+        let fixture = Fixture::new(91, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut first = driver();
+        let id = first
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        complete(&mut first).await;
+        let record = first.export_job(id).unwrap();
+        let resume = first.export_resume(id).unwrap();
+        assert!(resume.barrier);
+        assert_eq!(resume.pieces, 4);
+        assert_eq!(
+            resume
+                .bits
+                .iter()
+                .map(|byte| byte.count_ones())
+                .sum::<u32>(),
+            4
+        );
+        assert_eq!(resume.files.len(), 2);
+        assert_eq!(resume.files[0].size, PIECE as u64);
+        assert_eq!(
+            resume.files[1].size,
+            fixture.data.len() as u64 - PIECE as u64
+        );
+        first.remove(id, false).await.unwrap();
+        drop(first);
+        server.close().await;
+
+        let restore = |resume: Option<&ResumeRecord>| restore_with(record.clone(), resume.cloned());
+
+        let (scan, row) = restore(None).await;
+        assert_eq!(scan.trusted, 0);
+        assert_eq!(scan.checked, 4);
+        assert_eq!(scan.note, None);
+        assert_eq!(row.state, JobState::Complete);
+
+        let mut open = resume.clone();
+        open.barrier = false;
+        let (scan, row) = restore(Some(&open)).await;
+        assert_eq!(scan.trusted, 0);
+        assert_eq!(scan.checked, 4);
+        assert_eq!(scan.note, Some("resume bitmap had no durability barrier"));
+        assert_eq!(row.state, JobState::Complete);
+
+        let (scan, row) = restore(Some(&resume)).await;
+        assert_eq!(
+            (scan.trusted, scan.checked, scan.failed, scan.note),
+            (4, 0, 0, None)
+        );
+        assert_eq!(row.state, JobState::Complete);
+        assert_eq!(row.verified_bytes, fixture.data.len() as u64);
+        fixture.assert_files(&root.job());
+
+        let episode = root.job().join("owned-series/Episode01.bin");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&episode)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        let (scan, row) = restore(Some(&resume)).await;
+        assert_eq!(
+            (scan.trusted, scan.checked, scan.failed, scan.note),
+            (1, 3, 0, None),
+            "only the untouched file skips the hash"
+        );
+        assert_eq!(row.state, JobState::Complete);
+        fixture.assert_files(&root.job());
+
+        let episode = root.job().join("owned-series/Episode02.bin");
+        let mut bytes = std::fs::read(&episode).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&episode, bytes).unwrap();
+        let (scan, row) = restore(Some(&resume)).await;
+        assert_eq!(scan.trusted, 0, "both files now differ from the bitmap");
+        assert_eq!(scan.checked, 4);
+        assert_eq!(scan.failed, 1);
+        assert_ne!(row.state, JobState::Complete);
+        assert_eq!(row.verified_bytes, fixture.data.len() as u64 - PIECE as u64);
     })
     .await
     .unwrap();

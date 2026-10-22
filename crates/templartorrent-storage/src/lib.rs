@@ -5,7 +5,9 @@
 //! is a symlink. Pre-existing files at or under the torrent length resume in
 //! place; longer files are an explicit [`StorageError::LengthMismatch`], never
 //! silently truncated. Every piece write ends with a data sync so verified
-//! bytes are durable before the engine credits them.
+//! bytes are durable before the engine credits them. A resume checkpoint
+//! calls [`FileStore::durable_identity`], which syncs inode fields as well
+//! and refuses a path whose inode is no longer the one the handle wrote.
 //!
 //! Two handles: [`FileStore`] for direct single-owner use, [`SharedStore`]
 //! (cheaply cloneable) for engine sessions, where the sink moves into the
@@ -22,6 +24,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -125,6 +128,18 @@ fn probe(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error(path, error)),
     }
+}
+
+/// Identity of one open payload file, taken from the handle after a sync.
+/// A resume bitmap may trust bytes only while a later open still reports
+/// this device, inode, size and mtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
 }
 
 struct StoredFile {
@@ -332,6 +347,31 @@ impl FileStore {
         Ok(())
     }
 
+    /// Device, inode, size and mtime of each open handle, in file order.
+    /// Fails when the path no longer names that inode.
+    pub fn file_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {
+        let job = self.jobs.get(&id.0).ok_or(StorageError::UnknownJob(id))?;
+        let mut stamps = Vec::with_capacity(job.files.len());
+        for file in &job.files {
+            stamps.push(stamp_handle(file)?);
+        }
+        Ok(stamps)
+    }
+
+    /// [`FileStore::file_identity`] after `sync_all` on every handle. Piece
+    /// writes already `sync_data` the bytes; this also pushes mtime, which
+    /// the resume stamp records, so a crash cannot keep the bitmap and lose
+    /// the identity it names.
+    pub fn durable_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {
+        let job = self.jobs.get(&id.0).ok_or(StorageError::UnknownJob(id))?;
+        for file in &job.files {
+            file.handle
+                .sync_all()
+                .map_err(|error| io_error(&file.path, error))?;
+        }
+        self.file_identity(id)
+    }
+
     fn job(&self, torrent: TorrentId) -> Result<&JobFiles, SinkError> {
         self.jobs.get(&torrent.0).ok_or(SinkError::UnknownJob)
     }
@@ -339,6 +379,39 @@ impl FileStore {
     fn job_mut(&mut self, torrent: TorrentId) -> Result<&mut JobFiles, SinkError> {
         self.jobs.get_mut(&torrent.0).ok_or(SinkError::UnknownJob)
     }
+}
+
+fn stamp_handle(file: &StoredFile) -> Result<FileStamp, StorageError> {
+    let live = file
+        .handle
+        .metadata()
+        .map_err(|error| io_error(&file.path, error))?;
+    let on_path = match probe(&file.path)? {
+        Some(meta) if meta.is_file() => meta,
+        Some(_) => {
+            return Err(StorageError::Io(format!(
+                "{}: torrent path is no longer a regular file",
+                file.path.display()
+            )));
+        }
+        None => {
+            return Err(StorageError::IdentityChanged {
+                path: file.path.display().to_string(),
+            });
+        }
+    };
+    if on_path.dev() != live.dev() || on_path.ino() != live.ino() {
+        return Err(StorageError::IdentityChanged {
+            path: file.path.display().to_string(),
+        });
+    }
+    Ok(FileStamp {
+        dev: live.dev(),
+        ino: live.ino(),
+        size: live.len(),
+        mtime_sec: live.mtime(),
+        mtime_nsec: live.mtime_nsec(),
+    })
 }
 
 fn storage_to_sink(error: StorageError) -> SinkError {
@@ -483,6 +556,20 @@ impl SharedStore {
             .lock()
             .map_err(|_| StorageError::Io("store lock poisoned".into()))?
             .add_job(id, root, files, piece_length)
+    }
+
+    pub fn file_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Io("store lock poisoned".into()))?
+            .file_identity(id)
+    }
+
+    pub fn durable_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Io("store lock poisoned".into()))?
+            .durable_identity(id)
     }
 }
 

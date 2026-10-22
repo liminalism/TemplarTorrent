@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod driver;
 pub mod metadata;
 mod preflight;
+pub mod resume;
 pub mod torrent;
 use rbit::{
     AnnounceResponse, Block, BlockRequest, ExtensionHandshake, MagnetLink, Message, Metainfo,

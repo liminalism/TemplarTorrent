@@ -86,6 +86,30 @@ fn write_then_read_roundtrip_across_boundary() {
 }
 
 #[test]
+fn durable_identity_tracks_synced_bytes_and_refuses_a_replaced_file() {
+    let root = TempRoot::new("identity");
+    let mut store = FileStore::new();
+    store.add_job(ID, root.path(), &two_files(), 1024).unwrap();
+    let created = store.durable_identity(ID).unwrap();
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].size, 0);
+    assert_eq!(store.durable_identity(ID).unwrap(), created);
+    store.write_piece(ID, 0, &pattern(0, 1024)).unwrap();
+    let written = store.durable_identity(ID).unwrap();
+    assert_eq!(written[0].size, 1024);
+    assert_eq!(written[0].dev, created[0].dev);
+    assert_eq!(written[0].ino, created[0].ino);
+    assert_eq!(written[1], created[1], "the untouched file keeps its stamp");
+    let path = root.path().join("a.bin");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"replaced").unwrap();
+    assert!(matches!(
+        store.durable_identity(ID),
+        Err(StorageError::IdentityChanged { .. })
+    ));
+}
+
+#[test]
 fn pre_existing_complete_files_read_back() {
     let root = TempRoot::new("preexisting");
     let mut full = Vec::new();

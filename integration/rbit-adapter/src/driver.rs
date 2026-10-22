@@ -5,8 +5,10 @@
 //!
 //! Release limitations: FileStore is not yet handle-relative/reparse hardened;
 //! disk/hash work is synchronous but bounded and must run off the UI thread.
+pub use crate::resume::{ResumeRecord, ResumeScan};
 use crate::{
     metadata::{METADATA_BUDGET, fetch_metadata_budgeted},
+    resume,
     torrent::{MAX_DRIVER_PIECES, ValidatedV1},
     unpack_bitfield,
 };
@@ -147,6 +149,14 @@ struct Job {
     preferences: HashMap<IpAddr, PeerPreference>,
     /// Whether the user allowed public discovery for this magnet.
     bootstrap: bool,
+    /// Pieces adopted from a resume bitmap on restore, without hashing.
+    resume_trusted: usize,
+    /// Pieces read and hashed on that restore scan.
+    resume_checked: usize,
+    /// Hashed pieces that did not match.
+    resume_failed: usize,
+    /// Why a supplied bitmap was not applied.
+    resume_note: Option<&'static str>,
 }
 
 /// Everything needed to reinstall a job without the network: the metainfo
@@ -729,6 +739,10 @@ impl Driver {
                 trackers: Vec::new(),
                 preferences: HashMap::new(),
                 bootstrap: public_bootstrap,
+                resume_trusted: 0,
+                resume_checked: 0,
+                resume_failed: 0,
+                resume_note: None,
             },
         );
         if self
@@ -1734,12 +1748,82 @@ impl Driver {
         })
     }
 
+    /// Pieces the engine has verified, plus file identity taken after a
+    /// full sync. The barrier is set because verification runs only after
+    /// `write_piece` has synced the bytes, and [`SharedStore::durable_identity`]
+    /// syncs inode fields before the stamps in this record.
+    pub fn export_resume(&self, id: TorrentId) -> Result<ResumeRecord> {
+        let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
+        let words = self
+            .session
+            .verified_pieces(id)
+            .map_err(|_| DriverError("unknown job"))?;
+        let stamps = self
+            .store
+            .durable_identity(id)
+            .map_err(|_| DriverError("resume identity check failed"))?;
+        if stamps.len() != job.torrent.paths.len() {
+            return Err(DriverError("resume identity check failed"));
+        }
+        Ok(ResumeRecord::checkpoint(
+            job.torrent.piece_count(),
+            &words,
+            &stamps,
+        ))
+    }
+
+    /// How the most recent [`Driver::restore_job`] applied a resume bitmap.
+    /// Jobs that were not restored report an empty scan.
+    pub fn resume_scan(&self, id: TorrentId) -> Result<ResumeScan> {
+        let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
+        Ok(ResumeScan {
+            trusted: job.resume_trusted,
+            checked: job.resume_checked,
+            failed: job.resume_failed,
+            note: job.resume_note,
+        })
+    }
+
+    fn plan_resume(
+        &self,
+        id: TorrentId,
+        piece_count: usize,
+        piece_length: u64,
+        lengths: &[u64],
+        resume: Option<&ResumeRecord>,
+    ) -> (Vec<u32>, Option<&'static str>) {
+        let Some(resume) = resume else {
+            return (Vec::new(), None);
+        };
+        let live = match self.store.file_identity(id) {
+            Ok(live) => live,
+            Err(_) => return (Vec::new(), Some("resume identity check failed")),
+        };
+        match resume::trusted_pieces(piece_count, piece_length, lengths, resume, &live) {
+            Ok(pieces) => (pieces, None),
+            Err(reason) => (Vec::new(), Some(reason)),
+        }
+    }
+
     /// Reinstall a saved job from its stored metainfo. The destination is
-    /// rechecked from disk; no peer is contacted. Saved trackers the job
-    /// already knew are admitted (their hosts resolve) and announce on their
-    /// normal schedule; a private job keeps only original trackers. An
-    /// invalid saved selection or order is dropped and noted, never applied.
+    /// rechecked from disk; no peer is contacted. A resume bitmap, when
+    /// supplied, skips the hash for pieces whose files still match the
+    /// recorded identity and whose record carried a durability barrier.
+    /// Saved trackers the job already knew are admitted (their hosts resolve)
+    /// and announce on their normal schedule; a private job keeps only
+    /// original trackers. An invalid saved selection or order is dropped and
+    /// noted, never applied.
     pub async fn restore_job(&mut self, record: &JobRecord) -> Result<TorrentId> {
+        self.restore_job_with_resume(record, None).await
+    }
+
+    /// [`Driver::restore_job`] with an optional resume bitmap. `None` hashes
+    /// every piece, which is also what a missing bitmap file means.
+    pub async fn restore_job_with_resume(
+        &mut self,
+        record: &JobRecord,
+        resume: Option<&ResumeRecord>,
+    ) -> Result<TorrentId> {
         let (torrent, hash) =
             ValidatedV1::from_torrent_bytes(&record.torrent, &self.metadata_budget)
                 .map_err(DriverError)?;
@@ -1763,6 +1847,7 @@ impl Driver {
                 max_pieces: MAX_DRIVER_PIECES,
             })
             .map_err(|_| DriverError("torrent exceeds session admission limits"))?;
+        let lengths: Vec<u64> = torrent.paths.iter().map(|(_, length)| *length).collect();
         let admitted =
             (|| {
                 let root = prepare_destination(&record.destination, ExistingData::Recheck)?;
@@ -1774,12 +1859,27 @@ impl Driver {
                 self.store
                     .add_job(id, &root, &torrent.paths, torrent.piece_length())
                     .map_err(|_| DriverError("payload storage admission failed"))?;
-                self.session
+                let (trusted, note) = self.plan_resume(
+                    id,
+                    torrent.piece_count(),
+                    torrent.piece_length(),
+                    &lengths,
+                    resume,
+                );
+                let trusted_count = if trusted.is_empty() {
+                    0
+                } else {
+                    self.session
+                        .adopt_trusted(id, &trusted)
+                        .map_err(|_| DriverError("resume recheck failed"))?
+                };
+                let report = self
+                    .session
                     .recheck(id, &self.store, &torrent)
                     .map_err(|_| DriverError("resume recheck failed"))?;
-                Ok(root)
+                Ok((root, trusted_count, report.checked, report.failed, note))
             })();
-        let root = match admitted {
+        let (root, resume_trusted, resume_checked, resume_failed, resume_note) = match admitted {
             Ok(root) => root,
             Err(error) => {
                 let _ = self.session.remove(id, false);
@@ -1787,7 +1887,7 @@ impl Driver {
                 return Err(error);
             }
         };
-        let mut last_error = None;
+        let mut last_error = resume_note;
         if record.wanted.len() == torrent.paths.len() {
             for (index, wanted) in record.wanted.iter().enumerate() {
                 if !wanted && self.session.set_wanted(id, index, false).is_err() {
@@ -1859,6 +1959,10 @@ impl Driver {
                 trackers: Vec::new(),
                 preferences,
                 bootstrap: record.public_bootstrap,
+                resume_trusted,
+                resume_checked,
+                resume_failed,
+                resume_note,
             },
         );
         for tracker in trackers {

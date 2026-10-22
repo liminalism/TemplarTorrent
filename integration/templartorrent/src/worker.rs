@@ -18,6 +18,9 @@ use crate::space;
 use crate::workflow;
 
 const QUEUE: usize = 64;
+/// Resume bits are rewritten on a command, on shutdown, or at this cadence
+/// once verified bytes have changed. Not once per block.
+const RESUME_BATCH: Duration = Duration::from_secs(10);
 
 type WakeHook = Arc<dyn Fn() + Send + Sync>;
 type WakeSlot = Arc<Mutex<Option<WakeHook>>>;
@@ -354,6 +357,8 @@ struct Memory {
     rates: std::collections::HashMap<u64, workflow::RateCarry>,
     rated_at: Option<Instant>,
     store: Option<SessionStore>,
+    resume_flushed_at: Instant,
+    resume_verified: u64,
 }
 
 async fn run_session(
@@ -372,6 +377,8 @@ async fn run_session(
         rates: std::collections::HashMap::new(),
         rated_at: None,
         store: config.session_dir.clone().map(SessionStore::new),
+        resume_flushed_at: Instant::now(),
+        resume_verified: 0,
     };
     let mut engine = match Driver::new(config.limits) {
         Ok(mut driver) => {
@@ -425,9 +432,17 @@ async fn run_session(
             Engine::Down(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
         last = publish_if_changed(&mut engine, &mut memory, &shared, last);
+        maybe_flush_resumes(&mut engine, &mut memory);
     }
     if let Engine::Live { driver, .. } = &mut engine {
+        let flush_error = memory
+            .store
+            .as_ref()
+            .and_then(|store| flush_resumes(driver, store).err());
         driver.shutdown().await;
+        if let Some(error) = flush_error {
+            memory.note = Some(format!("resume bitmap not saved: {error}"));
+        }
     }
 }
 
@@ -458,8 +473,25 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
     let mut skipped = errors.len();
     let mut first_skip = errors.into_iter().next();
     for record in &records {
-        match driver.restore_job(record).await {
-            Ok(_) => restored += 1,
+        let resume = match store.load_resume(&record.info_hash) {
+            Ok(resume) => resume,
+            Err(error) => {
+                notes.push(format!("resume bitmap ignored: {error}"));
+                None
+            }
+        };
+        match driver
+            .restore_job_with_resume(record, resume.as_ref())
+            .await
+        {
+            Ok(id) => {
+                restored += 1;
+                if let Ok(scan) = driver.resume_scan(id)
+                    && let Some(reason) = scan.note
+                {
+                    notes.push(format!("resume bitmap not trusted: {reason}"));
+                }
+            }
             Err(error) => {
                 skipped += 1;
                 first_skip.get_or_insert_with(|| format!("saved job skipped: {}", error.0));
@@ -483,7 +515,50 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
 
 fn save_job(driver: &mut Driver, store: &SessionStore, id: TorrentId) -> Result<(), String> {
     let record = driver.export_job(id).map_err(|error| error.0.to_string())?;
-    store.save_job(&record)
+    store.save_job(&record)?;
+    match driver.export_resume(id) {
+        Ok(resume) => store.save_resume(&record.info_hash, &resume),
+        Err(error) => Err(error.0.to_string()),
+    }
+}
+
+/// Write every live job and its resume bitmap. The bitmap is produced after
+/// payload handles have been synced, and this returns before those handles
+/// are closed.
+fn flush_resumes(driver: &mut Driver, store: &SessionStore) -> Result<(), String> {
+    let ids: Vec<TorrentId> = driver.snapshot().jobs.iter().map(|job| job.id).collect();
+    for id in ids {
+        save_job(driver, store, id)?;
+    }
+    Ok(())
+}
+
+fn maybe_flush_resumes(engine: &mut Engine, memory: &mut Memory) {
+    if memory.resume_flushed_at.elapsed() < RESUME_BATCH {
+        return;
+    }
+    let Engine::Live { driver, .. } = engine else {
+        return;
+    };
+    let verified = driver
+        .snapshot()
+        .jobs
+        .iter()
+        .map(|job| job.verified_bytes)
+        .sum();
+    memory.resume_flushed_at = Instant::now();
+    if verified == memory.resume_verified {
+        return;
+    }
+    let saved = if let Some(store) = memory.store.as_ref() {
+        flush_resumes(driver, store)
+    } else {
+        return;
+    };
+    match saved {
+        Ok(()) => memory.resume_verified = verified,
+        Err(error) => memory.note = Some(format!("resume bitmap not saved: {error}")),
+    }
 }
 
 fn save_settings(driver: &Driver, memory: &Memory) -> Result<(), String> {
@@ -1025,6 +1100,8 @@ mod tests {
             rates: std::collections::HashMap::new(),
             rated_at: None,
             store: None,
+            resume_flushed_at: Instant::now(),
+            resume_verified: 0,
         };
         let shared = Shared {
             view: Arc::new(Mutex::new(SessionView::idle(
@@ -1242,6 +1319,162 @@ mod tests {
         let (records, _) = store.load_jobs();
         assert!(records.is_empty(), "the record is gone after removal");
         assert!(base.join("job/owned-series/Episode01.bin").exists());
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn shutdown_writes_a_resume_bitmap_the_next_launch_can_refuse() {
+        let base = std::env::temp_dir().join(format!(
+            "templartorrent-worker-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("job/owned-series")).unwrap();
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let torrent = rbit::TorrentBuilder::new("owned-series")
+            .version(rbit::TorrentVersion::V1)
+            .piece_length(16384)
+            .add_file("Episode02.bin", data[..20_000].to_vec())
+            .add_file("Episode01.bin", data[20_000..].to_vec())
+            .build()
+            .unwrap();
+        std::fs::write(base.join("job/owned-series/Episode02.bin"), &data[..20_000]).unwrap();
+        std::fs::write(base.join("job/owned-series/Episode01.bin"), &data[20_000..]).unwrap();
+        let meta = rbit::Metainfo::from_bytes(&torrent).unwrap();
+        let rbit::InfoHash::V1(hash) = meta.info_hash else {
+            panic!("fixture must be v1");
+        };
+        let store = SessionStore::new(base.join("session"));
+        store
+            .save_job(&JobRecord {
+                info_hash: hash,
+                torrent,
+                destination: base.join("job"),
+                paused: false,
+                public_bootstrap: false,
+                wanted: vec![true, true],
+                order: vec![1, 0],
+                trackers: Vec::new(),
+                preferences: Vec::new(),
+            })
+            .unwrap();
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            session_dir: Some(base.join("session")),
+            ..config()
+        })
+        .unwrap();
+        let start = Instant::now();
+        loop {
+            let view = handle.view();
+            if view.snapshot.jobs.len() == 1
+                && matches!(
+                    view.snapshot.jobs[0].state,
+                    JobState::Complete | JobState::Seeding
+                )
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "job never restored: {:?}",
+                view.note
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.shutdown();
+        let resume_path = store
+            .dir()
+            .join(format!("{}.resume", crate::persist::hex(&hash)));
+        let text = std::fs::read_to_string(&resume_path).unwrap();
+        assert!(text.starts_with("templartorrent-resume 1\n"), "{text}");
+        assert!(text.contains("barrier 1\n"), "{text}");
+        assert!(
+            text.contains("bits 1f\n"),
+            "five verified pieces, got {text}"
+        );
+
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            session_dir: Some(base.join("session")),
+            ..config()
+        })
+        .unwrap();
+        let start = Instant::now();
+        let note = loop {
+            let view = handle.view();
+            if view.snapshot.jobs.len() == 1
+                && matches!(
+                    view.snapshot.jobs[0].state,
+                    JobState::Complete | JobState::Seeding
+                )
+                && view
+                    .note
+                    .as_ref()
+                    .is_some_and(|note| note.contains("Restored"))
+            {
+                break view.note.unwrap();
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "trusted launch did not restore: {:?}",
+                handle.view().note
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            !note.contains("not trusted") && !note.contains("ignored"),
+            "{note}"
+        );
+        handle.shutdown();
+
+        let text = std::fs::read_to_string(&resume_path)
+            .unwrap()
+            .replace("barrier 1", "barrier 0");
+        std::fs::write(&resume_path, text).unwrap();
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            session_dir: Some(base.join("session")),
+            ..config()
+        })
+        .unwrap();
+        let start = Instant::now();
+        let note = loop {
+            let view = handle.view();
+            if view.snapshot.jobs.len() == 1
+                && view
+                    .note
+                    .as_ref()
+                    .is_some_and(|note| note.contains("barrier"))
+            {
+                break view.note.unwrap();
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "barrier refusal was not reported: {:?}",
+                handle.view().note
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(note.contains("no durability barrier"), "{note}");
+        assert!(
+            matches!(
+                handle.view().snapshot.jobs[0].state,
+                JobState::Complete | JobState::Seeding
+            ),
+            "a refused bitmap still rechecks"
+        );
+        let id = handle.view().snapshot.jobs[0].id;
+        handle
+            .try_request(Request::Command {
+                seq: 1,
+                command: Command::Remove {
+                    id,
+                    delete_data: false,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(1, Duration::from_secs(5)).unwrap();
+        assert!(ack.accepted, "{}", ack.message);
+        assert!(!resume_path.exists(), "removal deletes the bitmap");
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&base);
     }

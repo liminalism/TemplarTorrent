@@ -9,7 +9,7 @@ use std::{
 
 use templartorrent_core::{
     model::{JobState, Limits, Snapshot, TorrentId, TorrentRow},
-    sequence::{FileSpec, SKIP, Sequence},
+    sequence::{FileSpec, SKIP, Sequence, SequenceError},
     tracker::TrackerClock,
 };
 
@@ -404,6 +404,39 @@ impl Session {
             }
         }
         Ok(report)
+    }
+
+    /// Mark pieces verified without reading them. The caller has already
+    /// decided their durable bytes match the torrent. Out-of-range pieces
+    /// fail before any piece in `pieces` is adopted. Held or in-flight pieces
+    /// are left alone. Returns how many pieces newly became verified.
+    pub fn adopt_trusted(&mut self, id: TorrentId, pieces: &[u32]) -> Result<usize, EngineError> {
+        let Some(index) = self.jobs.iter().position(|job| job.id == id) else {
+            return Err(EngineError::UnknownJob);
+        };
+        let count = self.jobs[index].coordinator.sequence().piece_count();
+        if pieces.iter().any(|piece| *piece as usize >= count) {
+            return Err(EngineError::Sequence(SequenceError::InvalidPiece));
+        }
+        let mut adopted = 0;
+        for &piece in pieces {
+            if self.jobs[index]
+                .coordinator
+                .sequence()
+                .is_verified(piece as usize)
+                || self.verifying.contains(&(id.0, piece))
+                || self.jobs[index].coordinator.is_held(piece)
+            {
+                continue;
+            }
+            if self.jobs[index].coordinator.adopt_verified(piece)? {
+                adopted += 1;
+            }
+        }
+        if Self::is_complete(&self.jobs[index]) && self.jobs[index].state != JobState::Paused {
+            self.jobs[index].state = JobState::Seeding;
+        }
+        Ok(adopted)
     }
 
     /// Non-destructive removal only; data deletion arrives with safe storage.
