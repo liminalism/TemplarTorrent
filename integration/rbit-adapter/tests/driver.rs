@@ -783,7 +783,7 @@ async fn driver_corruption_retries_verified_piece_without_corrupting_files() {
         )
         .await;
         let mut driver = driver();
-        driver
+        let id = driver
             .add_magnet(
                 &fixture.magnet(),
                 &root.job(),
@@ -793,7 +793,38 @@ async fn driver_corruption_retries_verified_piece_without_corrupting_files() {
             )
             .await
             .unwrap();
-        assert_eq!(complete(&mut driver).await, 1);
+        let start = Instant::now();
+        let mut failed = 0;
+        let mut attributed = false;
+        loop {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "driver transfer deadline exceeded"
+            );
+            let report = driver.step(Duration::from_millis(10)).await.unwrap();
+            failed += report.hash_failures;
+            assert!(report.peer_errors.is_empty(), "{:?}", report.peer_errors);
+            if driver
+                .peer_status(id)
+                .iter()
+                .any(|peer| peer.hash_failures == 1 && peer.rtt_us.is_some())
+            {
+                attributed = true;
+            }
+            if driver
+                .snapshot()
+                .jobs
+                .iter()
+                .all(|row| row.state == JobState::Complete)
+            {
+                break;
+            }
+        }
+        assert_eq!(failed, 1);
+        assert!(
+            attributed,
+            "the blamed peer stayed connected with one hash failure and a measured round trip"
+        );
         fixture.assert_files(&root.job());
         // The corrupted block belongs to the first requested piece; every block
         // of that piece is fetched twice (piece 3 is the one-block tail).

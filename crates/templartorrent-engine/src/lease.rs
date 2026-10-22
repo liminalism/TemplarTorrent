@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use templartorrent_core::{
     model::TorrentId,
     picker::PieceIndex,
-    sequence::{Sequence, SequenceError},
+    sequence::{SKIP, Sequence, SequenceError},
 };
 
 use crate::{EngineError, event::PeerId};
@@ -153,6 +153,26 @@ impl LeaseCoordinator {
         lease.blocks.remove(index);
         lease.issued_ns = now_ns;
         true
+    }
+
+    /// True when `peer` is the only announcer of some still-wanted piece that
+    /// is not yet verified. A verified piece inside an incomplete file can
+    /// keep a non-SKIP rank, so verification is checked on its own.
+    pub fn sole_wanted_supplier(&self, peer: PeerId) -> bool {
+        let Some(bits) = self.peers.get(&peer) else {
+            return false;
+        };
+        let ranks = self.sequence.piece_ranks();
+        for (index, (&count, &rank)) in self.availability.iter().zip(ranks).enumerate() {
+            if count != 1 || rank == SKIP || self.sequence.is_verified(index) {
+                continue;
+            }
+            let mask = 1u64 << (index % 64);
+            if bits.get(index / 64).is_some_and(|word| word & mask != 0) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Register a peer with an empty bitfield. Returns false if already known.
@@ -400,5 +420,50 @@ impl LeaseCoordinator {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LeaseCoordinator;
+    use crate::event::PeerId;
+    use templartorrent_core::{
+        model::TorrentId,
+        sequence::{FileSpec, SKIP, Sequence},
+    };
+
+    #[test]
+    fn sole_wanted_supplier_is_one_unverified_piece() {
+        let length = 32_768;
+        let sequence = Sequence::new(
+            vec![FileSpec {
+                path: "a.bin".into(),
+                length,
+                wanted: true,
+            }],
+            16_384,
+            1024,
+        )
+        .unwrap();
+        let mut coordinator = LeaseCoordinator::new(TorrentId(1), sequence, 16_384, length);
+        let first = PeerId(1);
+        let second = PeerId(2);
+        assert!(coordinator.add_peer(first));
+        assert!(coordinator.add_peer(second));
+        assert!(!coordinator.sole_wanted_supplier(first));
+        coordinator.note_bitfield(first, &[0b01]).unwrap();
+        coordinator.note_bitfield(second, &[0b10]).unwrap();
+        assert!(coordinator.sole_wanted_supplier(first));
+        assert!(coordinator.sole_wanted_supplier(second));
+        coordinator.note_have(first, 1).unwrap();
+        assert!(coordinator.sole_wanted_supplier(first));
+        assert!(!coordinator.sole_wanted_supplier(second));
+        let lease = coordinator.pick_for(first, 0).unwrap().unwrap();
+        assert_eq!(lease.piece, 0, "availability 1 outranks availability 2");
+        coordinator.complete_lease(&lease).unwrap();
+        assert!(coordinator.sequence().is_verified(0));
+        assert_ne!(coordinator.sequence().piece_ranks()[0], SKIP);
+        assert!(!coordinator.sole_wanted_supplier(first));
+        assert!(!coordinator.sole_wanted_supplier(PeerId(9)));
     }
 }

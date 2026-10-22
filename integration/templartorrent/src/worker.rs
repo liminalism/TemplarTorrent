@@ -64,6 +64,10 @@ pub struct PeerView {
     pub client: String,
     pub down_bps: u64,
     pub up_bps: u64,
+    /// Smoothed block round trip in microseconds, when a requested block has returned.
+    pub rtt_us: Option<u64>,
+    /// Hash failures attributed to this peer.
+    pub hash_failures: u32,
     pub country: Option<[u8; 2]>,
     pub remote_choked: bool,
     pub remote_interested: bool,
@@ -772,6 +776,8 @@ fn peer_rows(driver: &Driver, id: TorrentId, geo: &mut GeoDb) -> Vec<PeerView> {
                 client: peer.client,
                 down_bps: peer.down_bps,
                 up_bps: peer.up_bps,
+                rtt_us: peer.rtt_us,
+                hash_failures: peer.hash_failures,
                 country,
                 remote_choked: peer.remote_choked,
                 remote_interested: peer.remote_interested,

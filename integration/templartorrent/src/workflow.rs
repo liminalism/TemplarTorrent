@@ -383,6 +383,15 @@ pub fn rate_text(bytes_per_second: u64) -> String {
     }
 }
 
+/// Block round trip for the peer row. Sub-millisecond samples stay visible.
+pub fn rtt_text(rtt_us: Option<u64>) -> String {
+    match rtt_us {
+        None => "—".into(),
+        Some(us) if us / 1000 == 0 => "<1 ms".into(),
+        Some(us) => format!("{} ms", us / 1000),
+    }
+}
+
 pub fn eta_text(row: &TorrentRow) -> String {
     if row.wanted_bytes == 0 || matches!(row.state, JobState::Paused | JobState::Queued) {
         return "—".into();
@@ -620,6 +629,10 @@ mod tests {
     fn unknown_rates_and_eta_use_an_em_dash() {
         let idle = row(JobState::Downloading, 100, 10, 0);
         assert_eq!(rate_text(0), "—");
+        assert_eq!(rtt_text(None), "—");
+        assert_eq!(rtt_text(Some(0)), "<1 ms");
+        assert_eq!(rtt_text(Some(999)), "<1 ms");
+        assert_eq!(rtt_text(Some(5_000)), "5 ms");
         assert_eq!(eta_text(&idle), "—");
         assert!(job_line(&idle).contains("—"));
         let done = row(JobState::Complete, 100, 100, 0);

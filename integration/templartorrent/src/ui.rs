@@ -23,7 +23,7 @@ use crate::worker::{FileRow, ListenState, Request, SessionView, TrackerView, Wor
 use crate::workflow::{
     self, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, automatic_order, cooldown_text,
     country_text, eta_text, format_bytes, move_file, preference_text, rank_label, rate_text,
-    speed_cap, validate_destination, validate_magnet,
+    rtt_text, speed_cap, validate_destination, validate_magnet,
 };
 
 const BG: u32 = 0xf4f4f2;
@@ -1522,9 +1522,11 @@ impl Desktop {
             ui.label_styled(
                 Rect::new(rect.x, rect.y + s.px(20), rect.w, s.px(20)),
                 &format!(
-                    "{remote}, {local}, remote {interest}    down {}    up {}",
+                    "{remote}, {local}, remote {interest}    down {}    up {}    rtt {}    bad {}",
                     rate_text(peer.down_bps),
-                    rate_text(peer.up_bps)
+                    rate_text(peer.up_bps),
+                    rtt_text(peer.rtt_us),
+                    peer.hash_failures
                 ),
                 *small,
                 MUTED,

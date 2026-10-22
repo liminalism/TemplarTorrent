@@ -58,6 +58,8 @@ const OPTIMISTIC_INTERVAL_S: u64 = 30;
 const CHOKE_INTERVAL_S: u64 = 10;
 /// Per-peer payload rates are sampled over this window and blended 3:1.
 const RATE_WINDOW: Duration = Duration::from_secs(2);
+/// Outstanding request stamps kept per peer. Older stamps drop first.
+const RTT_PENDING_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +108,11 @@ pub struct PeerStatus {
     pub down_bps: u64,
     /// Payload sent to this peer, smoothed, bytes per second.
     pub up_bps: u64,
+    /// Smoothed block round trip in microseconds. Absent until a block we
+    /// requested comes back.
+    pub rtt_us: Option<u64>,
+    /// Hash failures attributed to blocks this peer supplied.
+    pub hash_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +227,12 @@ struct Wire {
     window_up: u64,
     down_bps: u64,
     up_bps: u64,
+    /// Block requests stamped when sent, oldest first.
+    pending_rtt: Vec<SentRequest>,
+    /// Smoothed solicited-block round trip, microseconds.
+    rtt_us: Option<u64>,
+    /// Attributed hash failures. They demote this peer and disconnect nobody.
+    hash_failures: u32,
 }
 struct WireCommand {
     message: Message,
@@ -814,6 +827,9 @@ impl Driver {
                 window_up: 0,
                 down_bps: 0,
                 up_bps: 0,
+                pending_rtt: Vec::new(),
+                rtt_us: None,
+                hash_failures: 0,
             },
         );
         let pipeline = pipeline_for(self.peer_preference(id, source.address));
@@ -1253,8 +1269,16 @@ impl Driver {
                 self.session.set_peer_choking(id, peer, true)
             }
             Message::Piece { index, begin, data } => {
+                let now = self.now_ns();
                 if let Some(wire) = self.wires.get_mut(&peer) {
                     wire.window_down = wire.window_down.saturating_add(data.len() as u64);
+                    if let Some(sent) = take_request(&mut wire.pending_rtt, index, begin) {
+                        let sample = now.saturating_sub(sent) / 1_000;
+                        wire.rtt_us = Some(match wire.rtt_us {
+                            Some(previous) => blend_rate(previous, sample),
+                            None => sample,
+                        });
+                    }
                 }
                 self.session
                     .inject_block(id, peer, index, begin, data.to_vec())
@@ -1553,6 +1577,13 @@ impl Driver {
         report.work_outcomes += outcomes;
         report.completed.extend(completed.iter().copied());
         report.hash_failures += blamed.len();
+        for entry in &blamed {
+            if let Some(wire) = self.wires.get_mut(&entry.peer)
+                && wire.torrent == entry.torrent
+            {
+                wire.hash_failures = wire.hash_failures.saturating_add(1);
+            }
+        }
         for (id, piece) in verified {
             for (peer, wire) in &self.wires {
                 if wire.torrent == id && self.queue(*peer, Message::Have { piece }).is_err() {
@@ -1572,20 +1603,31 @@ impl Driver {
                     piece,
                     begin,
                     length,
-                } => Message::Request {
-                    index: piece,
-                    begin,
-                    length,
-                },
+                } => {
+                    let now = self.now_ns();
+                    if let Some(wire) = self.wires.get_mut(&entry.peer) {
+                        note_request(&mut wire.pending_rtt, piece, begin, now);
+                    }
+                    Message::Request {
+                        index: piece,
+                        begin,
+                        length,
+                    }
+                }
                 PeerMessage::Cancel {
                     piece,
                     begin,
                     length,
-                } => Message::Cancel {
-                    index: piece,
-                    begin,
-                    length,
-                },
+                } => {
+                    if let Some(wire) = self.wires.get_mut(&entry.peer) {
+                        forget_request(&mut wire.pending_rtt, piece, begin);
+                    }
+                    Message::Cancel {
+                        index: piece,
+                        begin,
+                        length,
+                    }
+                }
             };
             if self
                 .wires
@@ -1684,6 +1726,8 @@ impl Driver {
                 preference: self.peer_preference(id, wire.source.address),
                 down_bps: wire.down_bps,
                 up_bps: wire.up_bps,
+                rtt_us: wire.rtt_us,
+                hash_failures: wire.hash_failures,
             })
             .collect();
         rows.sort_by_key(|row| row.address);
@@ -2063,18 +2107,19 @@ impl Driver {
             .and_then(|(peer, _)| self.session.peer_pipeline(id, *peer).ok())
     }
 
-    /// Regular slot order: preference first, then the peer that currently
-    /// gives us the most verified payload (or, for a seeding job, takes the
-    /// most), then connection order. Re-ranked every [`CHOKE_INTERVAL_S`];
-    /// peers that arrived since are appended, so an order never churns on a
-    /// single fast step.
+    /// Regular slot order: manual preference, then fewer attributed hash
+    /// failures, then a peer who alone has a still-wanted piece, then higher
+    /// payload rate, then a lower measured block round trip, then connection
+    /// order. A seeding job uses upload rate and ignores download rate and
+    /// download round trip. Re-ranked every [`CHOKE_INTERVAL_S`]; peers that
+    /// arrived since are appended, so an order never churns on one fast step.
     fn regular_order(&mut self, rows: &Snapshot) -> Vec<PeerId> {
         let now = self.elapsed_s();
         let due = self
             .choke_evaluated_s
             .is_none_or(|at| now.saturating_sub(at) >= CHOKE_INTERVAL_S);
         if due {
-            let mut entries: Vec<(u8, u64, u64, PeerId)> = self
+            let mut entries: Vec<(SlotKey, PeerId)> = self
                 .wires
                 .iter()
                 .map(|(peer, wire)| {
@@ -2082,13 +2127,19 @@ impl Driver {
                         .jobs
                         .iter()
                         .any(|job| job.id == wire.torrent && job.state == JobState::Seeding);
-                    let score = if seeding { wire.up_bps } else { wire.down_bps };
-                    (
-                        preference_rank(self.peer_preference(wire.torrent, wire.source.address)),
-                        score,
-                        peer.0,
-                        *peer,
-                    )
+                    let key = slot_key(SlotInput {
+                        preference: preference_rank(
+                            self.peer_preference(wire.torrent, wire.source.address),
+                        ),
+                        failures: wire.hash_failures,
+                        sole: self.session.sole_wanted_supplier(wire.torrent, *peer),
+                        seeding,
+                        down_bps: wire.down_bps,
+                        up_bps: wire.up_bps,
+                        rtt_us: wire.rtt_us,
+                        order: peer.0,
+                    });
+                    (key, *peer)
                 })
                 .collect();
             self.choke_order = rank_peers(&mut entries);
@@ -2593,12 +2644,91 @@ fn pipeline_for(preference: PeerPreference) -> usize {
     }
 }
 
-/// Preference rank ascending, then measured score descending, then
-/// connection order. Pure so the policy is testable without a clock.
-fn rank_peers(entries: &mut [(u8, u64, u64, PeerId)]) -> Vec<PeerId> {
-    entries
-        .sort_unstable_by_key(|(rank, score, order, _)| (*rank, std::cmp::Reverse(*score), *order));
-    entries.iter().map(|(_, _, _, peer)| *peer).collect()
+/// One block request waiting for its piece message.
+struct SentRequest {
+    piece: u32,
+    begin: u32,
+    sent_ns: u64,
+}
+
+/// Inputs to one upload-slot key. Seeding ignores `sole`, `down_bps` and `rtt_us`.
+struct SlotInput {
+    preference: u8,
+    failures: u32,
+    sole: bool,
+    seeding: bool,
+    down_bps: u64,
+    up_bps: u64,
+    rtt_us: Option<u64>,
+    order: u64,
+}
+
+/// Ascending slot key. `rate` is reversed so a faster peer sorts earlier.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SlotKey {
+    preference: u8,
+    failures: u32,
+    /// 0 when this peer alone has a still-wanted piece. Seeding forces 1.
+    rarity: u8,
+    rate: std::cmp::Reverse<u64>,
+    rtt_us: u64,
+    order: u64,
+}
+
+fn slot_key(input: SlotInput) -> SlotKey {
+    let (rate, rarity, rtt_us) = if input.seeding {
+        (input.up_bps, 1, u64::MAX)
+    } else {
+        (
+            input.down_bps,
+            u8::from(!input.sole),
+            input.rtt_us.unwrap_or(u64::MAX),
+        )
+    };
+    SlotKey {
+        preference: input.preference,
+        failures: input.failures,
+        rarity,
+        rate: std::cmp::Reverse(rate),
+        rtt_us,
+        order: input.order,
+    }
+}
+
+/// Preference, then failures, rarity, rate, round trip and arrival.
+/// Pure so the policy is testable without a clock.
+fn rank_peers(entries: &mut [(SlotKey, PeerId)]) -> Vec<PeerId> {
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    entries.iter().map(|(_, peer)| *peer).collect()
+}
+
+fn note_request(pending: &mut Vec<SentRequest>, piece: u32, begin: u32, sent_ns: u64) {
+    if let Some(found) = pending
+        .iter_mut()
+        .find(|request| request.piece == piece && request.begin == begin)
+    {
+        found.sent_ns = sent_ns;
+        return;
+    }
+    if pending.len() >= RTT_PENDING_CAP {
+        pending.remove(0);
+    }
+    pending.push(SentRequest {
+        piece,
+        begin,
+        sent_ns,
+    });
+}
+
+fn take_request(pending: &mut Vec<SentRequest>, piece: u32, begin: u32) -> Option<u64> {
+    let index = pending
+        .iter()
+        .position(|request| request.piece == piece && request.begin == begin)?;
+    Some(pending.remove(index).sent_ns)
+}
+
+fn forget_request(pending: &mut Vec<SentRequest>, piece: u32, begin: u32) {
+    pending.retain(|request| request.piece != piece || request.begin != begin);
 }
 
 fn blend_rate(previous: u64, instant: u64) -> u64 {
@@ -2714,22 +2844,105 @@ async fn peer_actor(
 mod policy_tests {
     use super::*;
 
+    fn input(
+        (preference, failures, sole, seeding, down_bps, up_bps, rtt_us, order): (
+            u8,
+            u32,
+            bool,
+            bool,
+            u64,
+            u64,
+            Option<u64>,
+            u64,
+        ),
+    ) -> SlotKey {
+        slot_key(SlotInput {
+            preference,
+            failures,
+            sole,
+            seeding,
+            down_bps,
+            up_bps,
+            rtt_us,
+            order,
+        })
+    }
+
     #[test]
-    fn regular_slots_rank_preference_then_rate_then_arrival() {
+    fn slot_order_ranks_preference_failures_rarity_rate_and_rtt() {
         let peer = |n: u64| PeerId(n);
-        let mut entries = vec![
-            (1, 50_000, 1, peer(1)),
-            (0, 10, 2, peer(2)),
-            (1, 90_000, 3, peer(3)),
-            (2, 999_999, 4, peer(4)),
-            (1, 90_000, 0, peer(0)),
+        let mut rate_only = vec![
+            (input((1, 0, false, false, 50_000, 0, None, 1)), peer(1)),
+            (input((0, 0, false, false, 10, 0, None, 2)), peer(2)),
+            (input((1, 0, false, false, 90_000, 0, None, 3)), peer(3)),
+            (input((2, 0, false, false, 999_999, 0, None, 4)), peer(4)),
+            (input((1, 0, false, false, 90_000, 0, None, 0)), peer(0)),
         ];
         assert_eq!(
-            rank_peers(&mut entries),
+            rank_peers(&mut rate_only),
             vec![peer(2), peer(0), peer(3), peer(1), peer(4)]
+        );
+
+        let mut ranked = vec![
+            (input((0, 0, false, false, 10, 0, Some(1), 7)), peer(7)),
+            (input((1, 0, true, false, 1, 0, Some(9_000), 6)), peer(6)),
+            (input((1, 0, false, false, 100, 0, Some(5_000), 5)), peer(5)),
+            (
+                input((1, 0, false, false, 100, 0, Some(10_000), 4)),
+                peer(4),
+            ),
+            (input((1, 0, false, false, 100, 0, None, 3)), peer(3)),
+            (
+                input((1, 1, true, false, 1_000_000, 0, Some(1), 2)),
+                peer(2),
+            ),
+            (
+                input((2, 0, true, false, 1_000_000, 0, Some(1), 1)),
+                peer(1),
+            ),
+        ];
+        assert_eq!(
+            rank_peers(&mut ranked),
+            vec![
+                peer(7),
+                peer(6),
+                peer(5),
+                peer(4),
+                peer(3),
+                peer(2),
+                peer(1)
+            ]
+        );
+        assert!(
+            input((1, 0, false, false, 100, 0, Some(0), 2))
+                < input((1, 0, false, false, 100, 0, None, 1))
+        );
+        assert!(
+            input((1, 0, false, true, 1, 500, None, 9))
+                < input((1, 0, true, true, 9_000_000, 10, Some(1), 1))
         );
         assert_eq!(blend_rate(0, 400), 400);
         assert_eq!(blend_rate(400, 0), 300);
         assert_eq!(blend_rate(1_000, 2_000), 1_250);
+    }
+
+    #[test]
+    fn slot_order_pending_rtt_replaces_and_caps() {
+        let mut pending = Vec::new();
+        note_request(&mut pending, 1, 0, 10);
+        note_request(&mut pending, 1, 0, 25);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sent_ns, 25);
+        assert_eq!(take_request(&mut pending, 1, 0), Some(25));
+        assert_eq!(take_request(&mut pending, 1, 0), None);
+        forget_request(&mut pending, 1, 0);
+        for index in 0..(RTT_PENDING_CAP + 5) {
+            note_request(&mut pending, 0, index as u32, index as u64);
+        }
+        assert_eq!(pending.len(), RTT_PENDING_CAP);
+        assert!(pending.iter().all(|request| request.begin >= 5));
+        forget_request(&mut pending, 0, 5);
+        assert_eq!(pending.len(), RTT_PENDING_CAP - 1);
+        assert!(pending.iter().all(|request| request.begin != 5));
     }
 }

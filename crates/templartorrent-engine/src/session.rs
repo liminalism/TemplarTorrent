@@ -106,8 +106,8 @@ pub struct SessionReport {
     pub completed: Vec<TorrentId>,
     pub connected: Vec<(TorrentId, PeerId)>,
     /// One entry per hash failure with an attributed supplier. Attribution is
-    /// exact while each queued item holds one peer's bytes; per-peer scoring
-    /// and quarantine consume this in later work.
+    /// exact while each queued item holds one peer's bytes. The driver counts
+    /// these on that peer and demotes only that peer in the upload-slot order.
     pub blamed: Vec<BlameEntry>,
     pub errors: Vec<EngineError>,
 }
@@ -722,6 +722,15 @@ impl Session {
             .get(&peer)
             .map(|actor| actor.max_in_flight())
             .ok_or(EngineError::UnknownPeer)
+    }
+
+    /// True when `peer` alone announced some still-wanted, unverified piece.
+    /// Unknown jobs and peers are not sole suppliers.
+    pub fn sole_wanted_supplier(&self, torrent: TorrentId, peer: PeerId) -> bool {
+        self.jobs
+            .iter()
+            .find(|job| job.id == torrent)
+            .is_some_and(|job| job.coordinator.sole_wanted_supplier(peer))
     }
 
     pub fn disconnect(&mut self, torrent: TorrentId, peer: PeerId) -> Result<(), EngineError> {

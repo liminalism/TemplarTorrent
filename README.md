@@ -95,7 +95,7 @@ layout/policy demonstrator, not a connectivity test or production UI.
 | Trackers | Privacy gate, interval/backoff state | HTTP/UDP actors, discovery arbitration, feed validation/cache |
 | Engine | Real rbit type wrappers and bitfield conversion | Magnets-to-payload transfer loop, metadata exchange, hashing/storage |
 | UI | Native PixelKit split panes and fixture inspector | Add/limits/remove dialogs, real commands/acks, file browser |
-| Peers | Typed state, local Prefer/Avoid/Block, per-peer smoothed rates, rate-ranked upload slots with a rotating optimistic slot, MMDB country lookup | RTT/reliability scoring, peer-ID client fallback, flag atlas |
+| Peers | Typed state, local Prefer/Avoid/Block, per-peer smoothed rates, upload slots ranked by preference, attributed hash failures, rare-piece availability, rate and block round trip, with a rotating optimistic slot, MMDB country lookup | peer-ID client fallback, flag atlas |
 | Removal | Default-safe intent, Linux handle-relative no-follow deletion with inode identity and hardlink refusal, forced-kill restart recheck | Windows reparse-aware deletion, crash journal |
 | Persistence | Per-job records, settings, window size and split ratio under `$XDG_DATA_HOME/templartorrent/session`, atomic writes, resume bitmap trusted only when the durability barrier is present and file device, inode, size and mtime still match | Pieces written after the last checkpoint are rechecked |
 | Performance | Scalar/AVX2 kernel, bucketed `(rank, availability)` piece index 65x to 170x below the O(P) oracle pick, microbench JSONL, localhost magnet-startup samples | Large piece-count end-to-end scenario, UI first-frame/RSS evidence, AVX2 use in the picker (no measured win) |
