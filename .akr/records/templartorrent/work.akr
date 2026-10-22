@@ -134,6 +134,39 @@ record templartorrent.work.peer-preference/1 : work {
     part_of [ @templartorrent.milestone.safety-and-peer-policy ]
 }
 
+record templartorrent.work.picker-buckets/1 : work {
+    title "Per-rank availability buckets for the live piece picker, oracle-checked"
+    state proposed
+    scope [
+        path "crates/templartorrent-bench/src/main.rs",
+        path "crates/templartorrent-core/src/sequence.rs",
+        path "crates/templartorrent-engine/src/session.rs"
+    ]
+    intent """
+        Replace the per-call full scan in the live engine's piece selection with an incrementally maintained structure keyed by (piece_rank, availability) so a pick is proportional to candidates in the lowest non-empty rank bucket rather than to the piece count. Keep the scalar Sequence picker unchanged as the oracle, add randomized equivalence tests, extend templartorrent-bench with the new picker beside reference_piece_pick, and gather repeated before/after runs at 1k, 100k and 1M pieces plus a release localhost scenario.
+        """
+    note """
+        Not started. Baseline on 2026-10-22: reference pick p50 3 us at 1k, 170 to 350 us at 100k, 4.8 ms at 1M pieces. AVX2 eligibility showed no consistent gain, so this is the first optimization target.
+        """
+    acceptance {
+        check bench {
+            statement """
+                Bench JSONL shows the new picker's p50 and p95 below the baseline reference pick at 100k and 1M pieces across at least three runs each.
+                """
+            method command
+            command "cargo run --release -p templartorrent-bench -- --pieces 1000000 --iterations 500"
+        }
+        check equivalence {
+            statement """
+                Randomized oracle tests pass with the new picker producing the oracle's pick for every tried state.
+                """
+            method command
+            command "cargo test --workspace"
+        }
+    }
+    part_of [ @templartorrent.milestone.picker-optimization ]
+}
+
 record templartorrent.work.rbit-driver/1 : work {
     title "Reusable bounded magnet and transfer driver"
     state completed

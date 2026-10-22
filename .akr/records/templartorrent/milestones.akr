@@ -107,6 +107,91 @@ record templartorrent.milestone.native-app-wiring/1 : milestone {
     }
 }
 
+record templartorrent.milestone.performance-baselines/1 : milestone {
+    title "Performance baselines recorded before any optimization"
+    state completed
+    scope [
+        path "crates/templartorrent-bench/**",
+        path "crates/templartorrent-core/src/sequence.rs",
+        path "crates/templartorrent-simd/**",
+        path "integration/rbit-adapter/tests/driver.rs"
+    ]
+    intent """
+        AGENTS.md step 5, first half: establish repeatable baselines on the documented development laptop per docs/PERFORMANCE.md before optimizing anything. Record the microbenchmark at 1k, 100k and 1M pieces with scalar and runtime-dispatched AVX2 backends, a release-profile localhost magnet-to-first-verified-piece sample with payload high-water and sampled RSS, and the scalar/AVX2 equivalence tests, as raw JSONL and logs under perf-results/. Name the measured hot spot that any later optimization must target with before/after evidence.
+        """
+    note """
+        Opened 2026-10-22 after persistence completed. Optimization itself is deliberately a later work item: PERFORMANCE.md requires repeated whole-scenario improvement with before/after evidence, and this milestone only establishes the before.
+        """
+    acceptance {
+        check magnet-startup-sample {
+            statement """
+                A release-profile localhost magnet-to-first-verified-piece sample records metadata, first verified write and total transfer nanoseconds with payload high-water and sampled RSS, labelled as including fixture and seeder.
+                """
+            method command
+            command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_magnet_to_first_verified_metrics --nocapture"
+            verified_by [ @templartorrent.evidence.baseline-magnet-startup/1 ]
+        }
+        check microbench-matrix {
+            statement """
+                Release microbenchmark JSONL exists for 1k, 100k and 1M pieces on the documented CPU with the detected backend named, including a repeat run at one size to show run-to-run spread.
+                """
+            method command
+            command "cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 500"
+            verified_by [ @templartorrent.evidence.baseline-microbench/1 ]
+        }
+        check scalar-avx2-equivalence {
+            statement """
+                SIMD equivalence tests pass showing scalar and AVX2 eligibility outputs match at every length including zero, unaligned sub-slices and non-multiples of four words.
+                """
+            method command
+            command "cargo test -p templartorrent-simd"
+            verified_by [ @templartorrent.evidence.baseline-simd-equivalence/1 ]
+        }
+    }
+    after [ @templartorrent.milestone.session-persistence ]
+}
+
+record templartorrent.milestone.picker-optimization/1 : milestone {
+    title "Optimize the measured hot spot: O(P) piece selection"
+    state proposed
+    scope [
+        path "crates/templartorrent-bench/**",
+        path "crates/templartorrent-core/src/sequence.rs",
+        path "crates/templartorrent-engine/**",
+        path "crates/templartorrent-simd/**"
+    ]
+    intent """
+        AGENTS.md step 5, second half, driven by the 2026-10-22 baseline: the reference piece pick scans every piece per call (about 3 us at 1k pieces, 170 to 350 us at 100k, 4.8 ms at 1M on the documented laptop) while the AVX2 eligibility kernel shows no consistent gain over scalar. Replace the per-pick full scan with per-rank availability buckets or dirty candidate windows in the live engine, keep the dependency-free scalar Sequence as the oracle, and prove equal picks against it on randomized fixtures plus repeated before/after microbench and one whole-scenario localhost measurement. Do not integrate the AVX2 kernel into the picker unless the same evidence shows a win.
+        """
+    note """
+        Proposed 2026-10-22; not started. PERFORMANCE.md optimization acceptance applies: no correctness, privacy or safety regression, repeated whole-scenario improvement, oracle and boundary tests re-run after the change.
+        """
+    acceptance {
+        check microbench-before-after {
+            statement """
+                Repeated release microbench runs at 1k, 100k and 1M pieces show the pick cost reduced against the 2026-10-22 baseline with the spread of both reported.
+                """
+            method command
+            command "cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 500"
+        }
+        check oracle-equivalence {
+            statement """
+                Randomized tests show the optimized picker returns the same piece as the scalar Sequence oracle for every peer bitfield, rank layout and reservation state tried, including boundary pieces and more than 255 ranked files.
+                """
+            method command
+            command "cargo test --workspace"
+        }
+        check scenario-before-after {
+            statement """
+                A release localhost transfer with a large piece count shows no regression in magnet-to-first-verified time, payload high-water or RSS against the baseline sample, repeated at least three times.
+                """
+            method command
+            command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_magnet_to_first_verified_metrics --nocapture"
+        }
+    }
+    after [ @templartorrent.milestone.performance-baselines ]
+}
+
 record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
     title "Protected storage, crash/private-discovery tests, capability gates and peer preference"
     state completed

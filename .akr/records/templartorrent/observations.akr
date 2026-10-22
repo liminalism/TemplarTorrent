@@ -260,7 +260,7 @@ record templartorrent.observation.complete-piece-status/4 : observation {
 
 record templartorrent.observation.complete-piece-status/5 : observation {
     title "Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22 uncommitted Linux x86_64/Rust 1.99.0 tree based on 72b01427. AGENTS.md steps 1 to 3 are completed milestones. Beyond the 2026-10-15 seeding state, the tree now holds a production crate `integration/templartorrent` (binary templartorrent): a worker thread owns the rbit Driver on a current-thread runtime, publishes coalesced SessionView snapshots with reliable per-sequence acks, and the PixelKit window has Add (magnet or .torrent, folder browser, space check, public bootstrap flag), Limits, Remove with an unchecked delete-data checkbox, Files order/wanted controls, Trackers with cooldown-gated reannounce, and a Peers tab. Owner-only Unix-socket single-instance activation forwards magnets; peer country comes only from a user-supplied MMDB; font is auto-detected. The storage crate deletes through openat/unlinkat with O_NOFOLLOW, inode identity from the still-open handle, hardlink refusal and no root removal. Tracker discovery, periodic refresh and public augmentation after metadata proves a public torrent exist in the Driver. Local peer preference is implemented today: a per-job table keyed by peer IP where Block closes and refuses the address, Avoid narrows the request pipeline to two blocks, and Prefer is retained first and unchoked first. 138 root and adapter tests, 21 of them in the production crate, and 10 preview tests passed; formatting and Clippy with denied warnings passed in all three workspaces; a release binary built. Evidence and hashes are in perf-results/2026-10-22-peer-preference/. Remaining boundaries: no automatic peer scoring or optimistic-unchoke rotation; no session persistence, so jobs and preferences are lost on restart; no forced-crash restart test; no bounded global file-handle cache beyond the 128 files per job cap; no headful window run, Linux clipboard paste check or Internet swarm in evidence; rbit can still allocate a 16 MiB receive frame before application checks; ring 0.17.14 still reaches the tree through rbit/reqwest/rustls so the native-source release gate is open; Windows is optional and untested.
         """
@@ -273,5 +273,24 @@ record templartorrent.observation.complete-piece-status/5 : observation {
         @templartorrent.evidence.peer-preference-driver,
         @templartorrent.evidence.peer-preference-gates,
         @templartorrent.evidence.production-linux-client
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/6 : observation {
+    title "Committed Linux client through AGENTS.md step 4 with persistence and recorded baselines; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22, Linux x86_64/Rust 1.99.0, committed on master through bf22b04 (initial tree, step 1 to 3 client plus peer preference, step 4 checks, session persistence, ledger refreshes). Milestones for AGENTS.md steps 2, 3 and 4 and for session persistence are completed with evidence; performance baselines are recorded under perf-results/2026-10-22-baselines/. The production client restores saved jobs and settings on launch through a disk recheck, saves after every state-changing command, and removes records with the job. Local peer preference, protected handle-relative deletion, v2/hybrid gates, a forced-process-kill restart test and offline country/client handling are in place. The engine re-evaluates completion when a selection changes. 148 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings are clean in all three workspaces; the release binary builds and stayed up for a six-second headful smoke on a Wayland session. Baseline finding: the AVX2 eligibility kernel shows no consistent gain over scalar at 1k, 100k or 1M pieces on an i7-13700H, while the O(P) reference piece pick costs about 3 us, 170 to 350 us and 4.8 ms respectively, so piece selection is the optimization target (milestone picker-optimization, proposed). Remaining boundaries: no automatic peer scoring or optimistic-unchoke rotation; no resume bitmap, so every launch rechecks from disk; window geometry and split ratio are not persisted; no headful interaction, Linux clipboard paste or Internet swarm test in evidence; no bounded global file-handle cache beyond 128 files per job; rbit can allocate a 16 MiB receive frame before application checks; ring 0.17.14 still reaches the tree through rbit/reqwest/rustls so the native-source release gate is open; Windows is optional and untested; perf-results/ is gitignored so evidence artifacts exist only on this machine.
+        """
+    observed_at git:bf22b04d3d0a4923101a2c7aec5b0c6538da57d8
+    method command
+    watches [ "crates/**", "integration/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/5 ]
+    verified_by [
+        @templartorrent.evidence.baseline-microbench,
+        @templartorrent.evidence.persistence-client,
+        @templartorrent.evidence.persistence-driver,
+        @templartorrent.evidence.persistence-gates,
+        @templartorrent.evidence.step4-forced-crash-restart
     ]
 }

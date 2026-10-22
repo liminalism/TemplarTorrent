@@ -1,6 +1,45 @@
 akr 0.1
 project templartorrent
 
+record templartorrent.evidence.baseline-magnet-startup/1 : evidence {
+    title "Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, release profile, commit bf22b04, one sample each over owned loopback fixtures. Download: 196681 payload bytes, metadata 42229518 ns, magnet-to-first-verified-write 125156840 ns, total 330281810 ns, payload reservation high water 196608 B, engine owned peak sampled 65536 B, metadata permits 268660 B, sampled process RSS 6254592 B including fixture seeder and test harness. Seeding to a second Driver: 342743743 ns, upload reservation peak 98368 B, upload owned peak 81920 B, sampled RSS 6270976 B. Comparable to the 2026-10-15 samples (metadata 41.5 ms, first verified 123.4 ms, total 206 ms download; seed 340 ms); the download total is slower this time on a single sample and nothing was changed on that path, so this is spread, not a regression claim. Not application startup, not a public swarm, no optimization comparison."
+    state verified
+    result pass
+    method command
+    observed_at git:bf22b04d3d0a4923101a2c7aec5b0c6538da57d8
+    command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_magnet_to_first_verified_metrics driver_seeds_verified_disk_and_metadata_to_a_second_driver --nocapture"
+    artifact "perf-results/2026-10-22-baselines/metrics.jsonl"
+    summary """
+        Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, release profile, commit bf22b04, one sample each over owned loopback fixtures. Download: 196681 payload bytes, metadata 42229518 ns, magnet-to-first-verified-write 125156840 ns, total 330281810 ns, payload reservation high water 196608 B, engine owned peak sampled 65536 B, metadata permits 268660 B, sampled process RSS 6254592 B including fixture seeder and test harness. Seeding to a second Driver: 342743743 ns, upload reservation peak 98368 B, upload owned peak 81920 B, sampled RSS 6270976 B. Comparable to the 2026-10-15 samples (metadata 41.5 ms, first verified 123.4 ms, total 206 ms download; seed 340 ms); the download total is slower this time on a single sample and nothing was changed on that path, so this is spread, not a regression claim. Not application startup, not a public swarm, no optimization comparison.
+        """
+}
+
+record templartorrent.evidence.baseline-microbench/1 : evidence {
+    title "Ubuntu 26.04.1, i7-13700H (avx2, sha_ni), rustc 1.99.0, release profile, commit bf22b04, backend detected Avx2, synthetic dense arrays, 500 iterations. eligible p50 ns scalar/auto: 1k pieces 32/36; 100k 939/929 then 697/796 on a repeat run; 1M 7968/6418 with auto p95 20803 versus scalar 9433. reference_piece_pick p50: 1k 3034 ns; 100k 171793 ns then 348377 ns on the repeat with p95 3366847 ns; 1M 4786919 ns with p95 10686525 ns. Finding: the AVX2 eligibility kernel shows no consistent advantage over scalar at any size on this CPU, and the O(P) reference piece pick dominates by two to three orders of magnitude, reaching several milliseconds per pick at 1M pieces. Run-to-run spread at 100k was about 2x on p50, so single runs are not comparable; a laptop on a live desktop session, not an isolated device."
+    state verified
+    result pass
+    method command
+    observed_at git:bf22b04d3d0a4923101a2c7aec5b0c6538da57d8
+    command "cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 500"
+    artifact "perf-results/2026-10-22-baselines/microbench.jsonl"
+    summary """
+        Ubuntu 26.04.1, i7-13700H (avx2, sha_ni), rustc 1.99.0, release profile, commit bf22b04, backend detected Avx2, synthetic dense arrays, 500 iterations. eligible p50 ns scalar/auto: 1k pieces 32/36; 100k 939/929 then 697/796 on a repeat run; 1M 7968/6418 with auto p95 20803 versus scalar 9433. reference_piece_pick p50: 1k 3034 ns; 100k 171793 ns then 348377 ns on the repeat with p95 3366847 ns; 1M 4786919 ns with p95 10686525 ns. Finding: the AVX2 eligibility kernel shows no consistent advantage over scalar at any size on this CPU, and the O(P) reference piece pick dominates by two to three orders of magnitude, reaching several milliseconds per pick at 1M pieces. Run-to-run spread at 100k was about 2x on p50, so single runs are not comparable; a laptop on a live desktop session, not an isolated device.
+        """
+}
+
+record templartorrent.evidence.baseline-simd-equivalence/1 : evidence {
+    title "Same host: 2 SIMD tests passed, dispatch_matches_scalar_including_unaligned_slices_and_tails and mismatched_input_is_rejected, on a CPU where the AVX2 path is actually taken. The scalar fallback on a non-AVX2 machine was not executed here; the shipping profile sets no target-cpu and the dispatch is runtime detected."
+    state verified
+    result pass
+    method command
+    observed_at git:bf22b04d3d0a4923101a2c7aec5b0c6538da57d8
+    command "cargo test -p templartorrent-simd"
+    artifact "perf-results/2026-10-22-baselines/simd-tests.log"
+    summary """
+        Same host: 2 SIMD tests passed, dispatch_matches_scalar_including_unaligned_slices_and_tails and mismatched_input_is_rejected, on a CPU where the AVX2 path is actually taken. The scalar fallback on a non-AVX2 machine was not executed here; the shipping profile sets no target-cpu and the dispatch is runtime detected.
+        """
+}
+
 record templartorrent.evidence.complete-piece-integration-checks/1 : evidence {
     title "All three workspaces passed format checks and Clippy with warnings denied on Linux/Rust 1.99.0; 9 PixelKit headless command/view tests passed. PixelKit native window and Windows were not executed. Native audit separately still lists ring 0.17.14 through rustls/reqwest/rbit; this release blocker is not closed."
     state verified
