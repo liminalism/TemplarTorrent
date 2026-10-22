@@ -53,23 +53,34 @@ https://docs.rs/rustls-rustcrypto/latest/rustls_rustcrypto/
 The owner chose the fork direction. `vendor/rbit` is the published rbit 0.2.2
 source with `reqwest` made optional behind an off-by-default `http-client`
 feature (see `vendor/rbit/TEMPLARTORRENT-FORK.md`); the workspace applies it
-through `[patch.crates-io]`. The adapter announces to HTTP trackers through its
-own bounded plain-HTTP transport (`integration/rbit-adapter/src/announce.rs`):
-one connection to the already-classified address, no redirects, 64 KiB cap,
-`Connection: close`, bencode parsed into rbit's `AnnounceResponse`.
+through `[patch.crates-io]`. The adapter announces through its own bounded
+transport (`integration/rbit-adapter/src/announce.rs`): one connection to the
+already-classified address, no redirects, 64 KiB cap, `Connection: close`,
+bencode parsed into rbit's `AnnounceResponse`. HTTPS uses rustls 0.23.46.
 
 Consequences, stated rather than hidden:
 
-- `cargo tree -i ring`, `-i rustls` and `-i reqwest` on the workspace graph now
-  report nothing. Raw output is kept with each handoff under `perf-results/`.
-- `https://` trackers are refused with a visible reason. This is the explicit
-  limitation the paragraph above warned against removing silently; restoring
-  HTTPS requires choosing and reviewing a pure-Rust TLS stack, which remains
-  open. rbit's WebSeed and UPnP modules are unavailable without the feature and
-  were never used.
-- Remaining non-Rust boundary: OS bindings (`libc`, Wayland/X11 shell crates
-  used by PixelKit) and build scripts of pure-Rust crates. Review the package
-  list in the audit log for `-sys` crates each time the lockfile changes.
+- `cargo tree -i ring` and `-i reqwest` on the workspace graph report nothing.
+  rustls is back, by choice: the owner selected the 2026-10-14 rustls release
+  (0.23.46) for HTTPS tracker announces. Default crate features are off.
+  Enabled features are `std`, `tls12` and `aws_lc_rs`, the cryptography
+  provider that release turns on by default. `ring` is not a feature.
+  `cargo tree -i ring` prints nothing, so ring is not compiled. Cargo.lock
+  still names ring because rustls-webpki declares it as an unused optional
+  dependency. `cargo tree -i aws-lc-sys` reports aws-lc-sys. aws-lc is C,
+  built with cmake. That is an accepted native boundary for tracker TLS,
+  not a pure-Rust stack, and the strict all-Rust claim does not cover it.
+- `https://` announces go through the same bounded client as plain HTTP:
+  one connection to the already-classified address, no redirects, 64 KiB cap,
+  rustls certificate verification against the webpki public roots, and the
+  name from the tracker URL. Brotli certificate decompression is not enabled
+  (0.23.46 advisory GHSA-h2v8-394m-p7vv). The examined `rustls-rustcrypto`
+  provider is still not used. rbit's WebSeed and UPnP modules are unavailable
+  without the `http-client` feature and were never used.
+- Remaining non-Rust boundary: `aws-lc-sys` for tracker TLS, OS bindings
+  (`libc`, Wayland/X11 shell crates used by PixelKit), and build scripts
+  (`cmake` and `cc` for aws-lc, plus build scripts of pure-Rust crates).
+  Review the package list for `-sys` crates each time the lockfile changes.
 
 ## PixelKit Windows integration gate
 

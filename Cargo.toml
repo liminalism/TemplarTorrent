@@ -43,6 +43,7 @@ strip = "none"
 
 # In-tree fork of rbit 0.2.2 (MIT OR Apache-2.0, https://github.com/jspwrd/rbit):
 # identical source except that reqwest is optional (feature `http-client`),
-# so the default graph carries no rustls/ring. See vendor/rbit/TEMPLARTORRENT-FORK.md.
+# so the default graph carries no reqwest or ring. HTTPS announces use
+# rustls 0.23.46 with aws-lc-rs. See vendor/rbit/TEMPLARTORRENT-FORK.md.
 [patch.crates-io]
 rbit = { path = "vendor/rbit" }

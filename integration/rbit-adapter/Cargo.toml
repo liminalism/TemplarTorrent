@@ -13,6 +13,13 @@ templartorrent-storage = { path = "../../crates/templartorrent-storage" }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
 sha1 = "0.10"
 bytes = "1"
+# rustls 0.23.46 (2026-10-14). Default features are off so ring, logging,
+# post-quantum preference and brotli stay out. aws_lc_rs is the provider
+# that release enables by default.
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

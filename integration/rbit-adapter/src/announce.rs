@@ -1,22 +1,28 @@
-//! Application-owned HTTP tracker announce (BEP-3 over plain HTTP/1.1).
+//! Application-owned HTTP tracker announce (BEP-3 over HTTP/1.1).
 //!
 //! The fork of rbit compiles without reqwest, so announces go through this
 //! bounded transport: one TCP connection to an address the discovery module
 //! already admitted (no second DNS lookup between classification and use),
 //! one GET with `Connection: close`, a response capped at
 //! [`MAX_RESPONSE_BYTES`], no redirects followed, and the bencoded body parsed
-//! into rbit's [`AnnounceResponse`]. `https://` trackers are refused with a
-//! visible reason until a reviewed pure-Rust TLS stack is chosen; that is an
-//! explicit limitation, not silent removal.
+//! into rbit's [`AnnounceResponse`]. `https://` trackers use rustls 0.23.46
+//! with its aws-lc-rs provider. The certificate is checked against the webpki
+//! public roots and the name in the tracker URL. Ring is not linked.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use rbit::{AnnounceResponse, CompactPeer, TrackerEvent, Value};
+use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     time::timeout,
 };
+use tokio_rustls::TlsConnector;
 
 use crate::discovery::ParsedTracker;
 
@@ -43,13 +49,11 @@ pub fn build_request(
     tracker: &ParsedTracker,
     request: &AnnounceRequest<'_>,
 ) -> Result<Vec<u8>, &'static str> {
-    if tracker.url.starts_with("https://") {
-        return Err("https trackers need TLS support that this client does not build");
-    }
     let rest = tracker
         .url
-        .strip_prefix("http://")
-        .ok_or("tracker scheme must be http")?;
+        .strip_prefix("https://")
+        .or_else(|| tracker.url.strip_prefix("http://"))
+        .ok_or("tracker scheme must be http or https")?;
     let target = match rest.find(['/', '?']) {
         Some(index) => &rest[index..],
         None => "",
@@ -85,7 +89,12 @@ pub fn build_request(
     } else {
         tracker.host.clone()
     };
-    let host_header = if tracker.port == 80 {
+    let default_port = if tracker.url.starts_with("https://") {
+        443
+    } else {
+        80
+    };
+    let host_header = if tracker.port == default_port {
         host
     } else {
         format!("{host}:{}", tracker.port)
@@ -106,37 +115,86 @@ pub async fn announce(
     address: SocketAddr,
     request: &AnnounceRequest<'_>,
 ) -> Result<AnnounceResponse, &'static str> {
+    announce_with(tracker, address, request, None).await
+}
+
+/// Same as [`announce`], with `tls` replacing the public root bundle. Tests
+/// use this to trust a localhost certificate. `None` verifies against the
+/// webpki roots.
+async fn announce_with(
+    tracker: &ParsedTracker,
+    address: SocketAddr,
+    request: &AnnounceRequest<'_>,
+    tls: Option<Arc<ClientConfig>>,
+) -> Result<AnnounceResponse, &'static str> {
     let bytes = build_request(tracker, request)?;
+    let https = tracker.url.starts_with("https://");
     let exchange = async {
-        let mut stream = TcpStream::connect(address)
+        let tcp = TcpStream::connect(address)
             .await
             .map_err(|_| "tracker connection failed")?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|_| "tracker request failed")?;
-        let mut response = Vec::with_capacity(4096);
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = stream
-                .read(&mut chunk)
+        if https {
+            let name = ServerName::try_from(tracker.host.clone())
+                .map_err(|_| "tracker host is not a valid TLS server name")?;
+            let config = tls.unwrap_or_else(public_tls);
+            let connector = TlsConnector::from(config);
+            let mut stream = connector
+                .connect(name, tcp)
                 .await
-                .map_err(|_| "tracker response read failed")?;
-            if n == 0 {
-                break;
-            }
-            if response.len() + n > MAX_RESPONSE_BYTES {
-                return Err("tracker response exceeds 64 KiB");
-            }
-            response.extend_from_slice(&chunk[..n]);
+                .map_err(|_| "tracker TLS handshake failed")?;
+            exchange_http(&mut stream, &bytes).await
+        } else {
+            let mut stream = tcp;
+            exchange_http(&mut stream, &bytes).await
         }
-        Ok(response)
     };
     let response = timeout(ANNOUNCE_TIMEOUT, exchange)
         .await
         .map_err(|_| "tracker announce deadline exceeded")??;
     let body = parse_http_response(&response)?;
     parse_announce_body(&body)
+}
+
+fn public_tls() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // No ALPN. Many trackers terminate TLS and then speak HTTP/1.1
+        // without negotiating a protocol, and offering one makes rustls
+        // reject that handshake. This client always writes HTTP/1.1.
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }))
+}
+
+async fn exchange_http<S>(stream: &mut S, bytes: &[u8]) -> Result<Vec<u8>, &'static str>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|_| "tracker request failed")?;
+    let mut response = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|_| "tracker response read failed")?;
+        if n == 0 {
+            break;
+        }
+        if response.len() + n > MAX_RESPONSE_BYTES {
+            return Err("tracker response exceeds 64 KiB");
+        }
+        response.extend_from_slice(&chunk[..n]);
+    }
+    Ok(response)
 }
 
 /// Status line, headers and body of one HTTP/1.x response. Only 200 is
@@ -338,10 +396,143 @@ mod tests {
         assert!(text.starts_with("GET /?info_hash="));
         assert!(text.contains("\r\nHost: tracker.example\r\n"));
         let https = parse_tracker_url("https://tracker.example/announce").unwrap();
-        assert_eq!(
-            build_request(&https, &request(&hash, &id)).unwrap_err(),
-            "https trackers need TLS support that this client does not build"
+        let text = String::from_utf8(build_request(&https, &request(&hash, &id)).unwrap()).unwrap();
+        assert!(text.starts_with("GET /announce?info_hash="), "{text}");
+        assert!(text.contains("\r\nHost: tracker.example\r\n"), "{text}");
+        let custom = parse_tracker_url("https://tracker.example:8443/announce").unwrap();
+        let text =
+            String::from_utf8(build_request(&custom, &request(&hash, &id)).unwrap()).unwrap();
+        assert!(
+            text.contains("\r\nHost: tracker.example:8443\r\n"),
+            "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn https_announce_checks_the_certificate_name() {
+        let ca = test_ca();
+        let trusted = issued_cert("localhost", &ca);
+        let trusted_config = tls_trusting(&ca);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(trusted.server));
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&chunk[..n]);
+                if got.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = b"d8:intervali60e5:peers0:e";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.shutdown().await.unwrap();
+            String::from_utf8(got).unwrap()
+        });
+
+        let tracker = parse_tracker_url("https://localhost/announce").unwrap();
+        let hash = [1u8; 20];
+        let id = [2u8; 20];
+        let response = announce_with(
+            &tracker,
+            address,
+            &request(&hash, &id),
+            Some(trusted_config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.interval, 60);
+        let request_text = server.await.unwrap();
+        assert!(request_text.starts_with("GET /announce?"), "{request_text}");
+        assert!(
+            request_text.contains("\r\nHost: localhost\r\n"),
+            "{request_text}"
+        );
+
+        let mismatched = issued_cert("other.example", &ca);
+        let mismatch_config = tls_trusting(&ca);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(mismatched.server));
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+        let error = announce_with(
+            &tracker,
+            address,
+            &request(&hash, &id),
+            Some(mismatch_config),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "tracker TLS handshake failed");
+    }
+
+    struct TestCa {
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+        der: rustls::pki_types::CertificateDer<'static>,
+    }
+
+    struct Issued {
+        server: rustls::ServerConfig,
+    }
+
+    fn test_ca() -> TestCa {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Templar Test CA");
+        let cert = params.self_signed(&key).unwrap();
+        let der = cert.der().clone();
+        TestCa { cert, key, der }
+    }
+
+    fn issued_cert(name: &str, ca: &TestCa) -> Issued {
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+        use rustls::pki_types::PrivateKeyDer;
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let cert = params.signed_by(&key, &ca.cert, &ca.key).unwrap();
+        let key_der = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key_der)
+            .unwrap();
+        Issued { server }
+    }
+
+    fn tls_trusting(ca: &TestCa) -> Arc<ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der.clone()).unwrap();
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
     }
 
     #[test]

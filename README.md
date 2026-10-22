@@ -29,9 +29,9 @@ The GUI preview pins all PixelKit crates to:
 The rbit adapter pins `rbit = "=0.2.2"`, resolved through `[patch.crates-io]`
 to the in-tree fork at `vendor/rbit`: identical source with `reqwest` behind an
 off-by-default `http-client` feature, so the default graph carries no
-rustls/ring. HTTP tracker announces use the application's own bounded
-transport (`integration/rbit-adapter/src/announce.rs`); `https://` trackers
-are refused with a visible reason until a reviewed pure-Rust TLS stack exists.
+reqwest or ring. HTTP and HTTPS tracker announces use the application's own
+bounded transport (`integration/rbit-adapter/src/announce.rs`). HTTPS uses
+rustls 0.23.46 with its aws-lc-rs provider and checks the webpki roots.
 See `vendor/rbit/TEMPLARTORRENT-FORK.md` and `docs/DEPENDENCY-AUDIT.md`.
 
 Dependency resolution, Cargo.lock generation and compilation were **not performed**
@@ -101,6 +101,6 @@ layout/policy demonstrator, not a connectivity test or production UI.
 | Performance | Scalar/AVX2 kernel, bucketed `(rank, availability)` piece index 65x to 170x below the O(P) oracle pick, microbench JSONL, localhost magnet-startup samples | Large piece-count end-to-end scenario, UI first-frame/RSS evidence, AVX2 use in the picker (no measured win) |
 
 All executable application/reference source supplied here is Rust. This is **not** a
-claim that stock rbit's transitive TLS dependency graph contains no C or assembly;
-see the dependency audit. Neither integration directory should be represented as
-release-ready until its explicit gates have passed.
+claim that the TLS dependency graph contains no C or assembly: HTTPS announces use
+rustls 0.23.46 with aws-lc, which is C. See the dependency audit. Neither integration
+directory should be represented as release-ready until its explicit gates have passed.
