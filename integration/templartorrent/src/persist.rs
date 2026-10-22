@@ -17,6 +17,7 @@ use templartorrent_rbit_adapter::driver::JobRecord;
 
 pub const RECORD_HEADER: &str = "templartorrent-job 1";
 pub const SETTINGS_HEADER: &str = "templartorrent-settings 1";
+pub const UI_HEADER: &str = "templartorrent-ui 1";
 pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
 pub const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TRACKERS: usize = 12;
@@ -28,6 +29,45 @@ const MAX_URL: usize = 2048;
 pub struct Settings {
     pub limits: Limits,
     pub allow_local_trackers: bool,
+}
+
+/// Window geometry in logical pixels and the inspector pane's share of the
+/// body. Out-of-range values are clamped on load, never trusted raw.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiState {
+    pub width: u32,
+    pub height: u32,
+    pub split: f32,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        // Transmission GTK's default main window; a larger opening leaves the
+        // download list empty.
+        Self {
+            width: 300,
+            height: 500,
+            split: 0.38,
+        }
+    }
+}
+
+impl UiState {
+    pub const MIN_WIDTH: u32 = 260;
+    pub const MIN_HEIGHT: u32 = 320;
+    const MAX_SIDE: u32 = 16_384;
+
+    pub fn clamped(self) -> Self {
+        Self {
+            width: self.width.clamp(Self::MIN_WIDTH, Self::MAX_SIDE),
+            height: self.height.clamp(Self::MIN_HEIGHT, Self::MAX_SIDE),
+            split: if self.split.is_finite() {
+                self.split.clamp(0.1, 0.9)
+            } else {
+                Self::default().split
+            },
+        }
+    }
 }
 
 pub struct SessionStore {
@@ -129,6 +169,22 @@ impl SessionStore {
             &self.dir.join("settings"),
             encode_settings(settings).as_bytes(),
         )
+    }
+
+    pub fn save_ui(&self, ui: &UiState) -> Result<(), String> {
+        self.ensure_dir()?;
+        write_atomic(&self.dir.join("ui"), encode_ui(&ui.clamped()).as_bytes())
+    }
+
+    /// Saved geometry, clamped; `None` when nothing was saved yet.
+    pub fn load_ui(&self) -> Result<Option<UiState>, String> {
+        let path = self.dir.join("ui");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = read_bounded(&path, MAX_RECORD_BYTES)?;
+        let text = String::from_utf8(text).map_err(|_| "ui state is not UTF-8".to_string())?;
+        decode_ui(&text).map(Some)
     }
 
     pub fn load_settings(&self) -> Result<Option<Settings>, String> {
@@ -346,6 +402,48 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
     })
 }
 
+pub fn encode_ui(ui: &UiState) -> String {
+    format!(
+        "{UI_HEADER}\nwidth {}\nheight {}\nsplit {:.4}\n",
+        ui.width, ui.height, ui.split
+    )
+}
+
+pub fn decode_ui(text: &str) -> Result<UiState, String> {
+    let mut lines = text.lines();
+    if lines.next() != Some(UI_HEADER) {
+        return Err("unknown ui state version".into());
+    }
+    let mut ui = UiState::default();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed line: {line}"))?;
+        match key {
+            "width" => {
+                ui.width = value
+                    .parse()
+                    .map_err(|_| "width must be numeric".to_string())?
+            }
+            "height" => {
+                ui.height = value
+                    .parse()
+                    .map_err(|_| "height must be numeric".to_string())?;
+            }
+            "split" => {
+                ui.split = value
+                    .parse()
+                    .map_err(|_| "split must be numeric".to_string())?
+            }
+            other => return Err(format!("unknown field {other}")),
+        }
+    }
+    Ok(ui.clamped())
+}
+
 fn preference_name(preference: PeerPreference) -> &'static str {
     match preference {
         PeerPreference::Prefer => "Prefer",
@@ -541,6 +639,31 @@ mod tests {
             "payload_budget_bytes 0",
         );
         assert!(decode_settings(&zero).unwrap_err().contains("positive"));
+    }
+
+    #[test]
+    fn ui_state_roundtrips_and_clamps_hostile_values() {
+        let ui = UiState {
+            width: 1120,
+            height: 760,
+            split: 0.42,
+        };
+        let decoded = decode_ui(&encode_ui(&ui)).unwrap();
+        assert_eq!(decoded.width, 1120);
+        assert_eq!(decoded.height, 760);
+        assert!((decoded.split - 0.42).abs() < 0.001);
+        let hostile =
+            decode_ui(&format!("{UI_HEADER}\nwidth 1\nheight 999999\nsplit 7\n")).unwrap();
+        assert_eq!(hostile.width, UiState::MIN_WIDTH);
+        assert_eq!(hostile.height, 16_384);
+        assert!((hostile.split - 0.9).abs() < 0.001);
+        assert!(decode_ui("templartorrent-ui 2\n").is_err());
+        assert!(decode_ui(&format!("{UI_HEADER}\nwidth wide\n")).is_err());
+        let dir = Dir::new("ui");
+        let store = SessionStore::new(dir.0.join("session"));
+        assert!(store.load_ui().unwrap().is_none());
+        store.save_ui(&ui).unwrap();
+        assert_eq!(store.load_ui().unwrap().unwrap().width, 1120);
     }
 
     #[test]

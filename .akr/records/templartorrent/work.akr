@@ -335,3 +335,37 @@ record templartorrent.work.ui-dialogs/1 : work {
     after [ @templartorrent.work.ui-commands ]
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
+
+record templartorrent.work.ui-state-persistence/1 : work {
+    title "Persist window size and inspector split ratio across launches"
+    state completed
+    scope [
+        path "integration/templartorrent/src/main.rs",
+        path "integration/templartorrent/src/persist.rs",
+        path "integration/templartorrent/src/ui.rs"
+    ]
+    intent """
+        DESIGN.md section 2: save splitter ratio and window geometry and clamp them on load. The session store gains a `ui` file (logical width and height, inspector split fraction) written atomically on exit from the last rendered size and pane layout; main.rs reads it before creating the window and falls back to the 300x500 default; values are clamped to 260..=16384 by 320..=16384 and 0.1..=0.9.
+        """
+    note """
+        Done 2026-10-22. Verified headlessly (unit tests on encode/decode/clamp and store roundtrip); the on_exit save path itself was not exercised in a window because closing the window cannot be automated here.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Workspace tests, formatting, Clippy with warnings denied and the release build pass.
+                """
+            method command
+            command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release -p templartorrent"
+            verified_by [ @templartorrent.evidence.ui-state-gates/1 ]
+        }
+        check roundtrip {
+            statement """
+                Client tests show the ui record encoding and decoding, hostile values clamped, unknown versions rejected, and the store returning None before a save and the saved size after.
+                """
+            method command
+            command "cargo test -p templartorrent"
+            verified_by [ @templartorrent.evidence.ui-state-roundtrip/1 ]
+        }
+    }
+}

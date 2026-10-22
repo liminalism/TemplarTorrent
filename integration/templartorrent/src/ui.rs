@@ -18,6 +18,7 @@ use templartorrent_core::model::{
 };
 
 use crate::activate::Activator;
+use crate::persist::{SessionStore, UiState};
 use crate::worker::{FileRow, ListenState, Request, SessionView, TrackerView, WorkerHandle};
 use crate::workflow::{
     self, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, automatic_order, cooldown_text,
@@ -249,15 +250,26 @@ struct Desktop {
     last_title: String,
     pending_title: Option<String>,
     waiting: VecDeque<String>,
+    /// Inspector share of the body as last laid out, saved on exit.
+    split: f32,
+    /// Window size in logical pixels as last rendered.
+    logical_size: (f32, f32),
+    store: Option<SessionStore>,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl Desktop {
-    fn new(client: WorkerHandle, activator: Activator) -> Self {
+    fn new(
+        client: WorkerHandle,
+        activator: Activator,
+        ui: UiState,
+        store: Option<SessionStore>,
+    ) -> Self {
+        let ui = ui.clamped();
         let mut panes = Panes::new(Pane::Jobs);
         if let Some((root, _)) = panes.panes(Rect::new(0, 0, 1100, 700)).first().copied() {
             // The new pane takes this fraction, so the download list stays larger.
-            panes.split(root, Side::Bottom, Pane::Inspector, 0.38);
+            panes.split(root, Side::Bottom, Pane::Inspector, ui.split);
         }
         Self {
             panes,
@@ -281,7 +293,23 @@ impl Desktop {
             last_title: String::new(),
             pending_title: Some("TemplarTorrent".into()),
             waiting: VecDeque::new(),
+            split: ui.split,
+            logical_size: (ui.width as f32, ui.height as f32),
+            store,
         }
+    }
+
+    /// Persist geometry and split ratio; failures only lose the next
+    /// launch's layout, so they are not surfaced at exit.
+    fn save_ui(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let _ = store.save_ui(&UiState {
+            width: self.logical_size.0.round().max(0.0) as u32,
+            height: self.logical_size.1.round().max(0.0) as u32,
+            split: self.split,
+        });
     }
 
     pub fn prime(&mut self, payloads: Vec<String>) {
@@ -744,6 +772,7 @@ impl Desktop {
         interactive: bool,
     ) {
         let full = Rect::new(0, 0, width, height);
+        self.logical_size = (s.logical(width), s.logical(height));
         let (toolbar, below) = full.split_top(s.px(36));
         let (statusbar, body_band) = below.split_bottom(s.px(24));
         let area = body_band.inset(s.px(8));
@@ -759,6 +788,9 @@ impl Desktop {
             let Some(kind) = self.panes.get(id).copied() else {
                 continue;
             };
+            if matches!(kind, Pane::Inspector) && area.h > 0 {
+                self.split = (rect.h as f32 / area.h as f32).clamp(0.1, 0.9);
+            }
             let inner = ui.flat_panel(rect.inset(s.px(1)), PANEL, EDGE, false);
             match kind {
                 Pane::Jobs => self.draw_jobs(ui, view, s, inner, &body, interactive),
@@ -2249,12 +2281,18 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(fonts: &'static FontSet, client: WorkerHandle, activator: Activator) -> Self {
+    pub fn new(
+        fonts: &'static FontSet,
+        client: WorkerHandle,
+        activator: Activator,
+        ui: UiState,
+        store: Option<SessionStore>,
+    ) -> Self {
         Self {
             text: TextCache::new(fonts),
             kernel: RasterKernel::new(),
             input: Input::new(),
-            desktop: Desktop::new(client, activator),
+            desktop: Desktop::new(client, activator, ui, store),
         }
     }
 
@@ -2340,6 +2378,7 @@ impl PixelApp for App {
     }
 
     fn on_exit(&mut self) {
+        self.desktop.save_ui();
         self.desktop.client.shutdown();
         self.desktop.activator.stop();
     }

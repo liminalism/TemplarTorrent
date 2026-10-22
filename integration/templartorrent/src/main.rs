@@ -10,6 +10,7 @@ use templartorrent::activate::{
     Activation, activate, default_runtime_dir, spawn, valid_activation,
 };
 use templartorrent::geo;
+use templartorrent::persist::{SessionStore, UiState};
 use templartorrent::ui::App;
 use templartorrent::worker::{WorkerConfig, WorkerHandle};
 use templartorrent::workflow::{
@@ -58,6 +59,9 @@ fn run(launch: Launch) -> Result<(), String> {
         return Ok(());
     };
     let fonts = load_fonts(&resolve_font(font.as_deref())?)?;
+    let session_dir = workflow::data_dir().join("session");
+    let store = SessionStore::new(session_dir.clone());
+    let ui = store.load_ui().ok().flatten().unwrap_or_default().clamped();
     let tracker_path = public_tracker_path();
     let client = WorkerHandle::start(WorkerConfig {
         limits: Limits::default(),
@@ -68,14 +72,19 @@ fn run(launch: Launch) -> Result<(), String> {
         listen: "0.0.0.0:0"
             .parse()
             .map_err(|_| "the listen address is invalid".to_string())?,
-        session_dir: Some(workflow::data_dir().join("session")),
+        session_dir: Some(session_dir),
     })?;
     let activator = spawn(listener, path);
-    let mut app = App::new(fonts, client, activator);
+    let mut app = App::new(fonts, client, activator, ui, Some(store));
     app.prime(payloads);
-    // Transmission GTK's default main window is 300×500. A larger opening
-    // leaves an empty download list. The minimum stays under that default.
-    let mut config = WindowConfig::new("TemplarTorrent", 300.0, 500.0).min_size(260.0, 320.0);
+    // Transmission GTK's default main window is 300×500 unless a saved size
+    // exists. A larger opening leaves an empty download list. The minimum
+    // stays under that default.
+    let mut config = WindowConfig::new("TemplarTorrent", f64::from(ui.width), f64::from(ui.height))
+        .min_size(
+            f64::from(UiState::MIN_WIDTH),
+            f64::from(UiState::MIN_HEIGHT),
+        );
     config.app_id = Some("templartorrent".into());
     run_app(app, config).map_err(|error| error.to_string())
 }

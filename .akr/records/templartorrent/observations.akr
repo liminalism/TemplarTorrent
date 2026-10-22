@@ -278,7 +278,7 @@ record templartorrent.observation.complete-piece-status/5 : observation {
 
 record templartorrent.observation.complete-piece-status/6 : observation {
     title "Committed Linux client through AGENTS.md step 4 with persistence and recorded baselines; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22, Linux x86_64/Rust 1.99.0, committed on master through bf22b04 (initial tree, step 1 to 3 client plus peer preference, step 4 checks, session persistence, ledger refreshes). Milestones for AGENTS.md steps 2, 3 and 4 and for session persistence are completed with evidence; performance baselines are recorded under perf-results/2026-10-22-baselines/. The production client restores saved jobs and settings on launch through a disk recheck, saves after every state-changing command, and removes records with the job. Local peer preference, protected handle-relative deletion, v2/hybrid gates, a forced-process-kill restart test and offline country/client handling are in place. The engine re-evaluates completion when a selection changes. 148 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings are clean in all three workspaces; the release binary builds and stayed up for a six-second headful smoke on a Wayland session. Baseline finding: the AVX2 eligibility kernel shows no consistent gain over scalar at 1k, 100k or 1M pieces on an i7-13700H, while the O(P) reference piece pick costs about 3 us, 170 to 350 us and 4.8 ms respectively, so piece selection is the optimization target (milestone picker-optimization, proposed). Remaining boundaries: no automatic peer scoring or optimistic-unchoke rotation; no resume bitmap, so every launch rechecks from disk; window geometry and split ratio are not persisted; no headful interaction, Linux clipboard paste or Internet swarm test in evidence; no bounded global file-handle cache beyond 128 files per job; rbit can allocate a 16 MiB receive frame before application checks; ring 0.17.14 still reaches the tree through rbit/reqwest/rustls so the native-source release gate is open; Windows is optional and untested; perf-results/ is gitignored so evidence artifacts exist only on this machine.
         """
@@ -292,5 +292,41 @@ record templartorrent.observation.complete-piece-status/6 : observation {
         @templartorrent.evidence.persistence-driver,
         @templartorrent.evidence.persistence-gates,
         @templartorrent.evidence.step4-forced-crash-restart
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/7 : observation {
+    title "Linux client with persistence, bucketed picker, optimistic unchoke and saved geometry; remaining boundaries"
+    state superseded
+    statement """
+        2026-10-22 evening, Linux x86_64/Rust 1.99.0, committed on master through 14adab1 plus the ui-state commit that follows. Since rev 6: the live picker uses a (rank, availability) bucket index 65x to 170x below the O(P) oracle pick with randomized oracle-equivalence tests; one optimistic upload slot rotates every 30 s inside the configured total; window size and inspector split persist across launches. Milestones for steps 2 to 5 (baselines and picker optimization), persistence and the two standalone work items are completed with evidence. 153 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings clean; release binary builds. Remaining boundaries: no throughput, RTT or reliability peer scoring (slots follow preference, rotation and connection order); no resume bitmap, so every launch rechecks from disk; download order inside one file is no longer ascending because the in-bucket tie-break is seeded; no large-piece-count end-to-end scenario, only microbench evidence for the picker; no headful interaction, clipboard paste, window-close save or Internet swarm test in evidence; ring 0.17.14 reaches the tree through rbit's unconditional reqwest/rustls dependency, recorded as open question ring-release-gate; Windows optional and untested; perf-results/ is gitignored and local.
+        """
+    observed_at git:14adab1a93e0fd2c3fe1ef3f3dd42b6a2a31e2e7
+    method command
+    watches [ "crates/**", "integration/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/6 ]
+    verified_by [
+        @templartorrent.evidence.optimistic-rotation,
+        @templartorrent.evidence.picker-microbench,
+        @templartorrent.evidence.picker-oracle-equivalence,
+        @templartorrent.evidence.ui-state-gates
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/8 : observation {
+    title "Linux client with persistence, bucketed picker, optimistic unchoke and saved geometry; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22 evening, Linux x86_64/Rust 1.99.0, committed on master through 14adab1 plus the ui-state commit that follows. Since rev 6: the live picker uses a (rank, availability) bucket index 65x to 170x below the O(P) oracle pick with randomized oracle-equivalence tests; one optimistic upload slot rotates every 30 s inside the configured total; window size and inspector split persist across launches. Milestones for steps 2 to 5 (baselines and picker optimization), persistence and the two standalone work items are completed with evidence. 153 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings clean; release binary builds. Remaining boundaries: no throughput, RTT or reliability peer scoring (slots follow preference, rotation and connection order); no resume bitmap, so every launch rechecks from disk; download order inside one file is no longer ascending because the in-bucket tie-break is seeded; no large-piece-count end-to-end scenario, only microbench evidence for the picker; no headful interaction, clipboard paste, window-close save or Internet swarm test in evidence; ring 0.17.14 reaches the tree through rbit's unconditional reqwest/rustls dependency, recorded as open question ring-release-gate; Windows optional and untested; perf-results/ is gitignored and local.
+        """
+    observed_at git:14adab14f6e81a96c99ad1668378860c77593d9e
+    method command
+    watches [ "crates/**", "integration/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/7 ]
+    verified_by [
+        @templartorrent.evidence.optimistic-rotation,
+        @templartorrent.evidence.picker-microbench,
+        @templartorrent.evidence.picker-oracle-equivalence,
+        @templartorrent.evidence.ui-state-gates
     ]
 }

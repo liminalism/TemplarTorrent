@@ -696,3 +696,29 @@ record templartorrent.evidence.step4-protected-deletion/1 : evidence {
         Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree at cb822df plus uncommitted test additions: 11 storage tests passed including delete_refuses_hardlink_symlink_and_swapped_inode_without_removing_the_job, delete_removes_only_job_files_and_keeps_the_root, closing_job_releases_storage_without_deleting_files, symlinks_are_refused and hostile_paths_are_rejected; 22 adapter driver tests passed including driver_pause_and_remove_join_network_tasks_and_retain_data (hardlink refusal before job removal, data retained and directory renamable after remove without delete) and driver_tracker_discovery_reannounce_and_safe_delete. Linux openat/unlinkat path only; no Windows run.
         """
 }
+
+record templartorrent.evidence.ui-state-gates/1 : evidence {
+    title "Same host and tree: 153 workspace tests passed, formatting and all-target Clippy with warnings denied clean, release binary built."
+    state verified
+    result pass
+    method command
+    observed_at git:14adab14f6e81a96c99ad1668378860c77593d9e
+    command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release -p templartorrent"
+    artifact "perf-results/2026-10-22-ui-state/clippy.log"
+    summary """
+        Same host and tree: 153 workspace tests passed, formatting and all-target Clippy with warnings denied clean, release binary built.
+        """
+}
+
+record templartorrent.evidence.ui-state-roundtrip/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64, rustc 1.99.0, tree 14adab1 plus the ui-state change: 27 client tests passed including ui_state_roundtrips_and_clamps_hostile_values: a 1120x760 window with split 0.42 encodes and decodes, width 1 clamps to 260, height 999999 to 16384, split 7 to 0.9, an unknown version and a non-numeric width are rejected, and the store returns None before a save and the saved width after. The on_exit save in a real window was not exercised headlessly."
+    state verified
+    result pass
+    method command
+    observed_at git:14adab14f6e81a96c99ad1668378860c77593d9e
+    command "cargo test -p templartorrent"
+    artifact "perf-results/2026-10-22-ui-state/workspace-tests.log"
+    summary """
+        Ubuntu 26.04.1 x86_64, rustc 1.99.0, tree 14adab1 plus the ui-state change: 27 client tests passed including ui_state_roundtrips_and_clamps_hostile_values: a 1120x760 window with split 0.42 encodes and decodes, width 1 clamps to 260, height 999999 to 16384, split 7 to 0.9, an unknown version and a non-numeric width are rejected, and the store returns None before a save and the saved width after. The on_exit save in a real window was not exercised headlessly.
+        """
+}
