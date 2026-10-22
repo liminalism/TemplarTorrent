@@ -56,6 +56,8 @@ second backend, external torrent process or another GUI stack.
 
 **supersedes** `@templartorrent.observation.complete-piece-status/8` · **verified_by** `@templartorrent.evidence.announce-transport/1`, `@templartorrent.evidence.multi-lease-before-after/1`, `@templartorrent.evidence.native-audit-after-fork/1`, `@templartorrent.evidence.rate-ranking/1`
 
+> **Stale** — `watches "crates/**"` was matched by `5c912248`, which touched `crates/templartorrent-engine/src/lease.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#linux-client-with-forked-rbit-no-ring-rate-ranked-choking-multi-piece-pipelining-remaining-boundaries).
+
 ## Assessments
 
 _(none)_

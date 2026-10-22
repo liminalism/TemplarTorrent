@@ -7,7 +7,13 @@
 
 What should not be trusted without re-checking: records the build flagged `stale` or `at_risk`. Neither flag means a record is wrong (D-003); both mean look at it. This view is generated on every successful build, including one that exits 0 with a long queue (D-024). An empty file on an active project is more often a sign the `watches` globs are wrong than a sign the knowledge is perfect.
 
-## Stale (1)
+## Stale (2)
+
+### Linux client with forked rbit (no ring), rate-ranked choking, multi-piece pipelining; remaining boundaries
+
+`verified` · `@templartorrent.observation.complete-piece-status/9` · observation · **stale** · [Linux client with forked rbit (no ring), rate-ranked choking, multi-piece pipelining; remaining boundaries](CURRENT-STATE.md#linux-client-with-forked-rbit-no-ring-rate-ranked-choking-multi-piece-pipelining-remaining-boundaries)
+
+**Cause** — `watches "crates/**"` was matched by `5c912248`, which touched `crates/templartorrent-engine/src/lease.rs`.
 
 ### Rbit orchestration boundary and librqbit session alternative
 
