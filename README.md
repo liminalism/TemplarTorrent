@@ -15,9 +15,14 @@ acceptance criteria. **docs/DEPENDENCY-AUDIT.md** records the strict Rust/TLS bl
 
 ## Toolchain and dependencies
 
-Rust 1.99.0, edition 2024. The core workspace has no third-party dependencies.
-The two integrations are deliberately separate workspaces, so ordinary policy tests
-neither resolve GUI/network dependencies nor need a display server.
+Rust 1.99.0, edition 2024. `cargo build` from this directory builds the
+PixelKit client `templartorrent` and the policy crates. The policy crates
+themselves have no third-party dependencies. The fixture preview stays a
+separate workspace and is not part of that default build.
+
+`cargo build --release` produces the GUI at `target/release/templartorrent`.
+It opens a window with no arguments: the font is auto-detected from common
+system paths with a fontconfig fallback (`--font` overrides it).
 
 The GUI preview pins all PixelKit crates to:
 `614c9c6e84ce3cd0bc6c81988f636b493b30a497`.
@@ -34,13 +39,34 @@ interpret the presence of tests or CI as evidence that they passed.
 ```sh
 rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
 cargo fmt --all
-cargo test --workspace
+cargo build
+cargo test
 cargo clippy --workspace --all-targets
+cargo run -p templartorrent
+cargo run -p templartorrent -- --geoip-db /path/to/GeoLite2-Country.mmdb
 cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 500
-cargo test --manifest-path integration/rbit-adapter/Cargo.toml
+cargo test --workspace -p templartorrent-rbit-adapter
 cargo check --manifest-path integration/pixelkit-preview/Cargo.toml
 cargo run --release --manifest-path integration/pixelkit-preview/Cargo.toml -- --font /path/to/static-TrueType.ttf
 ```
+
+## Peer country lookup
+
+The Peers tab resolves peer countries locally from a user-supplied MaxMind
+DB (GeoLite2 Country or City), read with the pure-Rust `maxminddb` crate.
+No database is bundled. Resolution order is `--geoip-db FILE`, then
+`$TEMPLARTORRENT_GEOIP_DB`, then
+`~/.local/share/templartorrent/GeoLite2-Country.mmdb` (or the City file, or
+`/usr/share/GeoIP/`, `/var/lib/GeoIP/`). Without a database, peers show
+`--` and downloads are unaffected.
+
+```sh
+mkdir -p ~/.local/share/templartorrent
+ln -s /path/to/GeoLite2-Country.mmdb ~/.local/share/templartorrent/
+```
+
+GeoLite2 data is a MaxMind product under its own license and attribution
+terms; check them before redistributing any database file.
 
 On Windows, supply a supported installed `.ttf`, for example the path to a static
 TrueType system UI face. The preview's font loader is size-bounded and retains one
@@ -63,7 +89,7 @@ layout/policy demonstrator, not a connectivity test or production UI.
 | Trackers | Privacy gate, interval/backoff state | HTTP/UDP actors, discovery arbitration, feed validation/cache |
 | Engine | Real rbit type wrappers and bitfield conversion | Magnets-to-payload transfer loop, metadata exchange, hashing/storage |
 | UI | Native PixelKit split panes and fixture inspector | Add/limits/remove dialogs, real commands/acks, file browser |
-| Peers | Typed state and preference enum | Choker/request scoring, client fallback, offline geolocation/flags |
+| Peers | Typed state, local Prefer/Avoid/Block applied to upload slots, pipelines, retention and reconnection, MMDB country lookup | Automatic scoring, optimistic rotation, peer-ID client fallback, flag atlas |
 | Removal | Default-safe intent and lexical checks | Handle-relative storage/deletion, quiescence and crash recovery |
 | Performance | Scalar/AVX2 kernel, microbench JSONL | End-to-end local swarm, actual RSS/startup/CPU evidence |
 

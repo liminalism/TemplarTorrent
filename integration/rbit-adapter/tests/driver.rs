@@ -1,0 +1,1610 @@
+//! All transfers use the public driver, real rbit peers, generated v1 fixtures
+//! and exclusively created temporary roots. No internet discovery is enabled.
+use bytes::Bytes;
+use rbit::{
+    ExtensionHandshake, InfoHash, METADATA_PIECE_SIZE, Message, MetadataMessage, Metainfo,
+    PeerConnection, TorrentBuilder, TorrentVersion,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use templartorrent_core::model::{JobState, Limits, PeerPreference};
+use templartorrent_rbit_adapter::{
+    driver::{Driver, ExistingData, PeerOrigin, PeerSource},
+    metadata::OUR_MD_ID,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::{JoinHandle, JoinSet},
+    time::timeout,
+};
+
+const PIECE: usize = 65536;
+const DEADLINE: Duration = Duration::from_secs(15);
+fn process_rss() -> Option<usize> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .map(|kb| kb * 1024)
+}
+struct Root(PathBuf);
+impl Root {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "templartorrent-driver-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn job(&self) -> PathBuf {
+        self.0.join("job")
+    }
+}
+impl Drop for Root {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Fixture {
+    data: Vec<u8>,
+    meta: Metainfo,
+    hash: [u8; 20],
+}
+impl Fixture {
+    fn new(salt: u8, private: bool) -> Arc<Self> {
+        let data: Vec<_> = (0..3 * PIECE + 73)
+            .map(|i| ((i / 16384) as u8).wrapping_mul(23) ^ (i as u8).wrapping_add(salt))
+            .collect();
+        let torrent = TorrentBuilder::new("owned-series")
+            .version(TorrentVersion::V1)
+            .private(private)
+            .piece_length(PIECE as u64)
+            .add_file("Episode02.bin", data[..PIECE].to_vec())
+            .add_file("Episode01.bin", data[PIECE..].to_vec())
+            .build()
+            .unwrap();
+        let meta = Metainfo::from_bytes(&torrent).unwrap();
+        let InfoHash::V1(hash) = meta.info_hash else {
+            panic!("fixture must be v1");
+        };
+        Arc::new(Self { data, meta, hash })
+    }
+    fn magnet(&self) -> String {
+        let hex = self
+            .hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        format!("magnet:?xt=urn:btih:{hex}")
+    }
+    fn assert_files(&self, root: &Path) {
+        for file in &self.meta.info.files {
+            assert_eq!(
+                std::fs::read(root.join(&file.path)).unwrap(),
+                self.data[file.offset as usize..(file.offset + file.length) as usize]
+            );
+        }
+    }
+}
+#[derive(Default)]
+struct Stats {
+    requests: Mutex<Vec<(u32, u32)>>,
+    metadata: AtomicUsize,
+    active: AtomicUsize,
+    corrupted: AtomicBool,
+}
+#[derive(Clone, Copy, Default)]
+struct Fault {
+    corrupt: bool,
+    hold: bool,
+    /// Record every request and keep reading, but never send a block.
+    silent: bool,
+    control_flood: bool,
+    hold_metadata: bool,
+    disconnect_after: Option<usize>,
+}
+struct Server {
+    source: PeerSource,
+    stats: Arc<Stats>,
+    task: JoinHandle<()>,
+}
+impl Server {
+    async fn start(fixture: Arc<Fixture>, fault: Fault) -> Self {
+        Self::start_at("127.0.0.1", fixture, fault).await
+    }
+    /// Loopback accepts the whole 127/8 range, so fixtures can present
+    /// distinct peer IP addresses without leaving the host.
+    async fn start_at(ip: &str, fixture: Arc<Fixture>, fault: Fault) -> Self {
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let source = PeerSource {
+            address: listener.local_addr().unwrap(),
+            origin: PeerOrigin::OriginalTracker(1),
+        };
+        let stats = Arc::new(Stats::default());
+        let observed = stats.clone();
+        let task = tokio::spawn(async move {
+            let mut clients = JoinSet::new();
+            loop {
+                tokio::select! {
+                    incoming = listener.accept() => {
+                        let (stream, addr) = incoming.unwrap(); assert!(addr.ip().is_loopback());
+                        let fixture = fixture.clone(); let stats = observed.clone();
+                        clients.spawn(async move {
+                            let Ok(mut conn) = PeerConnection::accept(stream, fixture.hash, [17; 20]).await else { return; };
+                            stats.active.fetch_add(1, Ordering::SeqCst);
+                            let result = serve(&mut conn, &fixture, &stats, fault).await;
+                            stats.active.fetch_sub(1, Ordering::SeqCst);
+                            result
+                        });
+                    }
+                    result = clients.join_next(), if !clients.is_empty() => {
+                        result.unwrap().unwrap();
+                    }
+                }
+            }
+        });
+        Self {
+            source,
+            stats,
+            task,
+        }
+    }
+    async fn close(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+/// An interested downloader that only records the choke state it receives.
+struct Leech {
+    source: PeerSource,
+    seen: Arc<Mutex<Vec<&'static str>>>,
+    task: JoinHandle<()>,
+}
+impl Leech {
+    async fn start(ip: &str, hash: [u8; 20]) -> Self {
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let source = PeerSource {
+            address: listener.local_addr().unwrap(),
+            origin: PeerOrigin::OriginalTracker(1),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let task = tokio::spawn(async move {
+            let (stream, addr) = listener.accept().await.unwrap();
+            assert!(addr.ip().is_loopback());
+            let mut conn = PeerConnection::accept(stream, hash, [71; 20])
+                .await
+                .unwrap();
+            conn.send(Message::Interested).await.unwrap();
+            while let Ok(message) = conn.receive().await {
+                match message {
+                    Message::Unchoke => observed.lock().unwrap().push("unchoke"),
+                    Message::Choke => observed.lock().unwrap().push("choke"),
+                    _ => {}
+                }
+            }
+        });
+        Self { source, seen, task }
+    }
+    fn seen(&self) -> Vec<&'static str> {
+        self.seen.lock().unwrap().clone()
+    }
+    async fn close(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+async fn serve(conn: &mut PeerConnection, fixture: &Fixture, stats: &Stats, fault: Fault) {
+    let mut served = 0;
+    let handshake = {
+        let mut h = ExtensionHandshake::with_extensions(&[("ut_metadata", 7)]);
+        h.metadata_size = Some(fixture.meta.raw_info().len() as i64);
+        h.encode().unwrap()
+    };
+    let count = fixture.meta.info.piece_count();
+    let mut bits = vec![0; count.div_ceil(8)];
+    for piece in 0..count {
+        bits[piece / 8] |= 0x80 >> (piece % 8);
+    }
+    for message in [Message::Bitfield(Bytes::from(bits)), Message::Unchoke] {
+        if conn.send(message).await.is_err() {
+            return;
+        }
+    }
+    if fault.control_flood {
+        for _ in 0..65 {
+            if conn.send(Message::KeepAlive).await.is_err() {
+                return;
+            }
+        }
+    }
+    if conn
+        .send(Message::Extended {
+            id: 0,
+            payload: handshake,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(message) = conn.receive().await {
+        match message {
+            Message::Extended { id: 0, payload } => {
+                let ours = ExtensionHandshake::decode(&payload).unwrap();
+                assert_eq!(ours.get_extension_id("ut_metadata"), Some(OUR_MD_ID));
+            }
+            Message::Extended { id: 7, payload } => {
+                let request = MetadataMessage::decode(&payload).unwrap();
+                let start = request.piece as usize * METADATA_PIECE_SIZE;
+                assert!(start < fixture.meta.raw_info().len());
+                let end = (start + METADATA_PIECE_SIZE).min(fixture.meta.raw_info().len());
+                let message = MetadataMessage::data(
+                    request.piece,
+                    fixture.meta.raw_info().len() as u32,
+                    Bytes::copy_from_slice(&fixture.meta.raw_info()[start..end]),
+                );
+                stats.metadata.fetch_add(1, Ordering::SeqCst);
+                if fault.hold_metadata {
+                    std::future::pending::<()>().await;
+                }
+                if conn
+                    .send(Message::Extended {
+                        id: OUR_MD_ID,
+                        payload: message.encode().unwrap(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Message::Request {
+                index,
+                begin,
+                length,
+            } => {
+                if fault.disconnect_after.is_some_and(|limit| served >= limit) {
+                    return;
+                }
+                served += 1;
+                stats.requests.lock().unwrap().push((index, begin));
+                assert!((index as usize) < count && length > 0 && length <= 16384);
+                let start = index as usize * PIECE + begin as usize;
+                let end = start + length as usize;
+                assert!(end <= fixture.data.len() && begin as usize + length as usize <= PIECE);
+                if fault.silent {
+                    continue;
+                }
+                if fault.hold {
+                    std::future::pending::<()>().await;
+                }
+                let mut data = fixture.data[start..end].to_vec();
+                if fault.corrupt && !stats.corrupted.swap(true, Ordering::SeqCst) {
+                    data[0] ^= 0xff;
+                }
+                if conn
+                    .send(Message::Piece {
+                        index,
+                        begin,
+                        data: Bytes::from(data),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Message::Interested
+            | Message::NotInterested
+            | Message::Cancel { .. }
+            | Message::KeepAlive => {}
+            Message::Bitfield(_) | Message::Have { .. } | Message::Choke => {}
+            _ => panic!("unexpected owned seeder message"),
+        }
+    }
+}
+
+fn driver() -> Driver {
+    Driver::with_peer_id(
+        Limits {
+            payload_budget_bytes: 6 * PIECE,
+            ..Limits::default()
+        },
+        [23; 20],
+    )
+    .unwrap()
+}
+async fn complete(driver: &mut Driver) -> usize {
+    let start = Instant::now();
+    let mut failed = 0;
+    loop {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "driver transfer deadline exceeded"
+        );
+        let report = driver.step(Duration::from_millis(10)).await.unwrap();
+        failed += report.hash_failures;
+        assert!(report.peer_errors.is_empty(), "{:?}", report.peer_errors);
+        if driver
+            .snapshot()
+            .jobs
+            .iter()
+            .all(|row| row.state == JobState::Complete)
+        {
+            return failed;
+        }
+    }
+}
+
+async fn drive_client<T>(seed: &mut Driver, future: impl std::future::Future<Output = T>) -> T {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            result = seed.step(Duration::from_millis(2)) => { result.unwrap(); }
+        }
+    }
+}
+
+async fn upload_peer(addr: std::net::SocketAddr, hash: [u8; 20]) -> PeerConnection {
+    let mut conn = PeerConnection::connect(addr, hash, [61; 20]).await.unwrap();
+    conn.send(Message::Interested).await.unwrap();
+    loop {
+        if matches!(conn.receive().await.unwrap(), Message::Unchoke) {
+            return conn;
+        }
+    }
+}
+
+async fn seed_fixture(
+    root: &Root,
+    fixture: &Arc<Fixture>,
+) -> (Driver, templartorrent_core::model::TorrentId) {
+    let server = Server::start(fixture.clone(), Fault::default()).await;
+    let mut seed = driver();
+    let id = seed
+        .add_magnet(
+            &fixture.magnet(),
+            &root.job(),
+            ExistingData::Refuse,
+            &[server.source],
+            false,
+        )
+        .await
+        .unwrap();
+    complete(&mut seed).await;
+    server.close().await;
+    seed.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    (seed, id)
+}
+
+#[tokio::test]
+async fn driver_seed_rejects_invalid_requests_and_invalidated_disk_without_uploading() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(79, false);
+        let (mut seed, id) = seed_fixture(&root, &fixture).await;
+        let addr = seed.listening_address().unwrap();
+        for (index, begin, length) in [(u32::MAX, 0, 1), (0, 0, 0), (0, 0, 16385), (3, 73, 1)] {
+            drive_client(&mut seed, async {
+                let mut conn = upload_peer(addr, fixture.hash).await;
+                conn.send(Message::Request {
+                    index,
+                    begin,
+                    length,
+                })
+                .await
+                .unwrap();
+                while let Ok(message) = conn.receive().await {
+                    assert!(
+                        !matches!(message, Message::Piece { .. }),
+                        "invalid requests must not upload"
+                    );
+                }
+            })
+            .await;
+            assert_eq!(seed.payload_stats().reserved_bytes, 0);
+        }
+        assert_eq!(seed.snapshot().jobs[0].total_payload_uploaded, 0);
+        // Multiple peers must all be retired if one discovers changed storage.
+        let idle = drive_client(&mut seed, upload_peer(addr, fixture.hash)).await;
+        // Owned temporary payload only. Piece zero covers Episode02.
+        let path = root.job().join(&fixture.meta.info.files[0].path);
+        let mut changed = std::fs::read(&path).unwrap();
+        changed[0] ^= 1;
+        std::fs::write(path, changed).unwrap();
+        drive_client(&mut seed, async {
+            let mut conn = upload_peer(addr, fixture.hash).await;
+            conn.send(Message::Request {
+                index: 0,
+                begin: 0,
+                length: 16384,
+            })
+            .await
+            .unwrap();
+            while let Ok(message) = conn.receive().await {
+                assert!(!matches!(message, Message::Piece { .. }));
+            }
+        })
+        .await;
+        let snapshot = seed.snapshot();
+        assert_eq!(snapshot.jobs[0].state, JobState::Error);
+        assert_eq!(
+            snapshot.jobs[0].verified_bytes,
+            fixture.data.len() as u64 - PIECE as u64
+        );
+        assert_eq!(snapshot.jobs[0].total_payload_uploaded, 0);
+        assert!(seed.last_error(id).unwrap().contains("recheck"));
+        assert_eq!(seed.payload_stats().reserved_bytes, 0);
+        assert_eq!(seed.connection_count(), 0);
+        drop(idle);
+        seed.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_seed_cancel_queue_flood_and_slot_reduction_quiesce_writers() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(79, false);
+        let (mut seed, id) = seed_fixture(&root, &fixture).await;
+        let addr = seed.listening_address().unwrap();
+        let mut limits = Limits {
+            upload_kb_s: 1,
+            ..Limits::default()
+        };
+        seed.set_limits(limits.clone()).await.unwrap();
+        let mut conn = drive_client(&mut seed, upload_peer(addr, fixture.hash)).await;
+        drive_client(&mut seed, async {
+            conn.send(Message::Request {
+                index: 0,
+                begin: 0,
+                length: 16384,
+            })
+            .await
+            .unwrap();
+            loop {
+                if matches!(conn.receive().await.unwrap(), Message::Piece { .. }) {
+                    break;
+                }
+            }
+            conn.send(Message::Request {
+                index: 0,
+                begin: 16384,
+                length: 16384,
+            })
+            .await
+            .unwrap();
+            conn.send(Message::Cancel {
+                index: 0,
+                begin: 16384,
+                length: 16384,
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        })
+        .await;
+        for _ in 0..5 {
+            seed.step(Duration::from_millis(2)).await.unwrap();
+        }
+        assert_eq!(seed.snapshot().jobs[0].total_payload_uploaded, 16384);
+        assert_eq!(seed.payload_stats().reserved_bytes, 0);
+        limits.upload_peer_slots = 0;
+        seed.set_limits(limits.clone()).await.unwrap();
+        assert_eq!(
+            seed.connection_count(),
+            0,
+            "limit ack must join excess writers"
+        );
+        assert_eq!(seed.payload_stats().reserved_bytes, 0);
+        drop(conn);
+        limits.upload_peer_slots = 1;
+        seed.set_limits(limits.clone()).await.unwrap();
+        // A ninth queued request while the first is rate-stalled is rejected.
+        drive_client(&mut seed, async {
+            let mut conn = upload_peer(addr, fixture.hash).await;
+            for begin in 0..9 {
+                if conn
+                    .send(Message::Request {
+                        index: 0,
+                        begin,
+                        length: 16384,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            while let Ok(message) = conn.receive().await {
+                assert!(!matches!(message, Message::Piece { .. }));
+            }
+        })
+        .await;
+        assert_eq!(seed.connection_count(), 0);
+        limits.seed_jobs = 0;
+        seed.set_limits(limits).await.unwrap();
+        assert_eq!(seed.snapshot().jobs[0].state, JobState::Complete);
+        seed.pause(id).await.unwrap();
+        seed.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_seed_recheck_serves_without_refetch_and_rejects_unknown_or_private_ingress() {
+    timeout(DEADLINE, async {
+        for private in [false, true] {
+            let root = Root::new();
+            let fixture = Fixture::new(79, private);
+            let server = Server::start(fixture.clone(), Fault::default()).await;
+            let mut first = driver();
+            first
+                .add_magnet(
+                    &fixture.magnet(),
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[server.source],
+                    false,
+                )
+                .await
+                .unwrap();
+            complete(&mut first).await;
+            first.shutdown().await;
+            server.stats.requests.lock().unwrap().clear();
+            let mut seed = driver();
+            seed.add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Recheck,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(server.stats.requests.lock().unwrap().is_empty());
+            let addr = seed.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+            server.close().await;
+            drive_client(&mut seed, async {
+                assert!(
+                    PeerConnection::connect(addr, [0x71; 20], [62; 20])
+                        .await
+                        .is_err()
+                );
+            })
+            .await;
+            if private {
+                drive_client(&mut seed, async {
+                    assert!(
+                        PeerConnection::connect(addr, fixture.hash, [62; 20])
+                            .await
+                            .is_err()
+                    );
+                })
+                .await;
+            } else {
+                drive_client(&mut seed, async {
+                    let mut conn = upload_peer(addr, fixture.hash).await;
+                    conn.send(Message::Request {
+                        index: 3,
+                        begin: 0,
+                        length: 73,
+                    })
+                    .await
+                    .unwrap();
+                    loop {
+                        if let Message::Piece { data, .. } = conn.receive().await.unwrap() {
+                            assert_eq!(&data[..], &fixture.data[3 * PIECE..]);
+                            break;
+                        }
+                    }
+                })
+                .await;
+            }
+            seed.shutdown().await;
+            assert_eq!(seed.payload_stats().reserved_bytes, 0);
+            fixture.assert_files(&root.job());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// This second client uses the same public Driver and resolves its magnet
+/// exclusively from our listening Driver, after the source fixture is stopped.
+#[tokio::test]
+async fn driver_seeds_verified_disk_and_metadata_to_a_second_driver() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let target = Root::new();
+        let fixture = Fixture::new(29, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut seed = driver();
+        let id = seed.add_magnet(&fixture.magnet(), &root.job(), ExistingData::Refuse, &[server.source], false).await.unwrap();
+        complete(&mut seed).await;
+        server.close().await;
+        let addr = seed.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        assert_eq!(seed.snapshot().jobs[0].state, JobState::Seeding);
+        let magnet = fixture.magnet();
+        let path = target.job();
+        let client = tokio::spawn(async move {
+            let mut leech = driver();
+            let source = PeerSource { address: addr, origin: PeerOrigin::UserProvided };
+            leech.add_magnet(&magnet, &path, ExistingData::Refuse, &[source], true).await.unwrap();
+            assert_eq!(complete(&mut leech).await, 0);
+            leech.shutdown().await;
+        });
+        let start = Instant::now();
+        let mut peak = 0;
+        let mut rss = 0;
+        while !client.is_finished() {
+            seed.step(Duration::from_millis(5)).await.unwrap();
+            peak = peak.max(seed.payload_stats().reserved_bytes);
+            rss = rss.max(process_rss().unwrap_or(0));
+        }
+        client.await.unwrap();
+        for _ in 0..4 { seed.step(Duration::ZERO).await.unwrap(); }
+        fixture.assert_files(&target.job());
+        assert_eq!(seed.snapshot().jobs[0].total_payload_uploaded, fixture.data.len() as u64);
+        assert_eq!(seed.payload_stats().reserved_bytes, 0);
+        assert!(peak <= Limits::default().payload_budget_bytes);
+        let (owned, owned_high) = seed.upload_owned_bytes();
+        assert_eq!(owned, 0);
+        assert!(owned_high > 0 && owned_high <= PIECE + 16384);
+        println!("TT_SEED_METRIC {{\"payload_bytes\":{},\"elapsed_ns\":{},\"upload_reserved_peak_sampled_bytes\":{},\"upload_owned_peak_bytes\":{},\"process_rss_peak_sampled_bytes\":{},\"profile\":\"{}\"}}",
+            fixture.data.len(), start.elapsed().as_nanos(), peak, owned_high, rss, if cfg!(debug_assertions) { "debug" } else { "release" });
+        seed.pause(id).await.unwrap();
+        assert_eq!(seed.connection_count(), 0);
+        seed.shutdown().await;
+        assert!(seed.listening_address().is_none());
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn driver_magnet_resolves_metadata_and_routes_two_torrents_to_their_own_hashes() {
+    timeout(DEADLINE, async {
+        let root_a = Root::new();
+        let root_b = Root::new();
+        let a = Fixture::new(3, false);
+        let b = Fixture::new(11, false);
+        let server_a = Server::start(a.clone(), Fault::default()).await;
+        let server_b = Server::start(b.clone(), Fault::default()).await;
+        let mut driver = driver();
+        driver
+            .add_magnet(
+                &a.magnet(),
+                &root_a.job(),
+                ExistingData::Refuse,
+                &[server_a.source],
+                false,
+            )
+            .await
+            .unwrap();
+        driver
+            .add_magnet(
+                &b.magnet(),
+                &root_b.job(),
+                ExistingData::Refuse,
+                &[server_b.source],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&mut driver).await, 0);
+        a.assert_files(&root_a.job());
+        b.assert_files(&root_b.job());
+        assert_eq!(server_a.stats.metadata.load(Ordering::SeqCst), 1);
+        assert_eq!(server_b.stats.metadata.load(Ordering::SeqCst), 1);
+        assert_eq!(server_a.stats.requests.lock().unwrap()[0].0, 1);
+        assert_eq!(server_b.stats.requests.lock().unwrap()[0].0, 1);
+        assert_eq!(driver.snapshot().jobs.len(), 2);
+        assert_eq!(driver.payload_stats().reserved_bytes, 0);
+        assert!(!driver.seeding_unavailable_reason().is_empty());
+        driver.shutdown().await;
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        server_a.close().await;
+        server_b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_corruption_retries_verified_piece_without_corrupting_files() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(7, false);
+        let server = Server::start(
+            fixture.clone(),
+            Fault {
+                corrupt: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut driver = driver();
+        driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&mut driver).await, 1);
+        fixture.assert_files(&root.job());
+        assert_eq!(
+            server
+                .stats
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(piece, _)| *piece == 1)
+                .count(),
+            8
+        );
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_pause_and_remove_join_network_tasks_and_retain_data() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(5, false);
+        let server = Server::start(
+            fixture.clone(),
+            Fault {
+                hold: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut driver = driver();
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        while server.stats.requests.lock().unwrap().is_empty() {
+            driver.step(Duration::from_millis(10)).await.unwrap();
+        }
+        assert!(driver.payload_stats().reserved_bytes > 0);
+        driver.pause(id).await.unwrap();
+        assert_eq!(driver.connection_count(), 0);
+        assert_eq!(driver.payload_stats().reserved_bytes, 0);
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Paused);
+        for _ in 0..3 {
+            driver.step(Duration::ZERO).await.unwrap();
+        }
+        assert_eq!(driver.snapshot().jobs[0].verified_bytes, 0);
+        let episode = root.job().join("owned-series/Episode01.bin");
+        std::fs::hard_link(&episode, root.job().join("owned-series/Episode01-link.bin")).unwrap();
+        assert!(
+            driver.remove(id, true).await.is_err(),
+            "a hardlink must refuse deletion before the job is removed"
+        );
+        assert_eq!(driver.snapshot().jobs.len(), 1);
+        assert!(episode.exists());
+        std::fs::remove_file(root.job().join("owned-series/Episode01-link.bin")).unwrap();
+        driver.remove(id, false).await.unwrap();
+        assert!(driver.snapshot().jobs.is_empty());
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        assert!(root.job().join("owned-series/Episode01.bin").exists());
+        // The public remove ack occurs after Store::close_job, so the directory
+        // can be moved without retaining any application data handles.
+        std::fs::rename(root.job(), root.0.join("retained")).unwrap();
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_restart_rechecks_disk_and_requests_only_missing_pieces() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(13, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut first = driver();
+        let id = first
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        while first.snapshot().jobs[0].verified_bytes == 0 {
+            first.step(Duration::from_millis(10)).await.unwrap();
+        }
+        let verified = first.snapshot().jobs[0].verified_bytes;
+        assert!(verified >= PIECE as u64 && verified < fixture.data.len() as u64);
+        first.remove(id, false).await.unwrap();
+        drop(first);
+        server.stats.requests.lock().unwrap().clear();
+        let mut restarted = driver();
+        restarted
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Recheck,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(restarted.snapshot().jobs[0].verified_bytes >= verified);
+        complete(&mut restarted).await;
+        assert!(
+            !server
+                .stats
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(piece, _)| *piece == 1)
+        );
+        fixture.assert_files(&root.job());
+        restarted.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_bootstrap_privacy_and_private_tracker_scope_are_enforced() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(19, true);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let public = PeerSource {
+            origin: PeerOrigin::UserProvided,
+            ..server.source
+        };
+        let mut driver = driver();
+        assert!(
+            driver
+                .add_magnet(
+                    &fixture.magnet(),
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[public],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(server.stats.metadata.load(Ordering::SeqCst), 0);
+        assert!(
+            driver
+                .add_magnet(
+                    &fixture.magnet(),
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[public],
+                    true
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !root.job().exists(),
+            "private public-bootstrap metadata must not create files"
+        );
+        assert_eq!(driver.connection_count(), 0);
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(driver.connect_peer(id, public).await.is_err());
+        assert!(
+            driver
+                .connect_peer(
+                    id,
+                    PeerSource {
+                        origin: PeerOrigin::OriginalTracker(2),
+                        ..server.source
+                    }
+                )
+                .await
+                .is_err()
+        );
+        complete(&mut driver).await;
+        fixture.assert_files(&root.job());
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_rejects_duplicate_jobs_conflicting_roots_and_hostile_metadata_control_flood() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(29, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        let metadata = server.stats.metadata.load(Ordering::SeqCst);
+        assert!(
+            driver
+                .add_magnet(
+                    &fixture.magnet(),
+                    &root.0.join("duplicate"),
+                    ExistingData::Refuse,
+                    &[server.source],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(server.stats.metadata.load(Ordering::SeqCst), metadata);
+        assert!(!root.0.join("duplicate").exists());
+        let different = Fixture::new(31, false);
+        let other = Server::start(different.clone(), Fault::default()).await;
+        assert!(
+            driver
+                .add_magnet(
+                    &different.magnet(),
+                    &root.job(),
+                    ExistingData::Recheck,
+                    &[other.source],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(driver.snapshot().jobs.len(), 1);
+        complete(&mut driver).await;
+        fixture.assert_files(&root.job());
+        let flooded = Server::start(
+            different.clone(),
+            Fault {
+                control_flood: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        assert!(
+            driver
+                .add_magnet(
+                    &different.magnet(),
+                    &root.0.join("flooded"),
+                    ExistingData::Refuse,
+                    &[flooded.source],
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert!(!root.0.join("flooded").exists());
+        driver.shutdown().await;
+        server.close().await;
+        other.close().await;
+        flooded.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn driver_can_move_to_a_dedicated_runtime_thread_and_debug_redacts_peer_addresses() {
+    fn require_send<T: Send>() {}
+    require_send::<Driver>();
+    let source = PeerSource {
+        address: "127.0.0.1:6881".parse().unwrap(),
+        origin: PeerOrigin::UserProvided,
+    };
+    assert!(!format!("{source:?}").contains("127.0.0.1"));
+}
+
+#[tokio::test]
+async fn driver_two_peers_share_exclusive_leases_for_one_torrent() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(37, false);
+        let a = Server::start(fixture.clone(), Fault::default()).await;
+        let b = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[a.source, b.source],
+                false,
+            )
+            .await
+            .unwrap();
+        driver.connect_peer(id, b.source).await.unwrap();
+        assert_eq!(driver.connection_count(), 2);
+        complete(&mut driver).await;
+        let mut requests = a.stats.requests.lock().unwrap().clone();
+        requests.extend(b.stats.requests.lock().unwrap().iter().copied());
+        assert_eq!(requests.len(), 13);
+        assert_eq!(
+            requests
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            13
+        );
+        assert_eq!(
+            driver.connection_count(),
+            0,
+            "download-only completion closes peers"
+        );
+        fixture.assert_files(&root.job());
+        driver.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_global_connection_caps_and_zero_job_slots_quiesce_actual_network_work() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(43, false);
+        let a = Server::start(
+            fixture.clone(),
+            Fault {
+                hold: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let b = Server::start(
+            fixture.clone(),
+            Fault {
+                hold: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut driver = driver();
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[a.source, b.source],
+                false,
+            )
+            .await
+            .unwrap();
+        driver.connect_peer(id, b.source).await.unwrap();
+        assert_eq!(driver.connection_count(), 2);
+        driver
+            .set_limits(Limits {
+                connections_total: 1,
+                connections_per_job: 1,
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(driver.connection_count(), 1);
+        assert!(driver.connect_peer(id, b.source).await.is_err());
+        driver
+            .set_limits(Limits {
+                download_jobs: 0,
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(driver.connection_count(), 0);
+        assert_eq!(driver.payload_stats().reserved_bytes, 0);
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Queued);
+        driver.resume(id).await.unwrap();
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Queued);
+        driver
+            .set_limits(Limits {
+                download_jobs: 1,
+                download_kb_s: 0,
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(driver.connection_count(), 1);
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Downloading);
+        driver.pause(id).await.unwrap();
+        driver.set_limits(Limits::default()).await.unwrap();
+        assert_eq!(
+            driver.snapshot().jobs[0].state,
+            JobState::Paused,
+            "explicit pause must survive new settings"
+        );
+        assert_eq!(driver.connection_count(), 0);
+        driver.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_cancelled_metadata_future_drops_connection_and_all_metadata_permits() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(47, false);
+        let server = Server::start(
+            fixture.clone(),
+            Fault {
+                hold_metadata: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut driver = driver();
+        {
+            let uri = fixture.magnet();
+            let path = root.job();
+            let sources = [server.source];
+            let add = driver.add_magnet(&uri, &path, ExistingData::Refuse, &sources, false);
+            tokio::pin!(add);
+            loop {
+                tokio::select! {
+                    _ = &mut add => panic!("held metadata must not complete"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                        if server.stats.metadata.load(Ordering::SeqCst) > 0 { break; }
+                    }
+                }
+            }
+        }
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        assert_eq!(driver.connection_count(), 0);
+        assert!(driver.snapshot().jobs.is_empty());
+        assert!(!root.job().exists());
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_peer_drop_then_explicit_fallback_preserves_verified_progress() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(53, false);
+        let a = Server::start(
+            fixture.clone(),
+            Fault {
+                disconnect_after: Some(5),
+                ..Fault::default()
+            },
+        )
+        .await;
+        let b = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[a.source, b.source],
+                false,
+            )
+            .await
+            .unwrap();
+        while driver.connection_count() != 0 {
+            driver.step(Duration::from_millis(10)).await.unwrap();
+        }
+        assert_eq!(driver.snapshot().jobs[0].verified_bytes, PIECE as u64);
+        assert_eq!(driver.payload_stats().reserved_bytes, 0);
+        driver.connect_peer(id, b.source).await.unwrap();
+        complete(&mut driver).await;
+        assert!(
+            !b.stats
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(piece, _)| *piece == 1)
+        );
+        assert_eq!(
+            b.stats.metadata.load(Ordering::SeqCst),
+            0,
+            "payload reconnect uses already verified metadata"
+        );
+        fixture.assert_files(&root.job());
+        driver.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_magnet_to_first_verified_metrics() {
+    timeout(DEADLINE, async {
+        let root = Root::new(); let fixture = Fixture::new(41, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        let start = Instant::now();
+        driver.add_magnet(&fixture.magnet(), &root.job(), ExistingData::Refuse, &[server.source], false).await.unwrap();
+        let metadata_ns = start.elapsed().as_nanos();
+        let mut first_ns = None;
+        let mut owned = 0;
+        let mut rss_peak: Option<usize> = None;
+        loop {
+            driver.step(Duration::from_millis(10)).await.unwrap();
+            owned = owned.max(driver.payload_stats().owned_bytes());
+            let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+                s.lines().find(|line| line.starts_with("VmRSS:"))
+                    .and_then(|line| line.split_whitespace().nth(1)).and_then(|v| v.parse::<usize>().ok())
+            }).map(|bytes| bytes * 1024);
+            if let Some(rss) = rss { rss_peak = Some(rss_peak.unwrap_or(0).max(rss)); }
+            let snapshot = driver.snapshot();
+            if first_ns.is_none() && snapshot.jobs[0].verified_bytes > 0 { first_ns = Some(start.elapsed().as_nanos()); }
+            if snapshot.jobs[0].state == JobState::Complete { break; }
+        }
+        let elapsed = start.elapsed().as_nanos();
+        fixture.assert_files(&root.job());
+        println!("TT_DRIVER_METRIC {{\"payload_bytes\":{},\"metadata_ns\":{},\"magnet_to_first_verified_ns\":{},\"elapsed_ns\":{},\"throughput_including_metadata_bytes_s\":{},\"payload_reserved_peak_bytes\":{},\"engine_owned_peak_sampled_bytes\":{},\"metadata_reserved_bytes\":{},\"process_rss_peak_sampled_bytes\":{},\"profile\":\"{}\"}}",
+            fixture.data.len(), metadata_ns, first_ns.unwrap(), elapsed, fixture.data.len() as u128 * 1_000_000_000 / elapsed,
+            driver.payload_stats().reserved_high_watermark, owned, driver.metadata_reserved_bytes(), rss_peak.map(|value| value.to_string()).unwrap_or_else(|| "null".into()), if cfg!(debug_assertions) { "debug" } else { "release" });
+        driver.shutdown().await; server.close().await;
+    }).await.unwrap();
+}
+
+async fn http_tracker(listener: TcpListener, peer: std::net::SocketAddr) {
+    loop {
+        let Ok((mut stream, addr)) = listener.accept().await else {
+            return;
+        };
+        assert!(addr.ip().is_loopback());
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            if request.len() >= 8192 {
+                return;
+            }
+            let mut byte = [0];
+            if stream.read_exact(&mut byte).await.is_err() {
+                return;
+            }
+            request.push(byte[0]);
+        }
+        let mut body = b"d8:intervali60e12:min intervali60e5:peers6:".to_vec();
+        let std::net::IpAddr::V4(ip) = peer.ip() else {
+            return;
+        };
+        body.extend_from_slice(&ip.octets());
+        body.extend_from_slice(&peer.port().to_be_bytes());
+        body.push(b'e');
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(header.as_bytes()).await.is_err()
+            || stream.write_all(&body).await.is_err()
+        {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn driver_tracker_discovery_reannounce_and_safe_delete() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(53, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker_addr = tracker_listener.local_addr().unwrap();
+        let tracker_task = tokio::spawn(http_tracker(tracker_listener, server.source.address));
+        let mut driver = driver();
+        driver.set_allow_local_trackers(true);
+        driver.set_public_trackers(vec![
+            "http://203.0.113.9/announce".into(),
+            "http://127.0.0.1:9/announce".into(),
+        ]);
+        driver.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let hex = fixture
+            .hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let magnet = format!("magnet:?xt=urn:btih:{hex}&tr=http://{tracker_addr}/announce");
+        let id = driver
+            .add_magnet_with_discovery(&magnet, &root.job(), ExistingData::Refuse, &[], false)
+            .await
+            .unwrap();
+        let trackers = driver.tracker_status(id).unwrap();
+        assert_eq!(
+            trackers.len(),
+            1,
+            "local and documentation trackers stay off a public list"
+        );
+        assert_eq!(trackers[0].origin, "original");
+        assert!(trackers[0].label.contains("127.0.0.1"));
+        assert!(!trackers[0].label.contains("203.0.113.9"));
+        let error = driver.reannounce(id, 0).await.unwrap_err();
+        assert!(
+            error.to_string().contains("cooldown"),
+            "manual reannounce must honor the tracker minimum interval"
+        );
+        std::fs::write(root.job().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(root.0.join("outside.txt"), b"out").unwrap();
+        driver.remove(id, true).await.unwrap();
+        assert!(driver.snapshot().jobs.is_empty());
+        assert!(!root.job().join("owned-series").exists());
+        assert_eq!(std::fs::read(root.job().join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.0.join("outside.txt")).unwrap(), b"out");
+        assert!(root.job().is_dir());
+        driver.shutdown().await;
+        server.close().await;
+        tracker_task.abort();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_peer_preference_narrows_retains_and_blocks() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(53, false);
+        let silent = Fault {
+            silent: true,
+            ..Fault::default()
+        };
+        let a = Server::start_at("127.0.0.1", fixture.clone(), silent).await;
+        let b = Server::start_at("127.0.0.2", fixture.clone(), silent).await;
+        let mut driver = driver();
+        assert_eq!(
+            driver
+                .set_peer_preference(
+                    templartorrent_core::model::TorrentId(9),
+                    b.source.address,
+                    PeerPreference::Avoid
+                )
+                .await
+                .unwrap_err()
+                .0,
+            "unknown job"
+        );
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[a.source],
+                false,
+            )
+            .await
+            .unwrap();
+        // Avoid set before the connection exists applies on attach.
+        driver
+            .set_peer_preference(id, b.source.address, PeerPreference::Avoid)
+            .await
+            .unwrap();
+        driver.connect_peer(id, b.source).await.unwrap();
+        assert_eq!(driver.connection_count(), 2);
+        assert_eq!(driver.peer_pipeline(id, a.source.address), Some(8));
+        assert_eq!(driver.peer_pipeline(id, b.source.address), Some(2));
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "requests never reached the peers"
+            );
+            driver.step(Duration::from_millis(10)).await.unwrap();
+            if a.stats.requests.lock().unwrap().len() >= 4 {
+                break;
+            }
+        }
+        assert!(
+            b.stats.requests.lock().unwrap().len() <= 2,
+            "avoided peer must hold at most two requests in flight"
+        );
+        let status = driver.peer_status(id);
+        assert_eq!(status.len(), 2);
+        assert_eq!(
+            status
+                .iter()
+                .find(|row| row.address == b.source.address)
+                .unwrap()
+                .preference,
+            PeerPreference::Avoid
+        );
+        assert_eq!(
+            status
+                .iter()
+                .find(|row| row.address == a.source.address)
+                .unwrap()
+                .preference,
+            PeerPreference::Normal
+        );
+        // Prefer is retained when the caps shrink; the Normal peer goes.
+        driver
+            .set_peer_preference(id, b.source.address, PeerPreference::Prefer)
+            .await
+            .unwrap();
+        assert_eq!(driver.peer_pipeline(id, b.source.address), Some(8));
+        driver
+            .set_limits(Limits {
+                connections_total: 1,
+                connections_per_job: 1,
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        let status = driver.peer_status(id);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].address, b.source.address);
+        assert_eq!(status[0].preference, PeerPreference::Prefer);
+        driver
+            .set_limits(Limits {
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        // Block refuses reconnection of a disconnected peer and closes a live one.
+        driver
+            .set_peer_preference(id, a.source.address, PeerPreference::Block)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.connect_peer(id, a.source).await.unwrap_err().0,
+            "peer address is blocked"
+        );
+        driver
+            .set_peer_preference(id, b.source.address, PeerPreference::Block)
+            .await
+            .unwrap();
+        assert_eq!(driver.connection_count(), 0);
+        assert!(driver.peer_status(id).is_empty());
+        assert_eq!(
+            driver.connect_peer(id, b.source).await.unwrap_err().0,
+            "peer address is blocked"
+        );
+        assert!(
+            driver.resume(id).await.is_err(),
+            "blocked addresses leave the candidate list"
+        );
+        // Normal lifts the block.
+        driver
+            .set_peer_preference(id, b.source.address, PeerPreference::Normal)
+            .await
+            .unwrap();
+        driver.connect_peer(id, b.source).await.unwrap();
+        let status = driver.peer_status(id);
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].preference, PeerPreference::Normal);
+        assert_eq!(driver.peer_pipeline(id, b.source.address), Some(8));
+        driver.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_peer_preference_orders_upload_slots() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(59, false);
+        let (mut seed, id) = seed_fixture(&root, &fixture).await;
+        seed.set_limits(Limits {
+            upload_peer_slots: 1,
+            payload_budget_bytes: 6 * PIECE,
+            ..Limits::default()
+        })
+        .await
+        .unwrap();
+        let a = Leech::start("127.0.0.1", fixture.hash).await;
+        let b = Leech::start("127.0.0.2", fixture.hash).await;
+        seed.set_peer_preference(id, b.source.address, PeerPreference::Prefer)
+            .await
+            .unwrap();
+        seed.connect_peer(id, a.source).await.unwrap();
+        seed.connect_peer(id, b.source).await.unwrap();
+        let start = Instant::now();
+        while !b.seen().contains(&"unchoke") {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "preferred peer was never unchoked"
+            );
+            seed.step(Duration::from_millis(10)).await.unwrap();
+        }
+        // The Normal peer may have taken the slot before the preferred peer
+        // became interested; it must end up choked once both are present.
+        let start = Instant::now();
+        while a.seen().last() == Some(&"unchoke") {
+            assert!(start.elapsed() < DEADLINE, "normal peer kept the only slot");
+            seed.step(Duration::from_millis(10)).await.unwrap();
+        }
+        let status = seed.peer_status(id);
+        let row = |address| status.iter().find(|row| row.address == address).unwrap();
+        assert!(!row(b.source.address).we_choke);
+        assert!(row(a.source.address).we_choke);
+        // Reversing the preference moves the slot.
+        seed.set_peer_preference(id, a.source.address, PeerPreference::Prefer)
+            .await
+            .unwrap();
+        seed.set_peer_preference(id, b.source.address, PeerPreference::Avoid)
+            .await
+            .unwrap();
+        let start = Instant::now();
+        while !a.seen().contains(&"unchoke") || !b.seen().contains(&"choke") {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "slot did not move to the new preference"
+            );
+            seed.step(Duration::from_millis(10)).await.unwrap();
+        }
+        assert_eq!(seed.connection_count(), 2, "Avoid never disconnects");
+        seed.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}

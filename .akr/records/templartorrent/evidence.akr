@@ -1,0 +1,503 @@
+akr 0.1
+project templartorrent
+
+record templartorrent.evidence.complete-piece-integration-checks/1 : evidence {
+    title "All three workspaces passed format checks and Clippy with warnings denied on Linux/Rust 1.99.0; 9 PixelKit headless command/view tests passed. PixelKit native window and Windows were not executed. Native audit separately still lists ring 0.17.14 through rustls/reqwest/rbit; this release blocker is not closed."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo fmt --all -- --check; cargo fmt --manifest-path integration/rbit-adapter/Cargo.toml -- --check; cargo fmt --manifest-path integration/pixelkit-preview/Cargo.toml -- --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo clippy --manifest-path integration/rbit-adapter/Cargo.toml --all-targets --locked -- -D warnings; cargo clippy --manifest-path integration/pixelkit-preview/Cargo.toml --all-targets --locked -- -D warnings; cargo test --manifest-path integration/pixelkit-preview/Cargo.toml --locked"
+    artifact "perf-results/2026-10-15-assembly/handoff.json"
+    summary """
+        All three workspaces passed format checks and Clippy with warnings denied on Linux/Rust 1.99.0; 9 PixelKit headless command/view tests passed. PixelKit native window and Windows were not executed. Native audit separately still lists ring 0.17.14 through rustls/reqwest/rbit; this release blocker is not closed.
+        """
+}
+
+record templartorrent.evidence.complete-piece-metrics/1 : evidence {
+    title "One release run each, Linux i7-13700H/Rust 1.99.0, 2097225 owned payload bytes and sync_data file writes. 16 KiB: 4722350 B/s, first verified 40879754 ns, reserved high water 49152 B, sampled RSS 6987776 B. 256 KiB: 29488904 B/s, first verified 41659764 ns, reserved high water 786432 B, sampled RSS 7254016 B. Preloaded metadata and fixture-seeder RSS included; no app startup or before/after optimization claim."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --release --locked --test multiblock local_transfer_metrics -- --nocapture --test-threads=1"
+    artifact "perf-results/2026-10-15-assembly/metrics.jsonl"
+    summary """
+        One release run each, Linux i7-13700H/Rust 1.99.0, 2097225 owned payload bytes and sync_data file writes. 16 KiB: 4722350 B/s, first verified 40879754 ns, reserved high water 49152 B, sampled RSS 6987776 B. 256 KiB: 29488904 B/s, first verified 41659764 ns, reserved high water 786432 B, sampled RSS 7254016 B. Preloaded metadata and fixture-seeder RSS included; no app startup or before/after optimization claim.
+        """
+}
+
+record templartorrent.evidence.complete-piece-root/1 : evidence {
+    title "Uncommitted working tree on Ubuntu 26.04.1 Linux x86_64 i7-13700H, rustc 1.99.0: 68 root tests passed, including 10 new full-piece assembly/cancellation/fake-clock/rate/ownership cases and shared budget resize; scalar oracle and privacy/storage/SIMD equivalence tests ran."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --workspace --locked"
+    artifact "perf-results/2026-10-15-assembly/root-tests.log"
+    summary """
+        Uncommitted working tree on Ubuntu 26.04.1 Linux x86_64 i7-13700H, rustc 1.99.0: 68 root tests passed, including 10 new full-piece assembly/cancellation/fake-clock/rate/ownership cases and shared budget resize; scalar oracle and privacy/storage/SIMD equivalence tests ran.
+        """
+}
+
+record templartorrent.evidence.complete-piece-wire/1 : evidence {
+    title "On Linux/Rust 1.99.0, 16 adapter tests passed over explicitly owned localhost TCP/HTTP fixtures. Added 256 KiB pieces, reversed eight-block batches, SHA1 failure retry, disk-backed third-peer seeding and restart recheck with only missing piece requested; existing BEP-9 metadata faults passed. New tracker test parses magnet but uses preloaded metainfo, not integrated metadata discovery."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --locked -- --nocapture --test-threads=1"
+    artifact "perf-results/2026-10-15-assembly/adapter-tests.log"
+    summary """
+        On Linux/Rust 1.99.0, 16 adapter tests passed over explicitly owned localhost TCP/HTTP fixtures. Added 256 KiB pieces, reversed eight-block batches, SHA1 failure retry, disk-backed third-peer seeding and restart recheck with only missing piece requested; existing BEP-9 metadata faults passed. New tracker test parses magnet but uses preloaded metainfo, not integrated metadata discovery.
+        """
+}
+
+record templartorrent.evidence.driver-seeding-metrics/1 : evidence {
+    title "One release Linux i7-13700H/Rust 1.99.0 sample: second Driver resolved metadata and downloaded 196681 bytes from the listening Driver in 340301891 ns including final comparison/shutdown. Traced upload ownership peaked at 81920 B; sampled shared upload reservation 98368 B; sampled process RSS 5246976 B including both Drivers/fixture/Tokio. Initial seed download excluded; not app startup or an optimization comparison."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --release --locked --offline --test driver driver_seeds_verified_disk_and_metadata_to_a_second_driver -- --nocapture --test-threads=1"
+    artifact "perf-results/2026-10-15-seeding/metrics.jsonl"
+    summary """
+        One release Linux i7-13700H/Rust 1.99.0 sample: second Driver resolved metadata and downloaded 196681 bytes from the listening Driver in 340301891 ns including final comparison/shutdown. Traced upload ownership peaked at 81920 B; sampled shared upload reservation 98368 B; sampled process RSS 5246976 B including both Drivers/fixture/Tokio. Initial seed download excluded; not app startup or an optimization comparison.
+        """
+}
+
+record templartorrent.evidence.driver-seeding-path/1 : evidence {
+    title "Linux/Rust 1.99.0: all 37 adapter tests passed, including 16 Driver tests and four new seeding fixtures. A second Driver resolved BEP-9 metadata and downloaded verified files exclusively from the first Driver after the original fixture source stopped. Resume-adopted seed data, invalid requests, multi-peer disk invalidation, cancellation, queue flood, slot reduction, private/unknown ingress and existing tracker/privacy/storage fixtures ran."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --locked --offline -- --nocapture --test-threads=1"
+    artifact "perf-results/2026-10-15-seeding/adapter-tests.log"
+    summary """
+        Linux/Rust 1.99.0: all 37 adapter tests passed, including 16 Driver tests and four new seeding fixtures. A second Driver resolved BEP-9 metadata and downloaded verified files exclusively from the first Driver after the original fixture source stopped. Resume-adopted seed data, invalid requests, multi-peer disk invalidation, cancellation, queue flood, slot reduction, private/unknown ingress and existing tracker/privacy/storage fixtures ran.
+        """
+}
+
+record templartorrent.evidence.driver-seeding-regressions/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H/Rust 1.99.0: 71 root tests and 10 headless PixelKit tests passed. Fake-clock uploads exercised shared two-job rate authority, memory admission before tokens, verified spans, pause and seed-slot admission. Formatting and all-target Clippy with denied warnings passed in root and both integrations. No headful window ran; cargo tree still reports ring 0.17.14."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --workspace --locked --offline"
+    artifact "perf-results/2026-10-15-seeding/handoff.json"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H/Rust 1.99.0: 71 root tests and 10 headless PixelKit tests passed. Fake-clock uploads exercised shared two-job rate authority, memory admission before tokens, verified spans, pause and seed-slot admission. Formatting and all-target Clippy with denied warnings passed in root and both integrations. No headful window ran; cargo tree still reports ring 0.17.14.
+        """
+}
+
+record templartorrent.evidence.engine-scaffold-tests/1 : evidence {
+    title "Engine scaffold: 17/17 session tests pass"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test -p templartorrent-engine --test engine"
+    summary """
+        Engine scaffold: 17/17 session tests pass (lease/fence/budget/rate/e2e/lifecycle/tracker/resume)
+        """
+}
+
+record templartorrent.evidence.file-backed-resume/1 : evidence {
+    title "Disk resume adopts without rewrite"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost file_backed_resume"
+    summary """
+        Pre-existing complete files adopted via recheck with real hashes, zero writes, job seeds with no peer connected
+        """
+}
+
+record templartorrent.evidence.file-backed-transfer/1 : evidence {
+    title "File-backed transfer writes verified files"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost file_backed_transfer"
+    summary """
+        Localhost transfer into fresh temp dir completes with on-disk bytes equal to fixture, each verified piece written exactly once
+        """
+}
+
+record templartorrent.evidence.file-storage-unit/1 : evidence {
+    title "Storage unit tests cover mapping and refusals"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test -p templartorrent-storage"
+    summary """
+        Storage crate: 8/8 pass covering boundary mapping, pre-existing and partial files, longer-file refusal without truncate, hostile paths, piece gate, symlinks
+        """
+}
+
+record templartorrent.evidence.live-commands/1 : evidence {
+    title "Live commands dispatch with reliable acks"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/pixelkit-preview/Cargo.toml live_commands"
+    summary """
+        Typed command/ack bridge over a live session: 6/6 pass covering ordered acks, unknown-job rejection, queue-full Busy, remove/limits/wanted/order, reannounce cooldown, shutdown and explicit unsupported-path rejections
+        """
+}
+
+record templartorrent.evidence.localhost-bounded-memory/1 : evidence {
+    title "Bounded memory observed in localhost run"
+    state verified
+    result pass
+    method observation
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    summary """
+        Pump asserts payload budget peak at most 64KiB and 0 at end; engine queues capped (inbox 4096, worker cap, reqq 8, 16KiB blocks)
+        """
+}
+
+record templartorrent.evidence.localhost-faults/1 : evidence {
+    title "Fault injection recovers without panic"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost fault_injection"
+    summary """
+        Corrupt block re-requested and recovered; peer drop mid-transfer reconnects and completes; no panic or silent completion
+        """
+}
+
+record templartorrent.evidence.localhost-metadata/1 : evidence {
+    title "BEP-9 metadata fetch verifies and transfers"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost metadata_exchange"
+    summary """
+        BEP-9 from infohash alone: multi-piece fetch with reverse-order requests, raw-infohash verify before parse, then full transfer equal to fixture; 4 hostile cases rejected (hash mismatch, oversize, bad total_size, id 0)
+        """
+}
+
+record templartorrent.evidence.localhost-real-networking/1 : evidence {
+    title "Real rbit networking observed, loopback only"
+    state verified
+    result pass
+    method observation
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    summary """
+        All sockets are 127.0.0.1 TCP via rbit PeerConnection handshake and framed messages; loopback asserted on every connection
+        """
+}
+
+record templartorrent.evidence.localhost-seam-audit/1 : evidence {
+    title "Rbit seam audit evidenced with blame attribution"
+    state verified
+    result pass
+    method observation
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    summary """
+        Seams audited: transport reads into self-owned buffer with split_to on complete frames so timed-out receives lose nothing, 16MiB frame cap; asymmetric ut_metadata ids 3/7 prove directional mapping with id-0 rejected; announce gated by TrackerClock one-in-flight plus interval/backoff with direct peer route in this milestone; rejected blocks attribute supplier peer in SessionReport.blamed with retry, scoring/quarantine deferred
+        """
+}
+
+record templartorrent.evidence.localhost-seed/1 : evidence {
+    title "Seed path serves verified bytes"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost seed_serves_verified_bytes"
+    summary """
+        Completed leecher seeds verified bytes to third peer; third peer bytes equal fixture
+        """
+}
+
+record templartorrent.evidence.localhost-transfer/1 : evidence {
+    title "Localhost transfer completes with verified bytes"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost localhost_transfer"
+    summary """
+        Localhost v1 transfer completes over real rbit TCP: 4/4 pieces SHA1-verified against metainfo, final bytes equal 50KB owned fixture
+        """
+}
+
+record templartorrent.evidence.no-fixture-live/1 : evidence {
+    title "Live mode renders snapshots only"
+    state verified
+    result pass
+    method observation
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    summary """
+        LiveApp renders engine Snapshot rows through shared pure view functions and starts empty; fixture vectors exist only in the Preview path; number keys dispatch real bridge commands with visible acks
+        """
+}
+
+record templartorrent.evidence.peer-preference-client/1 : evidence {
+    title "Same host and tree: 21 production client tests passed. The worker now forwards SetPeerPreference to Driver::set_peer_preference and the ack for an unknown job reads \"unknown job\" instead of the former \"peer scoring\" rejection; PeerView carries socket and preference; the Peers tab label no longer calls the feature unavailable and preference_text covers the four choices. Headless only; no window was opened and no clipboard paste ran."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test -p templartorrent"
+    artifact "perf-results/2026-10-22-peer-preference/root-and-adapter-tests.log"
+    summary """
+        Same host and tree: 21 production client tests passed. The worker now forwards SetPeerPreference to Driver::set_peer_preference and the ack for an unknown job reads "unknown job" instead of the former "peer scoring" rejection; PeerView carries socket and preference; the Peers tab label no longer calls the feature unavailable and preference_text covers the four choices. Headless only; no window was opened and no clipboard paste ran.
+        """
+}
+
+record templartorrent.evidence.peer-preference-driver/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, uncommitted tree on 72b01427: 138 root and adapter tests passed including two new driver tests over loopback fixtures on 127.0.0.1 and 127.0.0.2. Avoid narrowed a peer to a two-block pipeline while the Normal peer held four; Prefer survived a one-connection cap while Normal was retired; Block closed the live peer, refused connect_peer with \"peer address is blocked\", emptied the reconnect list, and Normal lifted it. With one upload slot the preferred leech was unchoked and the Normal one choked; reversing to Prefer/Avoid moved the slot without disconnecting the avoided peer. No Internet, window or forced-crash run."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --workspace --all-targets"
+    artifact "perf-results/2026-10-22-peer-preference/root-and-adapter-tests.log"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, uncommitted tree on 72b01427: 138 root and adapter tests passed including two new driver tests over loopback fixtures on 127.0.0.1 and 127.0.0.2. Avoid narrowed a peer to a two-block pipeline while the Normal peer held four; Prefer survived a one-connection cap while Normal was retired; Block closed the live peer, refused connect_peer with "peer address is blocked", emptied the reconnect list, and Normal lifted it. With one upload slot the preferred leech was unchoked and the Normal one choked; reversing to Prefer/Avoid moved the slot without disconnecting the avoided peer. No Internet, window or forced-crash run.
+        """
+}
+
+record templartorrent.evidence.peer-preference-gates/1 : evidence {
+    title "Same host and tree: formatting and all-target Clippy with warnings denied passed in the root workspace and the pixelkit-preview workspace after fixing three inherited lint failures (redundant u64 casts in storage deletion.rs, a collapsible if and an eight-argument announce helper in driver.rs); 10 preview headless tests passed; cargo build --release produced target/release/templartorrent. cargo tree still reports ring 0.17.14 through rustls/reqwest/rbit, so the native-source release gate remains open."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release -p templartorrent"
+    artifact "perf-results/2026-10-22-peer-preference/root-and-adapter-clippy.log"
+    summary """
+        Same host and tree: formatting and all-target Clippy with warnings denied passed in the root workspace and the pixelkit-preview workspace after fixing three inherited lint failures (redundant u64 casts in storage deletion.rs, a collapsible if and an eight-argument announce helper in driver.rs); 10 preview headless tests passed; cargo build --release produced target/release/templartorrent. cargo tree still reports ring 0.17.14 through rustls/reqwest/rbit, so the native-source release gate remains open.
+        """
+}
+
+record templartorrent.evidence.preview-live-commands/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0 (b940084d7 2026-09-28), uncommitted tree based on 72b01427. The preview live_commands filter passed 6 tests and filtered 4. LiveBridge still rejects data deletion, add, reannounce, and peer preference. No window was opened."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/pixelkit-preview/Cargo.toml --offline live_commands -- --test-threads=1"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0 (b940084d7 2026-09-28), uncommitted tree based on 72b01427. The preview live_commands filter passed 6 tests and filtered 4. LiveBridge still rejects data deletion, add, reannounce, and peer preference. No window was opened.
+        """
+}
+
+record templartorrent.evidence.production-linux-client/1 : evidence {
+    title "Same host and uncommitted tree. Production crate tests: 10 passed, 0 failed, including activation forwarding, worker limit/add/remove/preference acks, and the snapshot fingerprint. Clippy --all-targets -D warnings passed. cargo build produced integration/templartorrent/target/debug/templartorrent; --help exited 0 and an unknown flag exited 2. Adapter driver tests driver_pause_and_remove_join_network_tasks_and_retain_data and driver_tracker_discovery_reannounce_and_safe_delete passed. No display, clipboard paste, or Internet transfer ran."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/templartorrent/Cargo.toml --offline -- --test-threads=1"
+    summary """
+        Same host and uncommitted tree. Production crate tests: 10 passed, 0 failed, including activation forwarding, worker limit/add/remove/preference acks, and the snapshot fingerprint. Clippy --all-targets -D warnings passed. cargo build produced integration/templartorrent/target/debug/templartorrent; --help exited 0 and an unknown flag exited 2. Adapter driver tests driver_pause_and_remove_join_network_tasks_and_retain_data and driver_tracker_discovery_reannounce_and_safe_delete passed. No display, clipboard paste, or Internet transfer ran.
+        """
+}
+
+record templartorrent.evidence.rbit-driver-metrics/1 : evidence {
+    title "One release-profile localhost v1 Driver sample on Linux i7-13700H/Rust 1.99.0: 196681 owned payload bytes, add_magnet resolution/admission 41464893 ns, magnet-to-first-verified-write 123442206 ns, total verified transfer 206474856 ns, 952566 B/s including metadata. Payload reservation high water 196608 B; core owned capacity sampled 65536 B; retained metadata permits 268660 B; sampled process RSS 4952064 B including fixture and seeder. No app startup or optimization comparison."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --release --locked --offline --test driver driver_magnet_to_first_verified_metrics -- --nocapture --test-threads=1"
+    artifact "perf-results/2026-10-15-driver/metrics.jsonl"
+    summary """
+        One release-profile localhost v1 Driver sample on Linux i7-13700H/Rust 1.99.0: 196681 owned payload bytes, add_magnet resolution/admission 41464893 ns, magnet-to-first-verified-write 123442206 ns, total verified transfer 206474856 ns, 952566 B/s including metadata. Payload reservation high water 196608 B; core owned capacity sampled 65536 B; retained metadata permits 268660 B; sampled process RSS 4952064 B including fixture and seeder. No app startup or optimization comparison.
+        """
+}
+
+record templartorrent.evidence.rbit-driver-path/1 : evidence {
+    title "Linux x86_64 i7-13700H/Rust 1.99.0 uncommitted tree: 33 adapter tests passed including 12 tests on the public Driver, two jobs with different hashes, two peers for one job, real magnet/BEP-9/files, corrupt-block retry, explicit peer fallback, interrupted disk recheck, private-source gates, cancelled resolver futures, quiescent removal and real connection/job limit changes. Existing TCP/HTTP tracker and disk seed fixtures passed. A seeded 4096-input malformed metainfo corpus and raw path/shape gates ran."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --locked --offline -- --nocapture --test-threads=1"
+    artifact "perf-results/2026-10-15-driver/adapter-tests.log"
+    summary """
+        Linux x86_64 i7-13700H/Rust 1.99.0 uncommitted tree: 33 adapter tests passed including 12 tests on the public Driver, two jobs with different hashes, two peers for one job, real magnet/BEP-9/files, corrupt-block retry, explicit peer fallback, interrupted disk recheck, private-source gates, cancelled resolver futures, quiescent removal and real connection/job limit changes. Existing TCP/HTTP tracker and disk seed fixtures passed. A seeded 4096-input malformed metainfo corpus and raw path/shape gates ran.
+        """
+}
+
+record templartorrent.evidence.rbit-driver-regressions/1 : evidence {
+    title "On Ubuntu 26.04.1 Linux x86_64/Rust 1.99.0, 69 root tests and 10 PixelKit headless tests passed, as did formatting and all-target Clippy with warnings denied in all three workspaces. Diagnostic example compiled via all-target checks. No native window or Windows execution. Native audit still lists ring 0.17.14 through rbit/reqwest/rustls."
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --workspace --locked --offline; cargo test --manifest-path integration/pixelkit-preview/Cargo.toml --locked --offline; cargo clippy --workspace --all-targets --locked --offline -- -D warnings; cargo clippy --manifest-path integration/rbit-adapter/Cargo.toml --all-targets --locked --offline -- -D warnings; cargo clippy --manifest-path integration/pixelkit-preview/Cargo.toml --all-targets --locked --offline -- -D warnings"
+    artifact "perf-results/2026-10-15-driver/handoff.json"
+    summary """
+        On Ubuntu 26.04.1 Linux x86_64/Rust 1.99.0, 69 root tests and 10 PixelKit headless tests passed, as did formatting and all-target Clippy with warnings denied in all three workspaces. Diagnostic example compiled via all-target checks. No native window or Windows execution. Native audit still lists ring 0.17.14 through rbit/reqwest/rustls.
+        """
+}
+
+record templartorrent.evidence.resume-recheck-tests/1 : evidence {
+    title "Resume recheck: 17/17 engine tests pass"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test -p templartorrent-engine --test engine"
+    summary """
+        Engine: 17/17 pass including 5 resume recheck tests (adopt without rewrite, corrupt/short retry, full seeding, read-error keeps progress, budget skip)
+        """
+}
+
+record templartorrent.evidence.resume-workspace-gates/1 : evidence {
+    title "Workspace green with resume: 48 tests, clippy and fmt clean"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check"
+    summary """
+        Workspace green with resume: 29 core + 17 engine + 2 simd pass, clippy -D warnings clean, fmt clean
+        """
+}
+
+record templartorrent.evidence.step1-audit-pixelkit/1 : evidence {
+    title "pixelkit-preview lockfile: 261 deps, 0 vulns, 1 allowed warning (ttf-parser 0.25.1 unmaintained RUSTSEC-2026-0192)"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo audit"
+    summary """
+        pixelkit-preview lockfile: 261 deps, 0 vulns, 1 allowed warning (ttf-parser 0.25.1 unmaintained RUSTSEC-2026-0192)
+        """
+}
+
+record templartorrent.evidence.step1-audit-rbit/1 : evidence {
+    title "rbit-adapter lockfile: 179 deps, no advisories"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo audit"
+    summary """
+        rbit-adapter lockfile: 179 deps, no advisories
+        """
+}
+
+record templartorrent.evidence.step1-audit-root/1 : evidence {
+    title "Root lockfile: 3 deps, no advisories"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo audit"
+    summary """
+        Root lockfile: 3 deps, no advisories
+        """
+}
+
+record templartorrent.evidence.step1-bench-smoke/1 : evidence {
+    title "Microbench JSONL runs: Avx2 backend on x86_64/linux, scalar/auto/pick timings"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 500"
+    summary """
+        Microbench JSONL runs: Avx2 backend on x86_64/linux, scalar/auto/pick timings
+        """
+}
+
+record templartorrent.evidence.step1-pixelkit-check/1 : evidence {
+    title "pixelkit-preview rev 614c9c6: cargo check + clippy clean, 260-pkg lockfile"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo check"
+    summary """
+        pixelkit-preview rev 614c9c6: cargo check + clippy clean, 260-pkg lockfile
+        """
+}
+
+record templartorrent.evidence.step1-rbit-tests/1 : evidence {
+    title "rbit-adapter (rbit =0.2.2): 2 tests pass, clippy clean, 178-pkg lockfile"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test"
+    summary """
+        rbit-adapter (rbit =0.2.2): 2 tests pass, clippy clean, 178-pkg lockfile
+        """
+}
+
+record templartorrent.evidence.step1-ring-provenance/1 : evidence {
+    title "Reproduced TLS audit blocker: ring 0.17.14 via rustls/reqwest/rbit 0.2.2"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo tree -i ring"
+    summary """
+        Reproduced TLS audit blocker: ring 0.17.14 via rustls/reqwest/rbit 0.2.2
+        """
+}
+
+record templartorrent.evidence.step1-root-clippy/1 : evidence {
+    title "Root workspace clippy clean with -D warnings after try_update + test lint fixes"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo clippy --workspace --all-targets -- -D warnings"
+    summary """
+        Root workspace clippy clean with -D warnings after try_update + test lint fixes
+        """
+}
+
+record templartorrent.evidence.step1-root-tests/1 : evidence {
+    title "Root workspace: 29 policy + 2 simd tests pass on Rust 1.99.0"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test --workspace"
+    summary """
+        Root workspace: 29 policy + 2 simd tests pass on Rust 1.99.0
+        """
+}
+
+record templartorrent.evidence.step2a-engine-tests/1 : evidence {
+    title "New engine crate: 12/12 session tests pass (lease/fence/budget/rate/e2e/lifecycle/tracker)"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo test -p templartorrent-engine"
+    summary """
+        New engine crate: 12/12 session tests pass (lease/fence/budget/rate/e2e/lifecycle/tracker)
+        """
+}
+
+record templartorrent.evidence.step2a-workspace-gates/1 : evidence {
+    title "Workspace green with engine member: fmt clean, clippy -D warnings exit 0, 43 tests pass"
+    state verified
+    result pass
+    method command
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    command "cargo clippy --workspace --all-targets -- -D warnings"
+    summary """
+        Workspace green with engine member: fmt clean, clippy -D warnings exit 0, 43 tests pass
+        """
+}

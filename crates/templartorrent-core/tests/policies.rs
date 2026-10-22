@@ -167,7 +167,10 @@ fn rate_wait_is_exact_and_failed_reservations_do_not_spend() {
 fn unlimited_is_not_zero_slots() {
     assert!(TokenBucket::new(0, 0).unwrap().reserve(u64::MAX, 0));
     assert!(TokenBucket::new(u64::MAX, 0).is_none());
-    let limits = Limits { download_jobs: 0, ..Limits::default() };
+    let limits = Limits {
+        download_jobs: 0,
+        ..Limits::default()
+    };
     assert!(admitted_jobs(&[(TorrentId(1), JobState::Queued)], &limits).is_empty());
 }
 #[test]
@@ -289,7 +292,10 @@ fn title_and_remote_labels_are_bounded() {
     };
     assert_eq!(row.eta_seconds(), Some(5));
     assert_eq!(window_title(&[]), "TemplarTorrent");
-    assert_eq!(window_title(std::slice::from_ref(&row)), "Example — TemplarTorrent");
+    assert_eq!(
+        window_title(std::slice::from_ref(&row)),
+        "Example — TemplarTorrent"
+    );
     assert_eq!(window_title(&[row.clone(), row]), "2 jobs — TemplarTorrent");
     assert_eq!(clean_label("x\n\u{202e}y", 10), "xy");
 }

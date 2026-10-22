@@ -1700,6 +1700,13 @@ name = "templartorrent-core"
 version = "0.1.0"
 
 [[package]]
+name = "templartorrent-engine"
+version = "0.1.0"
+dependencies = [
+ "templartorrent-core",
+]
+
+[[package]]
 name = "templartorrent-preview"
 version = "0.1.0"
 dependencies = [
@@ -1709,6 +1716,7 @@ dependencies = [
  "pixelkit-ui",
  "pixelkit-windowing",
  "templartorrent-core",
+ "templartorrent-engine",
 ]
 
 [[package]]

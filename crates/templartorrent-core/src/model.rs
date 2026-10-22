@@ -7,6 +7,9 @@ pub enum JobState {
     Metadata,
     Checking,
     Downloading,
+    /// Verified selected data, with no upload transport admitted. Keep this
+    /// distinct from actively seeding when exposing a download-only driver.
+    Complete,
     Seeding,
     Paused,
     Removing,

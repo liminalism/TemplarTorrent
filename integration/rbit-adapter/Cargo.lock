@@ -1180,11 +1180,32 @@ name = "templartorrent-core"
 version = "0.1.0"
 
 [[package]]
+name = "templartorrent-engine"
+version = "0.1.0"
+dependencies = [
+ "templartorrent-core",
+]
+
+[[package]]
 name = "templartorrent-rbit-adapter"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "rbit",
+ "sha1",
  "templartorrent-core",
+ "templartorrent-engine",
+ "templartorrent-storage",
+ "tokio",
+]
+
+[[package]]
+name = "templartorrent-storage"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "templartorrent-core",
+ "templartorrent-engine",
 ]
 
 [[package]]

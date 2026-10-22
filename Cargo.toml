@@ -1,8 +1,27 @@
 [workspace]
 resolver = "3"
-members = ["crates/templartorrent-core", "crates/templartorrent-simd", "crates/templartorrent-bench"]
-# These are separate workspaces so policy tests do not fetch GUI/network dependencies.
-exclude = ["integration/rbit-adapter", "integration/pixelkit-preview"]
+members = [
+    "crates/templartorrent-core",
+    "crates/templartorrent-simd",
+    "crates/templartorrent-bench",
+    "crates/templartorrent-engine",
+    "crates/templartorrent-storage",
+    "integration/rbit-adapter",
+    "integration/templartorrent",
+]
+# `cargo build` and `cargo run -p templartorrent` build the GUI.
+# The adapter is a member because the client links it, and it is not a default
+# member so plain `cargo test` does not run the localhost swarm.
+default-members = [
+    "crates/templartorrent-core",
+    "crates/templartorrent-simd",
+    "crates/templartorrent-bench",
+    "crates/templartorrent-engine",
+    "crates/templartorrent-storage",
+    "integration/templartorrent",
+]
+# Fixture preview stays its own workspace.
+exclude = ["integration/pixelkit-preview"]
 
 [workspace.package]
 version = "0.1.0"

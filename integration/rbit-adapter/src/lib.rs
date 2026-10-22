@@ -1,6 +1,12 @@
-//! Reference boundary against rbit 0.2.2, NOT a complete transfer/session engine.
-//! No network operation starts automatically. See docs/INTEGRATION.md before wiring it up.
+//! Rbit 0.2.2 protocol boundary and reusable bounded v1 transfer driver.
+//! Networking requires explicit calls and permitted sources; this is not yet a
+//! release-ready full session client. See driver module for remaining gates.
 #![forbid(unsafe_code)]
+mod discovery;
+pub mod driver;
+pub mod metadata;
+mod preflight;
+pub mod torrent;
 use rbit::{
     AnnounceResponse, Block, BlockRequest, ExtensionHandshake, HttpTracker, MagnetLink, Message,
     Metainfo, PeerConnection, PeerError, TrackerEvent,
@@ -15,18 +21,22 @@ pub enum Source {
     Magnet(MagnetLink),
     Torrent(Metainfo),
 }
-/// Byte bounds before parsing. A preflight bencode nesting/item-count limiter is also
-/// required before accepting untrusted production metadata; this is not that parser.
+/// Bounded magnet syntax only; parsing never authorizes discovery or endpoints.
 pub fn parse_magnet(uri: &str) -> Result<Source, Error> {
     if uri.len() > 16 * 1024 {
         return Err("magnet exceeds 16 KiB input limit".into());
     }
     Ok(Source::Magnet(MagnetLink::parse(uri)?))
 }
+/// Bounded v1 parser. Validates raw path components and layout before rbit;
+/// currently gates v2/hybrid, file attributes and more than 128 open files.
 pub fn parse_torrent(bytes: &[u8]) -> Result<Source, Error> {
     if bytes.len() > 16 * 1024 * 1024 {
         return Err("metainfo exceeds 16 MiB input limit".into());
     }
+    preflight::validate(bytes)?;
+    let info = preflight::field(bytes, b"info").ok_or("missing info dictionary")?;
+    torrent::layout(info)?;
     Ok(Source::Torrent(Metainfo::from_bytes(bytes)?))
 }
 /// rbit's u8 priorities only filter zero in the reviewed implementation. Rank externally.

@@ -1,0 +1,193 @@
+akr 0.1
+project templartorrent
+
+record templartorrent.papercut.a-multi-file-patch-for-allocation-telemetry/1 : papercut {
+    title "A multi-file patch for allocation telemetry missed a context line after…"
+    state verified
+    statement """
+        A multi-file patch for allocation telemetry missed a context line after rustfmt changed the metric print layout. The patch was atomic; re-read the formatted lines and applied the changes in smaller patches.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.akr-read-context-accept-revision-qualified/1 : papercut {
+    title "AKR read/context accept revision-qualified references, but revise and…"
+    state verified
+    statement """
+        AKR read/context accept revision-qualified references, but revise and complete require the bare key. Passing /3 or /1 was rejected; reran mutations with bare keys. Scratch prune ran after those errors, so recreated the status overlay from the preserved handoff artifact before retrying.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.akr-strict-validation-flags-observations/1 : papercut {
+    title "AKR strict validation flags observations watching new engine/storage…"
+    state verified
+    statement """
+        AKR strict validation flags observations watching new engine/storage directories because observed_at anchors HEAD before these untracked paths exist. Use a tracked parent glob until code is committed; dirty watched paths also emit the expected G004 freshness warning.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.capturing-the-templartorrent-window-on-display/1 : papercut {
+    title "Capturing the TemplarTorrent window on DISPLAY=:1 failed the first…"
+    state verified
+    statement """
+        Capturing the TemplarTorrent window on DISPLAY=:1 failed the first script because import, scrot, and xwd are not installed (set -e exited before launch). ffmpeg x11grab of the xwininfo geometry worked. xdotool search --name TemplarTorrent also matches the pcmanfm desktop icon, so the window has to be found by pid.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    about "x11"
+    author "grok"
+    created_at 2026-10-17
+}
+
+record templartorrent.papercut.in-integration-rbit-adapter-tests-driver-rs-the/1 : papercut {
+    title "In integration/rbit-adapter/tests/driver.rs the `hold` fixture fault…"
+    state verified
+    statement """
+        In integration/rbit-adapter/tests/driver.rs the `hold` fixture fault parks on `std::future::pending()` inside its request handler, so it stops reading after the first request and `stats.requests` never grows past one. A test waiting for four requests from a hold server hits its deadline. Added a `silent` fault that records requests and keeps reading for pipeline-depth assertions.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "claude"
+    created_at 2026-10-22
+}
+
+record templartorrent.papercut.knowledge-start-and-knowledge-search-with/1 : papercut {
+    title "`knowledge.start` and `knowledge.search` with planning kinds returned…"
+    state verified
+    statement """
+        `knowledge.start` and `knowledge.search` with planning kinds returned nothing because the ledger held only two completed milestones and no live planning record for AGENTS.md step 4; the handoff state lived in a stale observation and in perf-results handoff.json files. Opened templartorrent.milestone.safety-and-peer-policy so the next session has a live key to pass to knowledge.context.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "claude"
+    created_at 2026-10-22
+}
+
+record templartorrent.papercut.large-apply-patch-edits-to-the-growing-driver/1 : papercut {
+    title "Large apply_patch edits to the growing Driver missed exact contexts…"
+    state verified
+    statement """
+        Large apply_patch edits to the growing Driver missed exact contexts twice after formatting. Both were rejected atomically; split subsequent edits into smaller context-checked patches. Initial seeder fixtures also needed to accept the newly legitimate Bitfield/Have/Choke control messages.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.localhost-driver-tests-compile-in-the-sandbox/1 : papercut {
+    title "Localhost Driver tests compile in the sandbox but bind returns EPERM.…"
+    state verified
+    statement """
+        Localhost Driver tests compile in the sandbox but bind returns EPERM. Reran the same offline fixture command with escalation; no Internet endpoints are used.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.localhost-rbit-tests-failed-at-tcplistener-bind/1 : papercut {
+    title "Localhost rbit tests failed at TcpListener::bind with EPERM inside the…"
+    state verified
+    statement """
+        Localhost rbit tests failed at TcpListener::bind with EPERM inside the workspace sandbox. The approved elevated cargo test rerun passed all 11 deterministic local tests; failures were socket policy, not torrent protocol.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.orientation-used-positional-akr-context-key-cli/1 : papercut {
+    title "Orientation used positional akr context key; CLI requires --goal,…"
+    state verified
+    statement """
+        Orientation used positional akr context key; CLI requires --goal, unlike akr get. Retried with explicit --goal. Initial file inventory also referenced absent .agent scratch directory.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.resuming-from-the-ledger-the-inherited/1 : papercut {
+    title "Resuming from the ledger, the inherited uncommitted tree failed `cargo…"
+    state verified
+    statement """
+        Resuming from the ledger, the inherited uncommitted tree failed `cargo clippy --workspace --all-targets -D warnings` with three lints in templartorrent-storage and the adapter, although the latest evidence records said Clippy passed; the tree drifted after that evidence was recorded. Running the gates before trusting an evidence record for an uncommitted tree is the only defence until the tree is committed.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "claude"
+    created_at 2026-10-22
+}
+
+record templartorrent.papercut.the-pinned-rbit-crate-also-uses-peer-rs-rather/1 : papercut {
+    title "The pinned rbit crate also uses peer.rs rather than peer/mod.rs. The…"
+    state verified
+    statement """
+        The pinned rbit crate also uses peer.rs rather than peer/mod.rs. The registry module layout differs from common directory conventions; locate exported symbols with rg instead of assuming mod.rs paths.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.the-production-fixture-scan-include-str-of-lib/1 : papercut {
+    title "The production fixture scan include_str of lib.rs failed because the…"
+    state verified
+    statement """
+        The production fixture scan include_str of lib.rs failed because the assertion literals contained the forbidden names. Build those needles at runtime so the test source is not a match.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "grok"
+    created_at 2026-10-16
+}
+
+record templartorrent.papercut.while-inspecting-rbit-incoming-handshakes-i/1 : papercut {
+    title "While inspecting rbit incoming handshakes I tried peer/handshake.rs;…"
+    state verified
+    statement """
+        While inspecting rbit incoming handshakes I tried peer/handshake.rs; Handshake actually lives in peer/message.rs. Use rg to locate pinned upstream types before opening guessed paths.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.while-locating-audit-scripts-rg-reported-no/1 : papercut {
+    title "While locating audit scripts, rg reported no scripts directory; the…"
+    state verified
+    statement """
+        While locating audit scripts, rg reported no scripts directory; the repository stores reference checks in .github/workflows/reference.yml and uses cargo tree directly for the native-source dependency trace.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.while-locating-the-rbit-info-type-i-assumed/1 : papercut {
+    title "While locating the rbit Info type I assumed metainfo/info.rs; the crate…"
+    state superseded
+    statement """
+        While locating the rbit Info type I assumed metainfo/info.rs; the crate keeps it in types.rs. Switched to rg --files and symbol search before reading the actual source.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    author "codex"
+    created_at 2026-10-15
+}
+
+record templartorrent.papercut.while-locating-the-rbit-info-type-i-assumed/2 : papercut {
+    title "While locating the rbit Info type I assumed metainfo/info.rs; the crate…"
+    state verified
+    statement """
+        While locating rbit's Info type I assumed metainfo/info.rs, which did not exist.
+        rg --files and symbol search located the actual type and parser in
+        src/metainfo/torrent.rs. Inventory before assuming a module layout.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    supersedes [ @templartorrent.papercut.while-locating-the-rbit-info-type-i-assumed/1 ]
+    author "codex"
+    created_at 2026-10-15
+}

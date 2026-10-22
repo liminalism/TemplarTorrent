@@ -1,0 +1,1000 @@
+//! Owns the rbit [`Driver`] on one current-thread runtime, off the UI thread.
+//! `step` is never cancelled: dropping it mid-announce would leave a tracker
+//! clock in flight. Commands are drained between steps.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use templartorrent_core::model::{Command, JobState, Limits, PeerPreference, Snapshot, TorrentId};
+use templartorrent_rbit_adapter::driver::{Driver, ExistingData};
+use tokio::sync::{mpsc, watch};
+
+use crate::geo::GeoDb;
+use crate::space;
+use crate::workflow;
+
+const QUEUE: usize = 64;
+
+type WakeHook = Arc<dyn Fn() + Send + Sync>;
+type WakeSlot = Arc<Mutex<Option<WakeHook>>>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct JobMark {
+    id: u64,
+    state: JobState,
+    wanted: u64,
+    verified: u64,
+    downloaded: u64,
+    uploaded: u64,
+    seeds: u32,
+    peers: u32,
+    down_bps: u64,
+    up_bps: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenState {
+    Starting,
+    Bound(SocketAddr),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRow {
+    pub index: usize,
+    pub path: String,
+    pub length: u64,
+    pub verified_bytes: u64,
+    pub wanted: bool,
+    pub rank: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerView {
+    pub address: String,
+    pub socket: SocketAddr,
+    pub preference: PeerPreference,
+    pub client: String,
+    pub country: Option<[u8; 2]>,
+    pub remote_choked: bool,
+    pub remote_interested: bool,
+    pub we_choke: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerView {
+    pub label: String,
+    pub origin: String,
+    pub seeds: Option<u32>,
+    pub peers: Option<u32>,
+    pub manual_due_s: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ack {
+    pub seq: u64,
+    pub accepted: bool,
+    pub message: String,
+    pub entries: Vec<String>,
+    pub magnet: Option<String>,
+    pub space: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub snapshot: Snapshot,
+    pub limits: Limits,
+    pub listen: ListenState,
+    pub selected: Option<TorrentId>,
+    pub destination: Option<String>,
+    pub last_error: Option<String>,
+    pub seeding_reason: String,
+    pub files: Vec<FileRow>,
+    pub peers: Vec<PeerView>,
+    pub trackers: Vec<TrackerView>,
+    pub geo_status: String,
+    pub elapsed_s: u64,
+    pub acks: Vec<Ack>,
+    pub allow_local_trackers: bool,
+    pub public_tracker_count: usize,
+    pub public_tracker_path: String,
+    pub note: Option<String>,
+}
+
+impl SessionView {
+    fn idle(limits: Limits, public_tracker_path: String) -> Self {
+        Self {
+            snapshot: Snapshot::default(),
+            limits,
+            listen: ListenState::Starting,
+            selected: None,
+            destination: None,
+            last_error: None,
+            seeding_reason: String::new(),
+            files: Vec::new(),
+            peers: Vec::new(),
+            trackers: Vec::new(),
+            geo_status: "starting".into(),
+            elapsed_s: 0,
+            acks: Vec::new(),
+            allow_local_trackers: false,
+            public_tracker_count: 0,
+            public_tracker_path,
+            note: None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Visible {
+    jobs: Vec<JobMark>,
+    names: Vec<String>,
+    budget: usize,
+    limits: (usize, usize, usize, usize, usize, u64, u64, usize),
+    listen: ListenState,
+    selected: Option<u64>,
+    destination: Option<String>,
+    last_error: Option<String>,
+    seeding_reason: String,
+    files: Vec<FileRow>,
+    peers: Vec<PeerView>,
+    trackers: Vec<TrackerView>,
+    geo_status: String,
+    elapsed_s: u64,
+    acks: Vec<Ack>,
+    allow_local_trackers: bool,
+    public_tracker_count: usize,
+    note: Option<String>,
+}
+
+pub fn same_visible(left: &SessionView, right: &SessionView) -> bool {
+    let mut left_visible = visible(left);
+    let mut right_visible = visible(right);
+    if !cooling(left) && !cooling(right) {
+        left_visible.elapsed_s = 0;
+        right_visible.elapsed_s = 0;
+    }
+    left_visible == right_visible
+}
+
+fn cooling(view: &SessionView) -> bool {
+    view.trackers
+        .iter()
+        .any(|tracker| tracker.manual_due_s > view.elapsed_s)
+}
+
+fn visible(view: &SessionView) -> Visible {
+    Visible {
+        jobs: view
+            .snapshot
+            .jobs
+            .iter()
+            .map(|job| JobMark {
+                id: job.id.0,
+                state: job.state,
+                wanted: job.wanted_bytes,
+                verified: job.verified_bytes,
+                downloaded: job.total_payload_downloaded,
+                uploaded: job.total_payload_uploaded,
+                seeds: job.connected_seeds,
+                peers: job.connected_peers,
+                down_bps: job.down_bps,
+                up_bps: job.up_bps,
+            })
+            .collect(),
+        names: view
+            .snapshot
+            .jobs
+            .iter()
+            .map(|job| job.name.to_string())
+            .collect(),
+        budget: view.snapshot.payload_budget_used,
+        limits: (
+            view.limits.download_jobs,
+            view.limits.seed_jobs,
+            view.limits.upload_peer_slots,
+            view.limits.connections_total,
+            view.limits.connections_per_job,
+            view.limits.download_kb_s,
+            view.limits.upload_kb_s,
+            view.limits.payload_budget_bytes,
+        ),
+        listen: view.listen.clone(),
+        selected: view.selected.map(|id| id.0),
+        destination: view.destination.clone(),
+        last_error: view.last_error.clone(),
+        seeding_reason: view.seeding_reason.clone(),
+        files: view.files.clone(),
+        peers: view.peers.clone(),
+        trackers: view.trackers.clone(),
+        geo_status: view.geo_status.clone(),
+        elapsed_s: view.elapsed_s,
+        acks: view.acks.clone(),
+        allow_local_trackers: view.allow_local_trackers,
+        public_tracker_count: view.public_tracker_count,
+        note: view.note.clone(),
+    }
+}
+
+pub struct WorkerConfig {
+    pub limits: Limits,
+    pub allow_local_trackers: bool,
+    pub public_trackers: Vec<String>,
+    pub public_tracker_path: PathBuf,
+    pub geo_db_path: Option<PathBuf>,
+    pub listen: SocketAddr,
+}
+
+pub enum Request {
+    Command { seq: u64, command: Command },
+    ListDir { seq: u64, path: PathBuf },
+    ReadTorrent { seq: u64, path: PathBuf },
+    Space { seq: u64, path: PathBuf },
+    AllowLocal(bool),
+    ReloadTrackers,
+}
+
+pub struct WorkerHandle {
+    tx: mpsc::Sender<Request>,
+    stop: watch::Sender<bool>,
+    view: Arc<Mutex<SessionView>>,
+    selected: Arc<Mutex<Option<TorrentId>>>,
+    waker: WakeSlot,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl WorkerHandle {
+    pub fn start(config: WorkerConfig) -> Result<Self, String> {
+        let limits = config.limits.clone();
+        let path = config.public_tracker_path.display().to_string();
+        let view = Arc::new(Mutex::new(SessionView::idle(limits, path)));
+        let selected = Arc::new(Mutex::new(None));
+        let waker = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::channel(QUEUE);
+        let (stop, stop_rx) = watch::channel(false);
+        let shared = Shared {
+            view: Arc::clone(&view),
+            selected: Arc::clone(&selected),
+            waker: Arc::clone(&waker),
+        };
+        let thread = std::thread::Builder::new()
+            .name("templartorrent-driver".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime");
+                runtime.block_on(run_session(config, rx, stop_rx, shared));
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            tx,
+            stop,
+            view,
+            selected,
+            waker,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn try_request(&self, request: Request) -> Result<(), &'static str> {
+        self.tx.try_send(request).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => "command queue is full",
+            mpsc::error::TrySendError::Closed(_) => "session command channel is closed",
+        })
+    }
+
+    pub fn view(&self) -> SessionView {
+        lock(&self.view).clone()
+    }
+
+    pub fn set_selected(&self, id: Option<TorrentId>) {
+        *lock(&self.selected) = id;
+    }
+
+    pub fn set_waker(&self, wake: WakeHook) {
+        *lock(&self.waker) = Some(wake);
+    }
+
+    pub fn wait_ack(&self, seq: u64, timeout: Duration) -> Option<Ack> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if let Some(ack) = self.view().acks.iter().find(|ack| ack.seq == seq).cloned() {
+                return Some(ack);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    pub fn shutdown(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct Shared {
+    view: Arc<Mutex<SessionView>>,
+    selected: Arc<Mutex<Option<TorrentId>>>,
+    waker: WakeSlot,
+}
+
+enum Engine {
+    Live {
+        driver: Box<Driver>,
+        listen_error: Option<String>,
+    },
+    Down(&'static str),
+}
+
+struct Memory {
+    allow_local: bool,
+    public_trackers: Vec<String>,
+    public_path: PathBuf,
+    geo: GeoDb,
+    acks: Vec<Ack>,
+    note: Option<String>,
+    rates: std::collections::HashMap<u64, workflow::RateCarry>,
+    rated_at: Option<Instant>,
+}
+
+async fn run_session(
+    config: WorkerConfig,
+    mut rx: mpsc::Receiver<Request>,
+    stop: watch::Receiver<bool>,
+    shared: Shared,
+) {
+    let mut memory = Memory {
+        allow_local: config.allow_local_trackers,
+        public_trackers: config.public_trackers.clone(),
+        public_path: config.public_tracker_path.clone(),
+        geo: GeoDb::new(config.geo_db_path),
+        acks: Vec::new(),
+        note: None,
+        rates: std::collections::HashMap::new(),
+        rated_at: None,
+    };
+    let mut engine = match Driver::new(config.limits) {
+        Ok(mut driver) => {
+            driver.set_allow_local_trackers(config.allow_local_trackers);
+            driver.set_public_trackers(config.public_trackers);
+            match driver.listen(config.listen).await {
+                Ok(_) => Engine::Live {
+                    driver: Box::new(driver),
+                    listen_error: None,
+                },
+                Err(error) => Engine::Live {
+                    driver: Box::new(driver),
+                    listen_error: Some(error.0.to_string()),
+                },
+            }
+        }
+        Err(error) => Engine::Down(error.0),
+    };
+    let mut last = publish(&mut engine, &mut memory, &shared);
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+        let mut halt = false;
+        loop {
+            match rx.try_recv() {
+                Ok(request) => {
+                    if dispatch(&mut engine, &mut memory, &shared, request).await {
+                        halt = true;
+                        break;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    halt = true;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+        last = publish_if_changed(&mut engine, &mut memory, &shared, last);
+        if halt || *stop.borrow() {
+            break;
+        }
+        match &mut engine {
+            Engine::Live { driver, .. } => {
+                if let Err(error) = driver.step(Duration::from_millis(200)).await {
+                    memory.note = Some(error.0.to_string());
+                }
+            }
+            Engine::Down(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+        last = publish_if_changed(&mut engine, &mut memory, &shared, last);
+    }
+    if let Engine::Live { driver, .. } = &mut engine {
+        driver.shutdown().await;
+    }
+}
+
+fn publish_if_changed(
+    engine: &mut Engine,
+    memory: &mut Memory,
+    shared: &Shared,
+    last: SessionView,
+) -> SessionView {
+    let next = capture(engine, memory, shared);
+    if same_visible(&last, &next) {
+        return last;
+    }
+    *lock(&shared.view) = next.clone();
+    let wake = lock(&shared.waker).clone();
+    if let Some(wake) = wake {
+        wake();
+    }
+    next
+}
+
+fn publish(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> SessionView {
+    let next = capture(engine, memory, shared);
+    *lock(&shared.view) = next.clone();
+    let wake = lock(&shared.waker).clone();
+    if let Some(wake) = wake {
+        wake();
+    }
+    next
+}
+
+fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> SessionView {
+    let selected = *lock(&shared.selected);
+    let path = memory.public_path.display().to_string();
+    match engine {
+        Engine::Down(reason) => SessionView {
+            snapshot: Snapshot::default(),
+            limits: Limits::default(),
+            listen: ListenState::Failed((*reason).to_string()),
+            selected: None,
+            destination: None,
+            last_error: None,
+            seeding_reason: String::new(),
+            files: Vec::new(),
+            peers: Vec::new(),
+            trackers: Vec::new(),
+            geo_status: memory.geo.status_text(),
+            elapsed_s: 0,
+            acks: memory.acks.clone(),
+            allow_local_trackers: memory.allow_local,
+            public_tracker_count: memory.public_trackers.len(),
+            public_tracker_path: path,
+            note: Some((*reason).to_string()),
+        },
+        Engine::Live {
+            driver,
+            listen_error,
+        } => {
+            let mut snapshot = driver.snapshot();
+            apply_rates(&mut snapshot, memory);
+            let selected = selected.filter(|id| snapshot.jobs.iter().any(|job| job.id == *id));
+            let listen = match (driver.listening_address(), listen_error.clone()) {
+                (Some(address), _) => ListenState::Bound(address),
+                (None, Some(error)) => ListenState::Failed(error),
+                (None, None) => ListenState::Starting,
+            };
+            let (files, peers, trackers, destination, last_error) = match selected {
+                Some(id) => (
+                    file_rows(driver, id),
+                    peer_rows(driver, id, &mut memory.geo),
+                    tracker_rows(driver, id),
+                    driver
+                        .destination(id)
+                        .map(|path| path.display().to_string()),
+                    driver.last_error(id).map(str::to_string),
+                ),
+                None => (Vec::new(), Vec::new(), Vec::new(), None, None),
+            };
+            SessionView {
+                limits: driver.limits().clone(),
+                elapsed_s: driver.elapsed_secs(),
+                seeding_reason: driver.seeding_unavailable_reason().to_string(),
+                snapshot,
+                listen,
+                selected,
+                destination,
+                last_error,
+                files,
+                peers,
+                trackers,
+                geo_status: memory.geo.status_text(),
+                acks: memory.acks.clone(),
+                allow_local_trackers: memory.allow_local,
+                public_tracker_count: memory.public_trackers.len(),
+                public_tracker_path: path,
+                note: memory.note.clone(),
+            }
+        }
+    }
+}
+
+fn apply_rates(snapshot: &mut Snapshot, memory: &mut Memory) {
+    let now = Instant::now();
+    let dt_ms = memory
+        .rated_at
+        .map(|at| {
+            let millis = now.saturating_duration_since(at).as_millis();
+            u64::try_from(millis).unwrap_or(u64::MAX)
+        })
+        .unwrap_or(0);
+    memory.rated_at = Some(now);
+    let mut jobs = snapshot.jobs.to_vec();
+    let mut live = std::collections::HashMap::with_capacity(jobs.len());
+    for job in &mut jobs {
+        let next = match memory.rates.get(&job.id.0).copied() {
+            Some(previous) => workflow::advance_rate(
+                previous,
+                job.total_payload_downloaded,
+                job.total_payload_uploaded,
+                dt_ms,
+            ),
+            None => workflow::RateCarry {
+                downloaded: job.total_payload_downloaded,
+                uploaded: job.total_payload_uploaded,
+                down_bps: 0,
+                up_bps: 0,
+                window_ms: 0,
+            },
+        };
+        job.down_bps = next.down_bps;
+        job.up_bps = next.up_bps;
+        live.insert(job.id.0, next);
+    }
+    memory.rates = live;
+    snapshot.jobs = jobs.into();
+}
+
+fn file_rows(driver: &Driver, id: TorrentId) -> Vec<FileRow> {
+    driver
+        .file_progress(id)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(index, file)| FileRow {
+            index,
+            path: file.path,
+            length: file.length,
+            verified_bytes: file.verified_bytes,
+            wanted: file.wanted,
+            rank: file.rank,
+        })
+        .collect()
+}
+
+fn peer_rows(driver: &Driver, id: TorrentId, geo: &mut GeoDb) -> Vec<PeerView> {
+    driver
+        .peer_status(id)
+        .into_iter()
+        .map(|peer| {
+            let country = geo.lookup(peer.address.ip());
+            PeerView {
+                address: peer.address.to_string(),
+                socket: peer.address,
+                preference: peer.preference,
+                client: peer.client,
+                country,
+                remote_choked: peer.remote_choked,
+                remote_interested: peer.remote_interested,
+                we_choke: peer.we_choke,
+            }
+        })
+        .collect()
+}
+
+fn tracker_rows(driver: &Driver, id: TorrentId) -> Vec<TrackerView> {
+    driver
+        .tracker_status(id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tracker| TrackerView {
+            label: tracker.label,
+            origin: tracker.origin.to_string(),
+            seeds: tracker.seeds,
+            peers: tracker.peers,
+            manual_due_s: tracker.manual_due_s,
+            last_error: tracker.last_error,
+        })
+        .collect()
+}
+
+async fn dispatch(
+    engine: &mut Engine,
+    memory: &mut Memory,
+    shared: &Shared,
+    request: Request,
+) -> bool {
+    match request {
+        Request::Command { seq, command } => {
+            let stop = matches!(command, Command::Shutdown);
+            let result = run_command(engine, shared, command).await;
+            push_ack(
+                &mut memory.acks,
+                Ack {
+                    seq,
+                    accepted: result.is_ok(),
+                    message: result.err().unwrap_or_default(),
+                    entries: Vec::new(),
+                    magnet: None,
+                    space: None,
+                },
+            );
+            stop
+        }
+        Request::ListDir { seq, path } => {
+            let (accepted, message, entries) = match list_dir(&path) {
+                Ok(entries) => (true, String::new(), entries),
+                Err(message) => (false, message, Vec::new()),
+            };
+            push_ack(
+                &mut memory.acks,
+                Ack {
+                    seq,
+                    accepted,
+                    message,
+                    entries,
+                    magnet: None,
+                    space: None,
+                },
+            );
+            false
+        }
+        Request::ReadTorrent { seq, path } => {
+            let (accepted, message, magnet) = match read_torrent(&path) {
+                Ok(magnet) => (true, String::new(), Some(magnet)),
+                Err(message) => (false, message, None),
+            };
+            push_ack(
+                &mut memory.acks,
+                Ack {
+                    seq,
+                    accepted,
+                    message,
+                    entries: Vec::new(),
+                    magnet,
+                    space: None,
+                },
+            );
+            false
+        }
+        Request::Space { seq, path } => {
+            push_ack(
+                &mut memory.acks,
+                Ack {
+                    seq,
+                    accepted: true,
+                    message: String::new(),
+                    entries: Vec::new(),
+                    magnet: None,
+                    space: space::available_bytes(&path),
+                },
+            );
+            false
+        }
+        Request::AllowLocal(allow) => {
+            memory.allow_local = allow;
+            if let Engine::Live { driver, .. } = engine {
+                driver.set_allow_local_trackers(allow);
+            }
+            false
+        }
+        Request::ReloadTrackers => {
+            memory.public_trackers = workflow::load_public_trackers(&memory.public_path);
+            if let Engine::Live { driver, .. } = engine {
+                driver.set_public_trackers(memory.public_trackers.clone());
+            }
+            false
+        }
+    }
+}
+
+async fn run_command(engine: &mut Engine, shared: &Shared, command: Command) -> Result<(), String> {
+    let Engine::Live { driver, .. } = engine else {
+        return Err("the session driver did not start".into());
+    };
+    let outcome = match command {
+        Command::Add {
+            source,
+            destination,
+            public_magnet_bootstrap,
+        } => {
+            let existing = if destination.is_dir() {
+                ExistingData::Recheck
+            } else if destination.exists() {
+                return Err("destination must be a directory".into());
+            } else {
+                ExistingData::Refuse
+            };
+            driver
+                .add_magnet_with_discovery(
+                    &source,
+                    &destination,
+                    existing,
+                    &[],
+                    public_magnet_bootstrap,
+                )
+                .await
+                .map(|_| ())
+        }
+        Command::Pause(id) => driver.pause(id).await,
+        Command::Resume(id) => driver.resume(id).await,
+        Command::Remove { id, delete_data } => driver.remove(id, delete_data).await,
+        Command::SetLimits(limits) => driver.set_limits(limits).await,
+        Command::SetFileOrder { id, file_indices } => driver.set_file_order(id, file_indices),
+        Command::SetFileWanted {
+            id,
+            file_index,
+            wanted,
+        } => driver.set_file_wanted(id, file_index, wanted),
+        Command::Reannounce { id, tracker_index } => driver.reannounce(id, tracker_index).await,
+        Command::SetPeerPreference {
+            id,
+            address,
+            preference,
+        } => driver.set_peer_preference(id, address, preference).await,
+        Command::Inspect { id, .. } => {
+            *lock(&shared.selected) = id;
+            Ok(())
+        }
+        Command::Shutdown => Ok(()),
+    };
+    outcome.map_err(|error| error.0.to_string())
+}
+
+fn push_ack(acks: &mut Vec<Ack>, ack: Ack) {
+    acks.push(ack);
+    if acks.len() > 32 {
+        acks.remove(0);
+    }
+}
+
+fn list_dir(path: &Path) -> Result<Vec<String>, String> {
+    let read = std::fs::read_dir(path).map_err(|_| "could not read that folder".to_string())?;
+    let mut names = Vec::new();
+    for entry in read {
+        if names.len() == 200 {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let kind = meta.file_type();
+        if !kind.is_dir() || kind.is_symlink() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if name.contains('/') || name.contains('\0') {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names.sort_by(|left, right| {
+        left.to_ascii_lowercase()
+            .cmp(&right.to_ascii_lowercase())
+            .then(left.cmp(right))
+    });
+    Ok(names)
+}
+
+fn read_torrent(path: &Path) -> Result<String, String> {
+    let torrent = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"));
+    if !torrent {
+        return Err("file name must end in .torrent".into());
+    }
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|_| "could not open the torrent file".to_string())?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "could not read the torrent file".to_string())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("torrent file exceeds 16 MiB limit".into());
+    }
+    Driver::magnet_from_torrent_bytes(&bytes).map_err(|error| error.0.to_string())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use templartorrent_core::model::{InspectorTab, PeerPreference};
+
+    fn rate_job(down_bps: u64) -> templartorrent_core::model::TorrentRow {
+        templartorrent_core::model::TorrentRow {
+            id: TorrentId(1),
+            name: std::sync::Arc::from("transfer"),
+            state: JobState::Downloading,
+            wanted_bytes: 1_000,
+            verified_bytes: 10,
+            total_payload_downloaded: 10,
+            total_payload_uploaded: 0,
+            down_bps,
+            up_bps: 0,
+            connected_seeds: 0,
+            connected_peers: 1,
+            estimated_seeds: None,
+            estimated_peers: None,
+        }
+    }
+
+    fn config() -> WorkerConfig {
+        WorkerConfig {
+            limits: Limits::default(),
+            allow_local_trackers: false,
+            public_trackers: Vec::new(),
+            public_tracker_path: PathBuf::from("public-trackers.txt"),
+            geo_db_path: None,
+            listen: "127.0.0.1:0".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn snapshot_sequence_alone_does_not_change_the_visible_fingerprint() {
+        let mut left = SessionView::idle(Limits::default(), "trackers.txt".into());
+        let mut right = left.clone();
+        right.snapshot.sequence = 40;
+        right.elapsed_s = 9;
+        assert!(same_visible(&left, &right));
+        let mut slow = SessionView::idle(Limits::default(), "trackers.txt".into());
+        let mut fast = slow.clone();
+        slow.snapshot.jobs = vec![rate_job(0)].into();
+        fast.snapshot.jobs = vec![rate_job(2_000)].into();
+        assert!(!same_visible(&slow, &fast));
+        let tracker = TrackerView {
+            label: "tracker".into(),
+            origin: "original".into(),
+            seeds: None,
+            peers: None,
+            manual_due_s: 20,
+            last_error: None,
+        };
+        left.trackers.push(tracker.clone());
+        right.trackers.push(tracker);
+        left.elapsed_s = 3;
+        right.elapsed_s = 4;
+        assert!(!same_visible(&left, &right));
+    }
+
+    #[test]
+    fn capture_without_a_geo_database_reports_not_loaded() {
+        let mut memory = Memory {
+            allow_local: false,
+            public_trackers: Vec::new(),
+            public_path: PathBuf::from("public-trackers.txt"),
+            geo: GeoDb::new(None),
+            acks: Vec::new(),
+            note: None,
+            rates: std::collections::HashMap::new(),
+            rated_at: None,
+        };
+        let shared = Shared {
+            view: Arc::new(Mutex::new(SessionView::idle(
+                Limits::default(),
+                "trackers.txt".into(),
+            ))),
+            selected: Arc::new(Mutex::new(None)),
+            waker: Arc::new(Mutex::new(None)),
+        };
+        let mut engine = Engine::Down("test");
+        let view = capture(&mut engine, &mut memory, &shared);
+        assert!(view.peers.is_empty());
+        assert!(
+            view.geo_status.contains("not loaded"),
+            "{}",
+            view.geo_status
+        );
+    }
+
+    #[test]
+    fn live_commands_ack_limits_and_reject_bad_add() {
+        let mut handle = WorkerHandle::start(config()).unwrap();
+        let limits = Limits {
+            download_jobs: 2,
+            ..Limits::default()
+        };
+        handle
+            .try_request(Request::Command {
+                seq: 1,
+                command: Command::SetLimits(limits),
+            })
+            .unwrap();
+        let ack = handle
+            .wait_ack(1, Duration::from_secs(5))
+            .expect("limits ack");
+        assert!(ack.accepted, "{}", ack.message);
+        assert_eq!(handle.view().limits.download_jobs, 2);
+        handle
+            .try_request(Request::Command {
+                seq: 2,
+                command: Command::Add {
+                    source: "not a magnet".into(),
+                    destination: std::env::temp_dir(),
+                    public_magnet_bootstrap: false,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(2, Duration::from_secs(5)).expect("add ack");
+        assert!(!ack.accepted, "{}", ack.message);
+        assert!(
+            ack.message.contains("invalid magnet"),
+            "driver should reject the magnet, got {}",
+            ack.message
+        );
+        handle
+            .try_request(Request::Command {
+                seq: 3,
+                command: Command::Remove {
+                    id: TorrentId(9),
+                    delete_data: true,
+                },
+            })
+            .unwrap();
+        let ack = handle
+            .wait_ack(3, Duration::from_secs(5))
+            .expect("remove ack");
+        assert!(
+            ack.message.contains("unknown job"),
+            "delete reaches the driver, got {}",
+            ack.message
+        );
+        handle
+            .try_request(Request::Command {
+                seq: 4,
+                command: Command::SetPeerPreference {
+                    id: TorrentId(1),
+                    address: "127.0.0.1:1".parse().unwrap(),
+                    preference: PeerPreference::Avoid,
+                },
+            })
+            .unwrap();
+        let ack = handle
+            .wait_ack(4, Duration::from_secs(5))
+            .expect("preference ack");
+        assert!(
+            ack.message.contains("unknown job"),
+            "preference reaches the driver, got {}",
+            ack.message
+        );
+        handle
+            .try_request(Request::Command {
+                seq: 5,
+                command: Command::Inspect {
+                    id: None,
+                    tab: InspectorTab::Details,
+                    visible_range: 0..0,
+                },
+            })
+            .unwrap();
+        let ack = handle
+            .wait_ack(5, Duration::from_secs(5))
+            .expect("inspect ack");
+        assert!(ack.accepted, "{}", ack.message);
+        handle.shutdown();
+    }
+}

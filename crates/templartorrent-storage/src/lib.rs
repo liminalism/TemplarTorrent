@@ -1,0 +1,515 @@
+//! File-backed piece storage: one validated directory tree per job, v1
+//! concatenated-file mapping, explicit errors instead of silent overwrite.
+//!
+//! Paths are validated lexically ([`RelativeFile`]) and refused when any level
+//! is a symlink. Pre-existing files at or under the torrent length resume in
+//! place; longer files are an explicit [`StorageError::LengthMismatch`], never
+//! silently truncated. Every piece write ends with a data sync so verified
+//! bytes are durable before the engine credits them.
+//!
+//! Two handles: [`FileStore`] for direct single-owner use, [`SharedStore`]
+//! (cheaply cloneable) for engine sessions, where the sink moves into the
+//! session before the job id exists to register paths against.
+//!
+//! Deletion is Linux handle-relative: `openat`/`unlinkat` with
+//! `O_NOFOLLOW`, inode identity taken from the still-open handle, hardlink
+//! refusal, and no removal of the destination directory itself. Symlink
+//! checks at open time still do not re-validate every later read.
+
+#![deny(unsafe_code)]
+
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use templartorrent_core::{
+    model::TorrentId,
+    paths::{PathError, RelativeFile},
+};
+use templartorrent_engine::worker::{PieceReader, PieceSink, SinkError};
+
+mod deletion;
+
+/// Same bound as the engine; actual admission also requires enough session
+/// budget for piece assembly and incoming copies.
+pub const MAX_STORED_PIECE_LENGTH: u64 = templartorrent_engine::session::MAX_PIECE_LENGTH;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageError {
+    Path(PathError),
+    Io(String),
+    LengthMismatch {
+        path: String,
+        expected: u64,
+        found: u64,
+    },
+    Symlink {
+        path: String,
+    },
+    PieceTooLarge(u64),
+    UnknownPiece(u32),
+    DuplicateJob(TorrentId),
+    UnknownJob(TorrentId),
+    Hardlink {
+        path: String,
+    },
+    IdentityChanged {
+        path: String,
+    },
+    PartialDelete {
+        deleted: Vec<String>,
+        failed: String,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(inner) => write!(f, "rejected path: {inner}"),
+            Self::Io(detail) => write!(f, "storage I/O: {detail}"),
+            Self::LengthMismatch {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{path}: length {found} exceeds torrent length {expected}; refusing to truncate"
+            ),
+            Self::Symlink { path } => write!(f, "{path}: refusing symlink in torrent storage"),
+            Self::PieceTooLarge(length) => write!(
+                f,
+                "piece length {length} is outside 1..={MAX_STORED_PIECE_LENGTH} bytes"
+            ),
+            Self::UnknownPiece(piece) => write!(f, "piece {piece} out of range"),
+            Self::DuplicateJob(id) => write!(f, "job {} already has storage", id.0),
+            Self::UnknownJob(id) => write!(f, "job {} has no storage", id.0),
+            Self::Hardlink { path } => write!(f, "{path}: refusing to delete a hardlinked file"),
+            Self::IdentityChanged { path } => {
+                write!(f, "{path}: file identity changed before deletion")
+            }
+            Self::PartialDelete {
+                deleted,
+                failed,
+                detail,
+            } => write!(
+                f,
+                "deleted {} file(s) then stopped at {failed}: {detail}",
+                deleted.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+fn io_error(path: &Path, error: std::io::Error) -> StorageError {
+    StorageError::Io(format!("{}: {error}", path.display()))
+}
+
+/// `Ok(None)` when `path` is missing; refuses symlinks either way.
+fn probe(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(StorageError::Symlink {
+                    path: path.display().to_string(),
+                });
+            }
+            Ok(Some(meta))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_error(path, error)),
+    }
+}
+
+struct StoredFile {
+    path: PathBuf,
+    handle: File,
+    length: u64,
+    offset: u64,
+}
+
+struct JobFiles {
+    root: PathBuf,
+    files: Vec<StoredFile>,
+    piece_length: u64,
+    total: u64,
+    piece_count: usize,
+}
+
+impl JobFiles {
+    /// Byte range of one piece, or `None` when out of range.
+    fn piece_range(&self, piece: u32) -> Option<(u64, usize)> {
+        let index = usize::try_from(piece).ok()?;
+        if index >= self.piece_count {
+            return None;
+        }
+        let start = u64::from(piece).checked_mul(self.piece_length)?;
+        let end = start.saturating_add(self.piece_length).min(self.total);
+        Some((start, usize::try_from(end - start).ok()?))
+    }
+
+    /// Index of the file containing `offset`. Files tile `[0, total)`
+    /// contiguously, so the last file starting at or before `offset` always
+    /// contains it; zero-length files at the boundary are skipped by the
+    /// partition point, never selected.
+    fn locate(&self, offset: u64) -> Option<usize> {
+        if offset >= self.total || self.files.is_empty() {
+            return None;
+        }
+        let index = self
+            .files
+            .partition_point(|file| file.offset <= offset)
+            .checked_sub(1)?;
+        let file = &self.files[index];
+        (offset < file.offset + file.length).then_some(index)
+    }
+}
+
+/// Direct single-owner file storage. Register each job with [`FileStore::add_job`].
+#[derive(Default)]
+pub struct FileStore {
+    jobs: HashMap<u64, JobFiles>,
+}
+
+impl FileStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Close every handle for a quiesced job; leaves all data intact.
+    pub fn close_job(&mut self, id: TorrentId) -> bool {
+        self.jobs.remove(&id.0).is_some()
+    }
+
+    /// Map one torrent onto `root`. Creates missing directories and files but
+    /// never truncates: pre-existing files at or under the torrent length stay
+    /// for resume, longer ones fail with [`StorageError::LengthMismatch`].
+    pub fn add_job(
+        &mut self,
+        id: TorrentId,
+        root: &Path,
+        files: &[(Vec<String>, u64)],
+        piece_length: u64,
+    ) -> Result<(), StorageError> {
+        if piece_length == 0 || piece_length > MAX_STORED_PIECE_LENGTH {
+            return Err(StorageError::PieceTooLarge(piece_length));
+        }
+        if self.jobs.contains_key(&id.0) {
+            return Err(StorageError::DuplicateJob(id));
+        }
+        match probe(root)? {
+            Some(meta) if !meta.is_dir() => {
+                return Err(StorageError::Io(format!(
+                    "{}: storage root is not a directory",
+                    root.display()
+                )));
+            }
+            Some(_) => {}
+            None => std::fs::create_dir_all(root).map_err(|error| io_error(root, error))?,
+        }
+        let mut stored = Vec::with_capacity(files.len());
+        let mut total = 0u64;
+        for (components, length) in files {
+            let relative = RelativeFile::new(components.clone()).map_err(StorageError::Path)?;
+            let mut path = root.to_path_buf();
+            let parts = relative.components();
+            for (index, part) in parts.iter().enumerate() {
+                path.push(part);
+                let last = index + 1 == parts.len();
+                match probe(&path)? {
+                    Some(meta) => {
+                        if last && !meta.is_file() {
+                            return Err(StorageError::Io(format!(
+                                "{}: torrent file path is not a file",
+                                path.display()
+                            )));
+                        }
+                        if !last && !meta.is_dir() {
+                            return Err(StorageError::Io(format!(
+                                "{}: parent path is not a directory",
+                                path.display()
+                            )));
+                        }
+                    }
+                    None => {
+                        if last {
+                            File::create(&path).map_err(|error| io_error(&path, error))?;
+                        } else {
+                            std::fs::create_dir(&path).map_err(|error| io_error(&path, error))?;
+                        }
+                        probe(&path)?;
+                    }
+                }
+            }
+            let handle = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| io_error(&path, error))?;
+            let found = handle
+                .metadata()
+                .map_err(|error| io_error(&path, error))?
+                .len();
+            if found > *length {
+                return Err(StorageError::LengthMismatch {
+                    path: path.display().to_string(),
+                    expected: *length,
+                    found,
+                });
+            }
+            let offset = total;
+            total = total
+                .checked_add(*length)
+                .ok_or_else(|| StorageError::Io("total size overflows u64".into()))?;
+            stored.push(StoredFile {
+                path,
+                handle,
+                length: *length,
+                offset,
+            });
+        }
+        let piece_count = usize::try_from(total.div_ceil(piece_length))
+            .map_err(|_| StorageError::Io("piece count overflows usize".into()))?;
+        self.jobs.insert(
+            id.0,
+            JobFiles {
+                root: root.to_path_buf(),
+                files: stored,
+                piece_length,
+                total,
+                piece_count,
+            },
+        );
+        Ok(())
+    }
+
+    /// Check that every registered file is still the inode we opened.
+    /// Does not close handles or unlink anything.
+    pub fn preflight_delete(&self, id: TorrentId) -> Result<(), StorageError> {
+        let job = self.jobs.get(&id.0).ok_or(StorageError::UnknownJob(id))?;
+        deletion::plan(job)?;
+        Ok(())
+    }
+
+    /// Close this job's handles, then unlink only the files whose inode still
+    /// matches. The destination root is kept. Empty directories that contained
+    /// only those files are removed. A hardlink, symlink, or inode swap fails
+    /// before any unlink when `preflight_delete` caught it; a race after the
+    /// handles close returns [`StorageError::PartialDelete`] or
+    /// [`StorageError::IdentityChanged`] and leaves the job unregistered.
+    pub fn delete_job_data(&mut self, id: TorrentId) -> Result<(), StorageError> {
+        let job = self.jobs.get(&id.0).ok_or(StorageError::UnknownJob(id))?;
+        let plan = deletion::plan(job)?;
+        let job = self
+            .jobs
+            .remove(&id.0)
+            .ok_or(StorageError::UnknownJob(id))?;
+        let root = job.root.clone();
+        drop(job);
+        let mut deleted_paths = Vec::new();
+        for file in plan {
+            match deletion::unlink_matched(&root, &file.path, file.dev, file.ino) {
+                Ok(()) => deleted_paths.push(file.path),
+                Err(error) => {
+                    return Err(StorageError::PartialDelete {
+                        deleted: deleted_paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect(),
+                        failed: file.path.display().to_string(),
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        }
+        deletion::prune_empty_parents(&root, &deleted_paths);
+        Ok(())
+    }
+
+    fn job(&self, torrent: TorrentId) -> Result<&JobFiles, SinkError> {
+        self.jobs.get(&torrent.0).ok_or(SinkError::UnknownJob)
+    }
+
+    fn job_mut(&mut self, torrent: TorrentId) -> Result<&mut JobFiles, SinkError> {
+        self.jobs.get_mut(&torrent.0).ok_or(SinkError::UnknownJob)
+    }
+}
+
+fn storage_to_sink(error: StorageError) -> SinkError {
+    SinkError::Io(error.to_string())
+}
+
+impl PieceSink for FileStore {
+    fn write_piece(
+        &mut self,
+        torrent: TorrentId,
+        piece: u32,
+        data: &[u8],
+    ) -> Result<(), SinkError> {
+        let job = self.job_mut(torrent)?;
+        let (mut offset, expected) = job
+            .piece_range(piece)
+            .ok_or_else(|| storage_to_sink(StorageError::UnknownPiece(piece)))?;
+        if data.len() != expected {
+            return Err(SinkError::Io(format!(
+                "piece {piece}: {} bytes disagree with torrent length {expected}",
+                data.len()
+            )));
+        }
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let index = job
+                .locate(offset)
+                .ok_or_else(|| storage_to_sink(StorageError::UnknownPiece(piece)))?;
+            let file = &mut job.files[index];
+            let writable = (file.length - (offset - file.offset)).min(remaining.len() as u64);
+            if writable == 0 {
+                return Err(SinkError::Io(format!("piece {piece}: unmappable offset")));
+            }
+            let writable = writable as usize;
+            file.handle
+                .seek(SeekFrom::Start(offset - file.offset))
+                .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            file.handle
+                .write_all(&remaining[..writable])
+                .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            file.handle
+                .sync_data()
+                .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            remaining = &remaining[writable..];
+            offset += writable as u64;
+        }
+        Ok(())
+    }
+}
+
+impl PieceReader for FileStore {
+    fn read_piece(
+        &self,
+        torrent: TorrentId,
+        piece: u32,
+        expected_len: usize,
+    ) -> Result<Option<Vec<u8>>, SinkError> {
+        let job = self.job(torrent)?;
+        let (mut offset, expected) = job
+            .piece_range(piece)
+            .ok_or_else(|| storage_to_sink(StorageError::UnknownPiece(piece)))?;
+        // A caller/engine length disagreement fails open toward re-download:
+        // the piece is treated as missing, never as verified.
+        if expected_len != expected {
+            return Ok(None);
+        }
+        let mut out = vec![0; expected];
+        let mut remaining = expected;
+        while remaining > 0 {
+            let index = job
+                .locate(offset)
+                .ok_or_else(|| storage_to_sink(StorageError::UnknownPiece(piece)))?;
+            let file = &job.files[index];
+            let readable = (file.length - (offset - file.offset)).min(remaining as u64) as usize;
+            if readable == 0 {
+                return Err(SinkError::Io(format!("piece {piece}: unmappable offset")));
+            }
+            // A fresh handle per read keeps offsets independent of the write
+            // path; a short file (partial download) reads as missing.
+            let mut handle = File::open(&file.path)
+                .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            handle
+                .seek(SeekFrom::Start(offset - file.offset))
+                .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            let written = expected - remaining;
+            match handle.read_exact(&mut out[written..written + readable]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(storage_to_sink(io_error(&file.path, error))),
+            }
+            remaining -= readable;
+            offset += readable as u64;
+        }
+        Ok(Some(out))
+    }
+}
+
+/// Cloneable file storage for engine sessions. The session takes one clone up
+/// front; paths register later through another once the job id exists.
+#[derive(Clone, Default)]
+pub struct SharedStore {
+    inner: Arc<Mutex<FileStore>>,
+}
+
+impl SharedStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn close_job(&self, id: TorrentId) -> Result<bool, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Io("store lock poisoned".into()))?
+            .close_job(id))
+    }
+
+    pub fn preflight_delete(&self, id: TorrentId) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Io("store lock poisoned".into()))?
+            .preflight_delete(id)
+    }
+
+    pub fn delete_job_data(&self, id: TorrentId) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Io("store lock poisoned".into()))?
+            .delete_job_data(id)
+    }
+
+    pub fn add_job(
+        &self,
+        id: TorrentId,
+        root: &Path,
+        files: &[(Vec<String>, u64)],
+        piece_length: u64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Io("store lock poisoned".into()))?
+            .add_job(id, root, files, piece_length)
+    }
+}
+
+impl PieceSink for SharedStore {
+    fn write_piece(
+        &mut self,
+        torrent: TorrentId,
+        piece: u32,
+        data: &[u8],
+    ) -> Result<(), SinkError> {
+        self.inner
+            .lock()
+            .map_err(|_| SinkError::Io("store lock poisoned".into()))?
+            .write_piece(torrent, piece, data)
+    }
+}
+
+impl PieceReader for SharedStore {
+    fn read_piece(
+        &self,
+        torrent: TorrentId,
+        piece: u32,
+        expected_len: usize,
+    ) -> Result<Option<Vec<u8>>, SinkError> {
+        self.inner
+            .lock()
+            .map_err(|_| SinkError::Io("store lock poisoned".into()))?
+            .read_piece(torrent, piece, expected_len)
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "templartorrent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+templartorrent-core = { path = "../../crates/templartorrent-core" }
+templartorrent-rbit-adapter = { path = "../rbit-adapter" }
+pixelkit-raster = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-shell = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-text = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-ui = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+pixelkit-windowing = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+libc = "0.2.190"
+maxminddb = "0.32"

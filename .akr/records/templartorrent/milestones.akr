@@ -1,0 +1,172 @@
+akr 0.1
+project templartorrent
+
+record templartorrent.milestone.local-v1-transfer/1 : milestone {
+    title "Deterministic localhost v1 transfer and seed"
+    state completed
+    scope [ path "crates/**", path "integration/rbit-adapter/**" ]
+    intent """
+        AGENTS.md step 2 / INTEGRATION.md B-C: headless templartorrent-engine does a deterministic localhost v1 transfer and seed with real rbit networking, verified data, bounded memory, and fault injection.
+        """
+    acceptance {
+        check bounded-memory {
+            statement """
+                No unbounded task/queue growth: one lease coordinator, one session arbiter, bounded disk/hash workers, lease + memory admission before receive_block
+                """
+            method observation
+            verified_by [ @templartorrent.evidence.localhost-bounded-memory/1 ]
+        }
+        check fault-injection {
+            statement """
+                Injected peer drops and corrupt blocks yield recoverable errors, never panic or silent completion
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost fault_injection"
+            verified_by [ @templartorrent.evidence.localhost-faults/1 ]
+        }
+        check localhost-transfer {
+            statement """
+                Headless localhost v1 transfer completes: explicit src/dst, injected 127.0.0.1 tracker/peer route, final bytes equal owned fixture
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost localhost_transfer"
+            verified_by [ @templartorrent.evidence.localhost-transfer/1 ]
+        }
+        check metadata-exchange {
+            statement """
+                Leecher starting from infohash alone fetches metainfo via BEP-9, verifies raw infohash, then transfers
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost metadata_exchange"
+            verified_by [ @templartorrent.evidence.localhost-metadata/1 ]
+        }
+        check real-networking {
+            statement """
+                Transfer uses real rbit networking only; no fixture backend stands in for the wire
+                """
+            method observation
+            verified_by [ @templartorrent.evidence.localhost-real-networking/1 ]
+        }
+        check seam-audit {
+            statement """
+                Rbit seam audit per INTEGRATION.md C evidenced: framing cancellation, directional ext IDs, bounded announce, blame handling
+                """
+            method observation
+            verified_by [ @templartorrent.evidence.localhost-seam-audit/1 ]
+        }
+        check seed-path {
+            statement """
+                Completed leecher seeds verified bytes to a third peer
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost seed_serves_verified_bytes"
+            verified_by [ @templartorrent.evidence.localhost-seed/1 ]
+        }
+    }
+}
+
+record templartorrent.milestone.native-app-wiring/1 : milestone {
+    title "File-backed transfers and live UI wiring"
+    state completed
+    scope [ path "crates/**", path "integration/**" ]
+    intent """
+        AGENTS.md step 3: file-backed headless transfers on real directories (validated paths, no silent overwrite, disk resume without rewrite) plus PixelKit live wiring (typed commands/acks, add/limits/remove dialogs), no fixture data in live mode.
+        """
+    acceptance {
+        check disk-resume {
+            statement """
+                Pre-existing complete files on disk are adopted via recheck with zero writes and the job seeds without fetching
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost file_backed_resume"
+            verified_by [ @templartorrent.evidence.rbit-driver-path/1 ]
+        }
+        check file-transfer {
+            statement """
+                Headless localhost v1 transfer into a fresh temp dir completes with on-disk bytes equal to the owned fixture
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost file_backed_transfer"
+            verified_by [ @templartorrent.evidence.rbit-driver-path/1 ]
+        }
+        check live-commands {
+            statement """
+                UI dispatches typed commands with reliable acks against a live session
+                """
+            method command
+            command "cargo test --manifest-path integration/pixelkit-preview/Cargo.toml live_commands"
+            verified_by [ @templartorrent.evidence.preview-live-commands/1 ]
+        }
+        check no-fixture-live {
+            statement """
+                Live mode renders engine snapshots only; fixture rows confined to the preview harness
+                """
+            method observation
+            verified_by [ @templartorrent.evidence.no-fixture-live/1 ]
+        }
+    }
+}
+
+record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
+    title "Protected storage, crash/private-discovery tests, capability gates and peer preference"
+    state active
+    scope [
+        path "crates/templartorrent-engine/**",
+        path "crates/templartorrent-storage/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/**"
+    ]
+    intent """
+        AGENTS.md step 4 on the Linux production client: protected handle-relative storage and deletion with explicit refusals, resume and forced-crash restart tests, private-discovery scope tests, v2/hybrid capability gates that reject with a visible reason, and offline country/client/peer-preference integration (Prefer/Normal/Avoid/Block applied locally by the Driver and exposed in the Peers tab).
+        """
+    note """
+        Opened 2026-10-22 after milestones for AGENTS steps 2 and 3 completed. Peer preference is local only: it orders upload slots, narrows or keeps request pipelines, decides retention when caps shrink, and Block closes and refuses the peer's IP for that job. It is not automatic peer scoring.
+        """
+    acceptance {
+        check capability-gates {
+            statement """
+                v2 and hybrid magnets and torrent files are rejected with a clear message before any payload storage is created; private metadata revokes public bootstrap.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter"
+        }
+        check forced-crash-restart {
+            statement """
+                A job whose process is killed mid-transfer restarts from disk with a recheck, requests only missing pieces, and completes with bytes equal to the fixture.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver"
+        }
+        check offline-country-client {
+            statement """
+                Peer country resolves only from a local MMDB and shows -- without one; client names come from the sanitized extension handshake with Unknown fallback; no network lookup exists.
+                """
+            method command
+            command "cargo test -p templartorrent"
+        }
+        check peer-preference-driver {
+            statement """
+                Adapter tests show Block closing the matching peer and refusing its reconnection and new candidates, Avoid narrowing that peer's request pipeline, Prefer being retained ahead of Normal and Avoid when connection caps shrink, and upload slots ordered Prefer before Normal before Avoid.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.peer-preference-driver/1 ]
+        }
+        check peer-preference-ui {
+            statement """
+                The production client's worker routes SetPeerPreference to the Driver with a real acknowledgement, peer rows carry the preference, and headless tests pass.
+                """
+            method command
+            command "cargo test -p templartorrent"
+            verified_by [ @templartorrent.evidence.peer-preference-client/1 ]
+        }
+        check protected-deletion {
+            statement """
+                Storage and Driver tests show handle-relative no-follow deletion refusing symlinks, hardlinks and identity changes, never removing the destination root, and removal without deletion retaining data.
+                """
+            method command
+            command "cargo test -p templartorrent-storage && cargo test -p templartorrent-rbit-adapter --test driver"
+        }
+    }
+    after [ @templartorrent.milestone.native-app-wiring ]
+}

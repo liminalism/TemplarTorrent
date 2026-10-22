@@ -1,0 +1,224 @@
+akr 0.1
+project templartorrent
+
+record templartorrent.work.complete-piece-assembly/1 : work {
+    title "Bounded complete-piece transfer and cancellation"
+    state completed
+    intent """
+        Replace per-block verification with budget-admitted complete-piece assembly,
+        retain the scalar file-order oracle, fence cancellation and worker writes,
+        and exercise ordinary v1 piece sizes over real deterministic localhost peers.
+        Keep this milestone headless: the existing PixelKit live mode still has no Add
+        or production transport and must not be represented as a working client.
+        """
+    acceptance {
+        check assembly {
+            statement """
+                Complete-piece assembly handles out-of-order blocks, bounded pipeline refill, short tails, file promotion and exact verification before writes.
+                """
+            method command
+            command "cargo test -p templartorrent-engine --test assembly"
+            verified_by [ @templartorrent.evidence.complete-piece-root/1 ]
+        }
+        check lifecycle {
+            statement """
+                Fake-clock tests cover cancellation, timeout, low-rate progress and global reservation ownership across settings changes.
+                """
+            method command
+            command "cargo test --workspace --locked"
+            verified_by [ @templartorrent.evidence.complete-piece-root/1 ]
+        }
+        check wire {
+            statement """
+                Real rbit localhost transfers use 256 KiB pieces, a local tracker, verified file writes, corruption retry and interrupted disk resume.
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test multiblock --locked"
+            verified_by [ @templartorrent.evidence.complete-piece-wire/1 ]
+        }
+    }
+    part_of [ @templartorrent.milestone.native-app-wiring ]
+}
+
+record templartorrent.work.driver-seeding/1 : work {
+    title "Verified bounded Linux driver seeding"
+    state completed
+    intent """
+        Implement Linux Driver upload/seeding with verified disk reads, shared memory
+        and upload-rate admission, bounded peer queues and incoming v1 routing.
+        Preserve private-source restrictions, quiescent pause/remove and no-listener
+        Complete status. Windows is optional under the latest explicit user scope.
+        """
+    acceptance {
+        check policy {
+            statement """
+                Fake-clock upload admission and wire tests cover bounds, corruption, pause, cancellation, limits and private ingress.
+                """
+            method command
+            command "cargo test --workspace --locked"
+            verified_by [ @templartorrent.evidence.driver-seeding-regressions/1 ]
+        }
+        check seed {
+            statement """
+                Real rbit localhost peers fetch verified bytes from Driver, including restart-adopted data and metadata.
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test driver --locked"
+            verified_by [ @templartorrent.evidence.driver-seeding-path/1 ]
+        }
+    }
+    after [ @templartorrent.work.rbit-driver ]
+    part_of [ @templartorrent.milestone.native-app-wiring ]
+}
+
+record templartorrent.work.engine-scaffold/1 : work {
+    title "Engine session skeleton"
+    state completed
+    intent """
+        Engine skeleton: one lease coordinator, one session arbiter, peer actors owning sockets, bounded disk/hash workers, generation-tagged events.
+        """
+    part_of [ @templartorrent.milestone.local-v1-transfer ]
+}
+
+record templartorrent.work.file-storage/1 : work {
+    title "File-backed piece storage"
+    state completed
+    intent """
+        File-backed PieceSink/PieceReader: validated no-follow paths, explicit length-mismatch errors instead of silent overwrite, v1 piece mapping with a clear oversize-piece gate, per-write durability sync, temp-dir transfer and resume tests.
+        """
+    part_of [ @templartorrent.milestone.native-app-wiring ]
+}
+
+record templartorrent.work.peer-preference/1 : work {
+    title "Local peer preference: Prefer/Normal/Avoid/Block through Driver, worker and Peers tab"
+    state completed
+    scope [
+        path "crates/templartorrent-engine/src/peer.rs",
+        path "crates/templartorrent-engine/src/session.rs",
+        path "integration/rbit-adapter/src/driver.rs",
+        path "integration/rbit-adapter/tests/driver.rs",
+        path "integration/templartorrent/src/**"
+    ]
+    intent """
+        Make Command::SetPeerPreference real end to end. The Driver keeps a bounded per-job preference table keyed by peer IP: Block closes matching connections and refuses reconnection, incoming and tracker-supplied candidates; Avoid narrows the engine request pipeline to two blocks; Prefer is retained first when connection caps shrink and unchoked first when upload slots are scarce. The worker routes the command with a real ack and peer rows carry the preference and socket; the Peers tab selects a row and offers the four actions with the IP-scope and sole-supplier caveat visible.
+        """
+    note """
+        Deliberately not automatic scoring: no throughput, RTT or reliability metrics drive these choices yet. Keying by IP is chosen so an incoming peer cannot evade Block by reconnecting from another ephemeral port.
+        """
+    acceptance {
+        check client {
+            statement """
+                Production client tests pass with the worker routing SetPeerPreference to the Driver and the Peers tab label text no longer calling the feature unavailable.
+                """
+            method command
+            command "cargo test -p templartorrent"
+            verified_by [ @templartorrent.evidence.peer-preference-client/1 ]
+        }
+        check driver {
+            statement """
+                A new adapter driver test passes covering Avoid pipeline narrowing, Prefer retention under a shrunken cap, Block disconnecting and refusing reconnection, and Normal restoring the peer.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.peer-preference-driver/1 ]
+        }
+        check gates {
+            statement """
+                Formatting and all-target Clippy with warnings denied pass in the root workspace and both integrations.
+                """
+            method command
+            command "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings"
+            verified_by [ @templartorrent.evidence.peer-preference-gates/1 ]
+        }
+    }
+    part_of [ @templartorrent.milestone.safety-and-peer-policy ]
+}
+
+record templartorrent.work.rbit-driver/1 : work {
+    title "Reusable bounded magnet and transfer driver"
+    state completed
+    intent """
+        Move metadata exchange and verified payload pumping out of fixtures into a reusable
+        rbit driver with explicit peer provenance, bounded parsers/queues, per-torrent hash
+        routing and quiescent non-destructive removal. Test the same library path from an
+        actual magnet through BEP-9 to verified files and disk recheck. No automatic public
+        discovery, release claim or new GUI stack; the native-source gate remains open.
+        """
+    acceptance {
+        check lifecycle {
+            statement """
+                Driver tests cover cancellation, non-destructive removal with closed handles, duplicate rejection, interrupted disk resume and private-source restrictions.
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --locked"
+            verified_by [ @templartorrent.evidence.rbit-driver-path/1 ]
+        }
+        check magnet-driver {
+            statement """
+                A public library driver resolves bounded hash-verified magnet metadata and completes real localhost multi-block transfers into verified files; multiple jobs use their own hashes.
+                """
+            method command
+            command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test driver --locked"
+            verified_by [ @templartorrent.evidence.rbit-driver-path/1 ]
+        }
+        check regression {
+            statement """
+                Root and both integration workspaces pass tests, formatting and Clippy on the pinned Linux toolchain; unsupported paths remain explicit.
+                """
+            method command
+            command "cargo test --workspace --locked"
+            verified_by [ @templartorrent.evidence.rbit-driver-regressions/1 ]
+        }
+    }
+    after [ @templartorrent.work.complete-piece-assembly ]
+    part_of [ @templartorrent.milestone.native-app-wiring ]
+}
+
+record templartorrent.work.resume-recheck/1 : work {
+    title "Resume recheck without rewrite"
+    state completed
+    intent """
+        Resume scan: Session::recheck reads existing on-disk pieces via PieceReader, checks exact length, hash-verifies via PieceVerifier, and adopts matches without re-request or rewrite; missing/short/corrupt stay unverified, read errors mark Error, oversized pieces skip under payload budget.
+        """
+    part_of [ @templartorrent.milestone.local-v1-transfer ]
+}
+
+record templartorrent.work.seam-hardening/1 : work {
+    title "Rbit seam hardening + fault injection"
+    state completed
+    intent """
+        Rbit seam audit per INTEGRATION.md C (framing cancellation, directional ext IDs, bounded announce, blame handling) plus fault-injection and adversarial fixtures.
+        """
+    after [ @templartorrent.work.transfer-seed-loop ]
+    part_of [ @templartorrent.milestone.local-v1-transfer ]
+}
+
+record templartorrent.work.transfer-seed-loop/1 : work {
+    title "Transfer and seed loop"
+    state completed
+    intent """
+        Transfer loop: BEP-9 metadata + raw-infohash verify, handshake/extensions, framed messages, leased blocks, hash->write->mark_verified, completion, upload/seed.
+        """
+    after [ @templartorrent.work.engine-scaffold ]
+    part_of [ @templartorrent.milestone.local-v1-transfer ]
+}
+
+record templartorrent.work.ui-commands/1 : work {
+    title "UI typed commands and acks"
+    state completed
+    intent """
+        Typed command/ack channel between the PixelKit preview and a live engine session; live snapshot rendering with no fixture rows in live mode.
+        """
+    after [ @templartorrent.work.file-storage ]
+    part_of [ @templartorrent.milestone.native-app-wiring ]
+}
+
+record templartorrent.work.ui-dialogs/1 : work {
+    title "UI dialogs and native integration"
+    state completed
+    intent """
+        Add/limits/remove dialogs, folder browser, native activation/clipboard; safe non-destructive removal first.
+        """
+    after [ @templartorrent.work.ui-commands ]
+    part_of [ @templartorrent.milestone.native-app-wiring ]
+}

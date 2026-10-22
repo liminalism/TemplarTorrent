@@ -1,12 +1,18 @@
 [package]
 name = "templartorrent-rbit-adapter"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.99"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 rbit = "=0.2.2"
 templartorrent-core = { path = "../../crates/templartorrent-core" }
+templartorrent-engine = { path = "../../crates/templartorrent-engine" }
+templartorrent-storage = { path = "../../crates/templartorrent-storage" }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+sha1 = "0.10"
+bytes = "1"
 
-[workspace]
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }

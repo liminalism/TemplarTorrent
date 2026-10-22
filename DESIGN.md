@@ -1,6 +1,8 @@
 # TemplarTorrent — application design
 
-**Design baseline: 9 October 2026.** Windows and Linux desktop application. Rust
+**Design baseline: 9 October 2026.** Linux desktop application; Windows is optional
+following the user's 15 October 2026 scope change. Windows-specific requirements
+below are retained as future reference and are not completion gates. Rust
 1.99.0 / edition 2024. PixelKit for the complete application-owned UI, rbit 0.2.2
 for protocol primitives. This is the implementation specification; the archive's
 reference code implements only the parts identified in README.md.
@@ -41,7 +43,9 @@ concatenated-file reference scheduler to v2 Merkle/file-alignment semantics.
 
 ## 2. Main window and interaction specification
 
-Initial size approximately 1120 × 760 logical pixels, minimum 720 × 480. Native
+Initial size 300 × 500 logical pixels, the Transmission GTK default, minimum
+260 × 320. A larger opening leaves the download list empty. Widening the window
+reveals the rate, peer and state columns. Native
 titlebar, no custom decorations unless necessary for platform consistency. The
 application owns two vertically stacked, resizable panes. A compact optional
 status sidebar may be introduced later using the same `Panes` facility, not another

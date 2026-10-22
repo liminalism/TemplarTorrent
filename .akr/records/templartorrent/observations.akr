@@ -1,0 +1,277 @@
+akr 0.1
+project templartorrent
+
+record templartorrent.observation.backend-session-comparison/1 : observation {
+    title "Rbit orchestration boundary and librqbit session alternative"
+    state verified
+    statement """
+        Reviewed rbit 0.2.2 docs (https://docs.rs/rbit/0.2.2/rbit/) and the installed
+        registry source: rbit supplies protocol primitives, leaving piece selection,
+        peer coordination, bandwidth and lifecycle to the application. Current local
+        integration uses those real primitives; it does not assume an upstream Session.
+
+        Alternative reviewed: librqbit 9.0.1 has Session::new, add_torrent from magnet,
+        completion waiting, pause/unpause/delete, session limits and persistence options
+        in its public documentation (https://docs.rs/librqbit/9.0.1/librqbit/ and
+        https://docs.rs/librqbit/9.0.1/librqbit/struct.Session.html). Inference: it could
+        remove substantial generic session/lifecycle infrastructure. No compatibility
+        proof was established for this project's exact file-rank scheduler, global
+        payload ownership, private discovery and strict native-source gate. Its desktop
+        UI is a separate Tauri/web application; that UI is not an option for this contract.
+        The library can be considered separately from its UI, but replacing rbit conflicts
+        with AGENTS.md's explicit backend constraint. Retained rbit and did not add a
+        second backend, external torrent process or another GUI stack.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    method manual
+    watches [ "AGENTS.md", "DESIGN.md", "integration/rbit-adapter/Cargo.toml" ]
+}
+
+record templartorrent.observation.complete-piece-status/1 : observation {
+    title "Multi-block v1 execution evidence and remaining engine boundary"
+    state superseded
+    statement """
+        2026-10-15 uncommitted working tree on Linux x86_64/Rust 1.99.0: complete-piece
+        assembly replaces per-block hash/write submission. Requests reserve a full 3x
+        piece working set first, peer pipelines remain eight blocks, active pieces are
+        capped at 64, and unsupported working sets fail admission explicitly. Received
+        spans are removed from leases, duplicate inbox blocks are dropped before queueing,
+        policy changes/pause/removal cancel queued work, and ordinary file promotion no
+        longer fences useful work held by another peer. Global ByteBudget changes preserve
+        the same ownership pool. Storage accepts up to the engine piece-size bound and
+        reads directly into one resume buffer. Default 48 MiB admits at most 16 MiB pieces
+        under this conservative working-set rule; larger pieces need streaming verification.
+
+        Observed commands, fixtures, metrics, failures and environment are in
+        perf-results/2026-10-15-assembly/handoff.json and sibling raw logs/metrics.jsonl.
+        93 tests passed across three workspaces; format and Clippy passed. The new HTTP
+        tracker test parses a magnet but uses preloaded metainfo; BEP-9 metadata exchange
+        still lives in a separate localhost test harness. Actual rbit reuse is TCP/wire,
+        tracker, metainfo/magnet, extension/metadata primitives, not a session API or DHT.
+
+        This is not a finished client. Next is a bounded production metadata/transport
+        coordinator (including per-torrent verifier routing), then real PixelKit Add,
+        folder/limits/files/removal workflow on that driver. Current GUI Add and transport
+        are unwired; Reannounce bridge admission still does not perform a network announce.
+        Protected handle-relative storage/deletion, alias/duplicate writers, bounded file
+        handles, resume journals/crash recovery, upload policy, UDP fixtures, v2/hybrid
+        gates and Windows execution remain open. ring remains a strict native-source
+        release blocker. Existing README/AGENTS initial status is a historical handoff,
+        not the current execution evidence; no release binary or public swarm claim.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    method instrumented
+    watches [
+        "crates/templartorrent-engine/**",
+        "crates/templartorrent-storage/**",
+        "crates/templartorrent-core/src/budget.rs",
+        "integration/**"
+    ]
+    verified_by [
+        @templartorrent.evidence.complete-piece-integration-checks/1,
+        @templartorrent.evidence.complete-piece-metrics/1,
+        @templartorrent.evidence.complete-piece-root/1,
+        @templartorrent.evidence.complete-piece-wire/1
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/2 : observation {
+    title "Multi-block v1 execution evidence and remaining engine boundary"
+    state superseded
+    statement """
+        2026-10-15 uncommitted working tree on Linux x86_64/Rust 1.99.0: complete-piece
+        assembly replaces per-block hash/write submission. Requests reserve a full 3x
+        piece working set first, peer pipelines remain eight blocks, active pieces are
+        capped at 64, and unsupported working sets fail admission explicitly. Received
+        spans are removed from leases, duplicate inbox blocks are dropped before queueing,
+        policy changes/pause/removal cancel queued work, and ordinary file promotion no
+        longer fences useful work held by another peer. Global ByteBudget changes preserve
+        the same ownership pool. Storage accepts up to the engine piece-size bound and
+        reads directly into one resume buffer. Default 48 MiB admits at most 16 MiB pieces
+        under this conservative working-set rule; larger pieces need streaming verification.
+
+        Observed commands, fixtures, metrics, failures and environment are in
+        perf-results/2026-10-15-assembly/handoff.json and sibling raw logs/metrics.jsonl.
+        93 tests passed across three workspaces; format and Clippy passed. The new HTTP
+        tracker test parses a magnet but uses preloaded metainfo; BEP-9 metadata exchange
+        still lives in a separate localhost test harness. Actual rbit reuse is TCP/wire,
+        tracker, metainfo/magnet, extension/metadata primitives, not a session API or DHT.
+
+        This is not a finished client. Next is a bounded production metadata/transport
+        coordinator (including per-torrent verifier routing), then real PixelKit Add,
+        folder/limits/files/removal workflow on that driver. Current GUI Add and transport
+        are unwired; Reannounce bridge admission still does not perform a network announce.
+        Protected handle-relative storage/deletion, alias/duplicate writers, bounded file
+        handles, resume journals/crash recovery, upload policy, UDP fixtures, v2/hybrid
+        gates and Windows execution remain open. ring remains a strict native-source
+        release blocker. Existing README/AGENTS initial status is a historical handoff,
+        not the current execution evidence; no release binary or public swarm claim.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    method instrumented
+    watches [ "crates/**", "Cargo.toml", "integration/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/1 ]
+    verified_by [
+        @templartorrent.evidence.complete-piece-integration-checks/1,
+        @templartorrent.evidence.complete-piece-metrics/1,
+        @templartorrent.evidence.complete-piece-root/1,
+        @templartorrent.evidence.complete-piece-wire/1
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/3 : observation {
+    title "Reusable v1 driver execution and remaining native-client boundary"
+    state superseded
+    statement """
+        2026-10-15 uncommitted Linux x86_64/Rust 1.99.0 tree: complete-piece assembly
+        now has a reusable public rbit Driver. It accepts a bounded v1 magnet and explicit
+        permitted PeerSource addresses, resolves BEP-9 metadata, verifies its exact raw
+        infohash, validates original bencode path components, rechecks files, and drives
+        verified synced writes through the same scalar scheduler and session core.
+        Existing metadata tests call the production resolver, not a duplicate fetch loop.
+
+        The application still owns coordination: per-torrent hash routing, eight-request
+        peer pipelines, 32-command actor queues, 64 wire events and at most 32 supplied
+        candidates per job. Metadata uses a shared 32 MiB reservation pool with conservative
+        raw/parser working-set admission; input ceiling is 16 MiB but a large working set
+        can be explicitly rejected. Raw bencode depth/items, canonical unique keys,
+        signed extension integers, file sizes, original paths and duplicate/file-directory
+        conflicts are checked before rbit normalization or payload file creation. The
+        driver explicitly gates v2/hybrid, attributes and more than 128 files per job.
+
+        Pause/removal join peer actors and discard retired queued payload frames before
+        releasing their assembly reservations. Non-destructive removal closes store
+        handles and retains data. Limits quiesce actual connections; zero download slots
+        preserve running intent as Queued and raising slots reconnects it. Explicit user
+        pause survives settings changes. Complete data is exposed as Complete, with a
+        seeding-unavailable reason; the driver does not pretend its download path uploads.
+        PixelKit view formatting reflects that reason and its unwired Reannounce command
+        now rejects instead of returning a false clock-only acceptance.
+
+        112 tests passed: 69 root, 33 rbit adapter (12 Driver tests), 10 headless PixelKit;
+        formatting and all-target Clippy with warnings denied passed in all workspaces.
+        Tests cover concurrent jobs with different hashes, two peers for one torrent,
+        corruption, disconnect/fallback, cancellation, restart adoption without refetch,
+        private tracker scope, metadata flooding and 4096 seeded malformed metainfo
+        mutations. Raw logs, commands, source hashes, limitations and environment are
+        in perf-results/2026-10-15-driver/handoff.json and sibling files.
+
+        Single release sample, 196681 generated bytes: magnet resolution/validation/file
+        admission 41.5 ms, magnet-to-first-verified-write 123.4 ms, completion 206.5 ms;
+        sampled test-process RSS 4952064 B including fixture and seeder, payload reservation
+        high water 196608 B. This is not app startup or a before/after speed claim. Prior
+        2 MiB preloaded-metadata assembly baselines remain in the assembly artifact folder.
+
+        Remaining boundary: PeerSource provenance is supplied by a trusted discovery
+        layer. No tracker URI/x.pe/DHT/PEX is contacted automatically. Production tracker
+        body/provenance bounds and discovery, upload/listener/choking, UI worker/commands
+        and full Add/folder/limits/files/removal workflow are not complete. Driver metadata
+        resolution currently borrows the coordinator for up to 30 seconds while actors
+        backpressure; disk/hash operations are bounded synchronous work off the UI thread.
+        FileStore is not handle-relative/reparse hardened and has no global handle cache
+        or hardlink/Unicode alias protection. Crash journal/forced-crash and active external
+        file invalidation remain open. rbit can allocate a 16 MiB wire frame before driver
+        validation, outside payload admission. ring remains a strict native-source gate.
+        No Windows, headful GUI, Internet swarm or packaged-client validation occurred.
+        The verified_transfer example is a diagnostic caller, not the production binary.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    method instrumented
+    watches [ "crates/**", "Cargo.toml", "integration/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/2 ]
+    verified_by [
+        @templartorrent.evidence.rbit-driver-metrics/1,
+        @templartorrent.evidence.rbit-driver-path/1,
+        @templartorrent.evidence.rbit-driver-regressions/1
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/4 : observation {
+    title "Verified Linux Driver download and seeding; remaining native-client boundary"
+    state superseded
+    statement """
+        2026-10-15 uncommitted Linux x86_64/Rust 1.99.0 tree. The latest user request makes Windows optional; AGENTS.md and DESIGN.md now target Linux. The previous reusable v1 download Driver now also seeds through real rbit networking.
+
+        Existing magnet resolution, canonical bounded bencode/original-path validation, per-job raw infohash and piece hash routing, scalar ordered-file scheduling, exclusive multiblock leases, synced verified file writes and restart recheck remain. Metadata retains shared 32 MiB working-set admission, a 16 MiB input ceiling with stricter parse working-set rejection, 128 files/job until a bounded handle cache, and explicit v2/hybrid/attributes gates. The 32 supplied peer candidates/job, eight-request download pipelines, 32 actor commands and 64 wire events remain bounded.
+
+        Explicit opt-in v1 listener routes peeked handshakes to known public jobs, then uses real rbit PeerConnection::accept; unknown hashes and all private ingress are dropped.
+
+        Actual Driver seeding with verified-only bitfield/Have messages, bounded eight-request queues including the active block, one active payload write per peer, and global upload-peer/job/connection limits.
+
+        Global fake-clock upload token bucket and shared byte budget admit full disk reads plus block and encoded-frame copy headroom before allocation.
+
+        Read/hash each requested full piece from file storage before copying the requested <=16 KiB span; hash failure invalidates exact progress, marks Error and joins every job peer.
+
+        Upload buffers and permits remain owned through the actor send; successful full sends alone generate upload counter acknowledgements; slot reductions join excess writers.
+
+        BEP-9 metadata service negotiates directional extension IDs, validates signed control fields and bounds encoded responses under the shared byte pool.
+
+        Tracked upload disk-read and block ownership separately from memory reservations and sampled process RSS.
+
+        Diagnostic example adds opt-in --listen ADDRESS --seed-seconds N; no default listener or automatic Internet discovery.
+
+        rbit reuses: PeerConnection::connect/accept and v1 handshake codecs; Message framing, encoding and send/receive; ExtensionHandshake and MetadataMessage encoding, existing metadata resolver; Existing rbit magnet/metainfo parsing and v1 piece hashes. The app owns: Listener routing and private ingress admission; Slot admission, stable choking, bounded upload queue, cancellation and writer lifecycle; Global memory/rate authority, verified disk reads, exact upload acknowledgements and storage invalidation; Per-job metadata authority and directional extension negotiation.
+
+        118 tests passed on Ubuntu 26.04.1 Linux/i7-13700H/pinned Rust 1.99.0: 71 root, 37 adapter including 16 Driver tests, 10 headless PixelKit tests. Four new wire fixtures cover two production Drivers, restart-adopted seeding, invalid spans, two-peer disk corruption invalidation, rate-stalled cancellation, request flooding, upload/seed slot changes and private/unknown ingress. Fake-clock upload tests cover shared two-job rate authority, memory admission before tokens, verified spans, pause and seed slots. Existing HTTP tracker/packet/privacy/storage regressions and 4096 malformed metainfo mutations passed. Formatting and all-target Clippy passed in all three workspaces.
+
+        One release sample: 196681 bytes seeded in 340301891 ns including the second client's metadata resolution, verified transfer, shutdown/drain and independent output comparison; initial seed download excluded. Traced upload ownership peak 81920 B; sampled shared upload reservation 98368 B; sampled process RSS 5246976 B including both Drivers, fixture and Tokio. Ownership excludes upstream encoded frames and receive buffers. This is not application startup, public swarm throughput or an optimization comparison. Raw logs, commands, failures, definitions and final source hashes are in perf-results/2026-10-15-seeding/handoff.json and sibling files.
+
+        Private incoming connections are deliberately all rejected; outbound private payload uploads have not been independently exercised. Complete rows expose missing listener/seed/upload-slot reasons; a listening admitted job becomes Seeding. Reannounce remains rejected in the existing memory-only PixelKit bridge until actual tracker transport is connected. A typed command is not a completed UI workflow.
+
+        Remaining boundaries:
+        Production tracker discovery/refresh/announce and provenance bounds, DHT/PEX/private transition orchestration; no Internet discovery was added.
+
+        PixelKit still uses earlier memory-session bridge; live Driver worker, Add/folder/limits/files/removal workflow and Linux clipboard/activation are unfinished; no headful run.
+
+        No finished production templartorrent binary; example compiled but its CLI main was not separately exercised with live content.
+
+        Protected handle-relative no-follow storage/deletion, hardlink/alias checks, bounded global file-handle cache and crash journal/forced-crash validation remain.
+
+        All private inbound connections deliberately denied; private uploads require outbound peers from selected original tracker scope.
+
+        Listener has eight pending sockets plus one probe with five-second deadline, separate from admitted connection caps; sequential probing/handshake handling can delay service and needs concurrency hardening.
+
+        Stable deterministic upload slot selection has no periodic rotation, scoring or optimistic-unchoke fairness.
+
+        Full piece reread/SHA1 per block is bounded and safe but expensive for large pieces; an immutable verified cache needs evidence before optimization.
+
+        Cancellation may race an already-admitted transport write; partial writes are not credited and connection is closed. Crash-durable upload accounting is not implemented.
+
+        Active storage changes are detected on requested pieces; no background full-file invalidation watcher or seamless in-process recheck UI.
+
+        Metadata resolution and disk/hash operations still borrow the coordinator, off UI thread, with bounded queues.
+
+        rbit can allocate a 16 MiB receive frame before application checks, outside payload budget.
+
+        Strict native-source audit still reports ring 0.17.14 through rbit/reqwest/rustls; release gate unresolved.
+
+        No Internet swarm, native window, forced crash or packaged-client test occurred; Windows is no longer required.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    method instrumented
+    watches [ "crates/**", "Cargo.toml", "integration/**", "AGENTS.md", "DESIGN.md" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/3 ]
+    verified_by [
+        @templartorrent.evidence.driver-seeding-metrics/1,
+        @templartorrent.evidence.driver-seeding-path/1,
+        @templartorrent.evidence.driver-seeding-regressions/1
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/5 : observation {
+    title "Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22 uncommitted Linux x86_64/Rust 1.99.0 tree based on 72b01427. AGENTS.md steps 1 to 3 are completed milestones. Beyond the 2026-10-15 seeding state, the tree now holds a production crate `integration/templartorrent` (binary templartorrent): a worker thread owns the rbit Driver on a current-thread runtime, publishes coalesced SessionView snapshots with reliable per-sequence acks, and the PixelKit window has Add (magnet or .torrent, folder browser, space check, public bootstrap flag), Limits, Remove with an unchecked delete-data checkbox, Files order/wanted controls, Trackers with cooldown-gated reannounce, and a Peers tab. Owner-only Unix-socket single-instance activation forwards magnets; peer country comes only from a user-supplied MMDB; font is auto-detected. The storage crate deletes through openat/unlinkat with O_NOFOLLOW, inode identity from the still-open handle, hardlink refusal and no root removal. Tracker discovery, periodic refresh and public augmentation after metadata proves a public torrent exist in the Driver. Local peer preference is implemented today: a per-job table keyed by peer IP where Block closes and refuses the address, Avoid narrows the request pipeline to two blocks, and Prefer is retained first and unchoked first. 138 root and adapter tests, 21 of them in the production crate, and 10 preview tests passed; formatting and Clippy with denied warnings passed in all three workspaces; a release binary built. Evidence and hashes are in perf-results/2026-10-22-peer-preference/. Remaining boundaries: no automatic peer scoring or optimistic-unchoke rotation; no session persistence, so jobs and preferences are lost on restart; no forced-crash restart test; no bounded global file-handle cache beyond the 128 files per job cap; no headful window run, Linux clipboard paste check or Internet swarm in evidence; rbit can still allocate a 16 MiB receive frame before application checks; ring 0.17.14 still reaches the tree through rbit/reqwest/rustls so the native-source release gate is open; Windows is optional and untested.
+        """
+    observed_at git:72b01427f8bb0ef32794e5ecc67fe6a3dae2912e
+    method command
+    watches [ "crates/**", "integration/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/4 ]
+    verified_by [
+        @templartorrent.evidence.peer-preference-client,
+        @templartorrent.evidence.peer-preference-driver,
+        @templartorrent.evidence.peer-preference-gates,
+        @templartorrent.evidence.production-linux-client
+    ]
+}

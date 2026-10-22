@@ -2,7 +2,8 @@
 
 ## Non-negotiable product constraints
 
-Use Rust, PixelKit, and rbit. Keep Windows and Linux supported. No webview, second GUI
+Use Rust, PixelKit, and rbit. Target Linux; Windows support is optional per the user's
+2026-10-15 scope change. No webview, second GUI
 stack, libtorrent wrapper, external torrent process, media player or network content
 search. Name the production binary `templartorrent`. Follow DESIGN.md rather than
 inventing a broader product. Respect the strict native-source audit gate.
@@ -51,8 +52,8 @@ artifacts. Prefer one focused change with an explanation and before/after eviden
 The user can paste/open a magnet, choose a folder, complete and seed an actual
 verified transfer, change global slot/speed settings, observe correct details/files/
 peers, experience ordered-file promotion, reannounce safely, get public-only tracker
-augmentation, and remove a job with the data checkbox behaving safely. Both OSes
-must pass; Windows paste and data-handle closure count as functionality, not polish.
+augmentation, and remove a job with the data checkbox behaving safely. Linux must
+pass, including native paste and data-handle closure.
 
 ## Project knowledge (AKR)
 

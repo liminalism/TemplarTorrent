@@ -86,4 +86,7 @@ impl TrackerClock {
     pub fn manual_due(&self) -> u64 {
         self.manual_due
     }
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
 }
