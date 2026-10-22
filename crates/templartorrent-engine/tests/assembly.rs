@@ -118,10 +118,21 @@ fn multi_block_pipeline_refills_out_of_order_with_short_tail_and_file_promotion(
             break;
         }
     }
+    // Both episode01 pieces share rank 0 and availability 1; the live picker
+    // may take them in either order (seeded tie-break), but episode02's piece
+    // 0 must wait until episode01 is finished.
+    assert_eq!(piece_order.len(), 3, "{piece_order:?}");
     assert_eq!(
-        piece_order,
-        [1, 2, 0],
+        piece_order[2], 0,
         "episode01 finishes before episode02 starts"
+    );
+    assert_eq!(
+        {
+            let mut first_two = piece_order[..2].to_vec();
+            first_two.sort_unstable();
+            first_two
+        },
+        [1, 2]
     );
     assert_eq!(seen.len(), 33);
     assert_eq!(peak, piece_working_set(LENGTH as usize).unwrap());
@@ -202,7 +213,9 @@ fn memory_is_reserved_before_requests_and_repeated_settings_cannot_mint_capacity
     assert_eq!(session.snapshot().payload_budget_used, 0);
     let batch = requests(&session.update(0, &Exact));
     assert_eq!(batch.len(), 4);
-    assert!(batch.iter().all(|r| r.0 == p2 && r.1 == 0));
+    // Either piece is a valid pick (same rank and availability); all four
+    // requests must belong to one piece on the surviving peer.
+    assert!(batch.iter().all(|r| r.0 == p2 && r.1 == batch[0].1));
 }
 
 #[test]

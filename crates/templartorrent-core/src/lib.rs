@@ -5,5 +5,6 @@ pub mod bandwidth;
 pub mod budget;
 pub mod model;
 pub mod paths;
+pub mod picker;
 pub mod sequence;
 pub mod tracker;

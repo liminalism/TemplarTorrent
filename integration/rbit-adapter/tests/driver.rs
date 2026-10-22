@@ -733,8 +733,10 @@ async fn driver_magnet_resolves_metadata_and_routes_two_torrents_to_their_own_ha
         b.assert_files(&root_b.job());
         assert_eq!(server_a.stats.metadata.load(Ordering::SeqCst), 1);
         assert_eq!(server_b.stats.metadata.load(Ordering::SeqCst), 1);
-        assert_eq!(server_a.stats.requests.lock().unwrap()[0].0, 1);
-        assert_eq!(server_b.stats.requests.lock().unwrap()[0].0, 1);
+        // Episode01 (pieces 1..=3) ranks first; the seeded tie-break picks
+        // any of its pieces before Episode02's piece 0.
+        assert!((1..=3).contains(&server_a.stats.requests.lock().unwrap()[0].0));
+        assert!((1..=3).contains(&server_b.stats.requests.lock().unwrap()[0].0));
         assert_eq!(driver.snapshot().jobs.len(), 2);
         assert_eq!(driver.payload_stats().reserved_bytes, 0);
         assert!(!driver.seeding_unavailable_reason().is_empty());
@@ -773,16 +775,14 @@ async fn driver_corruption_retries_verified_piece_without_corrupting_files() {
             .unwrap();
         assert_eq!(complete(&mut driver).await, 1);
         fixture.assert_files(&root.job());
+        // The corrupted block belongs to the first requested piece; every block
+        // of that piece is fetched twice (piece 3 is the one-block tail).
+        let requests = server.stats.requests.lock().unwrap().clone();
+        let first = requests[0].0;
+        let expected = if first == 3 { 2 } else { 8 };
         assert_eq!(
-            server
-                .stats
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(piece, _)| *piece == 1)
-                .count(),
-            8
+            requests.iter().filter(|(piece, _)| *piece == first).count(),
+            expected
         );
         driver.shutdown().await;
         server.close().await;
@@ -886,16 +886,14 @@ async fn driver_restart_rechecks_disk_and_requests_only_missing_pieces() {
             )
             .await
             .unwrap();
-        assert!(restarted.snapshot().jobs[0].verified_bytes >= verified);
+        let adopted = restarted.snapshot().jobs[0].verified_bytes;
+        assert!(adopted >= verified);
         complete(&mut restarted).await;
+        // 13 blocks in total; adopted bytes are never requested again.
+        let after = server.stats.requests.lock().unwrap().len() as u64;
         assert!(
-            !server
-                .stats
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(piece, _)| *piece == 1)
+            after + adopted.div_ceil(16384) <= 13,
+            "adopted pieces re-requested: {after} after adopting {adopted} bytes"
         );
         fixture.assert_files(&root.job());
         restarted.shutdown().await;
@@ -1268,17 +1266,18 @@ async fn driver_peer_drop_then_explicit_fallback_preserves_verified_progress() {
         while driver.connection_count() != 0 {
             driver.step(Duration::from_millis(10)).await.unwrap();
         }
-        assert_eq!(driver.snapshot().jobs[0].verified_bytes, PIECE as u64);
+        let kept = driver.snapshot().jobs[0].verified_bytes;
+        assert!(
+            kept > 0 && kept < fixture.data.len() as u64,
+            "partial verified progress survives the drop, got {kept}"
+        );
         assert_eq!(driver.payload_stats().reserved_bytes, 0);
         driver.connect_peer(id, b.source).await.unwrap();
         complete(&mut driver).await;
+        let from_b = b.stats.requests.lock().unwrap().len() as u64;
         assert!(
-            !b.stats
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(piece, _)| *piece == 1)
+            from_b + kept.div_ceil(16384) <= 13,
+            "verified pieces must not be fetched again: {from_b} after keeping {kept} bytes"
         );
         assert_eq!(
             b.stats.metadata.load(Ordering::SeqCst),
@@ -1982,15 +1981,11 @@ async fn driver_export_and_restore_job_record_rechecks_without_peers() {
                 break;
             }
         }
+        let after = server.stats.requests.lock().unwrap().len() as u64;
         assert!(
-            !server
-                .stats
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(piece, _)| *piece == 1),
-            "adopted pieces are not requested again"
+            after + row.verified_bytes.div_ceil(16384) <= 13,
+            "adopted pieces are not requested again: {after} after {}",
+            row.verified_bytes
         );
         fixture.assert_files(&root.job());
         fourth.shutdown().await;

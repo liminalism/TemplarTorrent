@@ -1,0 +1,11 @@
+akr 0.1
+project templartorrent
+
+record templartorrent.question.ring-release-gate/1 : question {
+    title "How should the native-source release gate be closed when rbit 0.2.2 pulls ring unconditionally?"
+    state open
+    scope [ path "integration/rbit-adapter/**" ]
+    question """
+        The strict native-source audit still reports ring 0.17.14 through rbit 0.2.2 -> reqwest 0.12 (rustls-tls) -> rustls -> ring. Inspection of the registry source on 2026-10-22 shows rbit's Cargo.toml declares reqwest with features = ["rustls-tls"] and no Cargo feature to disable it; reqwest is used in rbit's tracker/http.rs, webseed.rs and upnp.rs. The adapter uses rbit::HttpTracker for announces. Options: (a) keep rbit as published and record the gate as open in every release claim; (b) fork or patch rbit to make reqwest optional and announce over an application-owned bounded plain-HTTP transport (the test suite already has a hand-rolled HTTP tracker fixture), which also removes HTTPS trackers unless another pure-Rust TLS is chosen; (c) accept ring as a reviewed exception to the strict policy. AGENTS.md forbids representing the gate as solved; it does not say which option the owner prefers.
+        """
+}

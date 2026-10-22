@@ -1,6 +1,9 @@
 //! Dependency-free, deterministic microbenchmark. JSONL to stdout; never uses the internet.
 use std::{hint::black_box, time::Instant};
-use templartorrent_core::sequence::{FileSpec, Sequence};
+use templartorrent_core::{
+    picker::PieceIndex,
+    sequence::{FileSpec, Sequence},
+};
 fn measurement(name: &str, iterations: usize, mut f: impl FnMut()) {
     for _ in 0..20 {
         f();
@@ -87,6 +90,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .pick(black_box(&peer), black_box(&busy), black_box(&availability))
                 .unwrap(),
         );
+    });
+    let mut index = PieceIndex::new(&sequence, &busy, &availability, 0x5eed);
+    measurement("indexed_piece_pick", iterations, || {
+        black_box(index.pick(
+            black_box(&peer),
+            black_box(&availability),
+            sequence.piece_ranks(),
+            sequence.verified_words(),
+            black_box(&busy),
+        ));
+    });
+    // A peer holding one piece in sixteen takes the sparse path.
+    let sparse: Vec<u64> = (0..words).map(|_| 0x0001_0001_0001_0001).collect();
+    measurement("indexed_piece_pick_sparse_peer", iterations, || {
+        black_box(index.pick(
+            black_box(&sparse),
+            black_box(&availability),
+            sequence.piece_ranks(),
+            sequence.verified_words(),
+            black_box(&busy),
+        ));
+    });
+    // Maintenance costs the reference never pays: a full rank rebuild and a
+    // whole-bitfield availability sweep (one seeder joining).
+    measurement("indexed_rebuild", iterations.min(50), || {
+        index.rebuild(&sequence, black_box(&busy), black_box(&availability));
+        black_box(&index);
+    });
+    let mut bumped = availability.clone();
+    measurement("indexed_availability_sweep", iterations.min(50), || {
+        for (piece, value) in bumped.iter_mut().enumerate() {
+            *value += 1;
+            index.set_availability(piece, *value);
+        }
+        black_box(&index);
     });
     Ok(())
 }

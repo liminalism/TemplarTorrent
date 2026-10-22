@@ -361,6 +361,45 @@ record templartorrent.evidence.persistence-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.picker-microbench/1 : evidence {
+    title "Same host, release, three runs at each of 1k, 100k and 1M pieces, full-bitfield peer. Reference pick p50 ns: 1k 2750/2760/2677; 100k 137038/154712/170449; 1M 1356235/1331665/1357768. Indexed pick p50 ns: 1k 42/40/40; 100k 952/927/819; 1M 7894/8232/7900, so 65x, 150x to 200x and about 170x below the reference within the same runs; p95 within 10 percent of p50. Sparse-peer path (one piece in sixteen) 205 to 223 ns, 11784 to 13920 ns and 164393 to 175714 ns. Maintenance the reference never paid: rank rebuild 6.2 us, 430 to 463 us and 4.8 to 5.1 ms; a whole-bitfield availability sweep 10 us, 810 to 834 us and 8.2 to 8.5 ms. About 12 bytes per piece plus bucket vectors. The reference at 1M measured 1.35 ms here against 4.8 ms in the morning baseline, so only within-run ratios are claimed."
+    state verified
+    result pass
+    method command
+    observed_at git:1a8d451aecf058c880b14445f215a5c52c7019f6
+    command "cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 300"
+    artifact "perf-results/2026-10-22-picker/microbench-100000-run1.jsonl"
+    summary """
+        Same host, release, three runs at each of 1k, 100k and 1M pieces, full-bitfield peer. Reference pick p50 ns: 1k 2750/2760/2677; 100k 137038/154712/170449; 1M 1356235/1331665/1357768. Indexed pick p50 ns: 1k 42/40/40; 100k 952/927/819; 1M 7894/8232/7900, so 65x, 150x to 200x and about 170x below the reference within the same runs; p95 within 10 percent of p50. Sparse-peer path (one piece in sixteen) 205 to 223 ns, 11784 to 13920 ns and 164393 to 175714 ns. Maintenance the reference never paid: rank rebuild 6.2 us, 430 to 463 us and 4.8 to 5.1 ms; a whole-bitfield availability sweep 10 us, 810 to 834 us and 8.2 to 8.5 ms. About 12 bytes per piece plus bucket vectors. The reference at 1M measured 1.35 ms here against 4.8 ms in the morning baseline, so only within-run ratios are claimed.
+        """
+}
+
+record templartorrent.evidence.picker-oracle-equivalence/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree 1a8d451 plus the picker change: 151 workspace tests passed. New core picker tests: 400 random sequences (1 to 6 files, zero-length files, random wanted and order, random verified, busy and availability) each checked against 9 random peers, the picked piece carries the oracle's (rank, availability) key and is eligible for that peer, or both pick None; 200 sequences each with 60 incremental mutations (availability, lease and release, verify and invalidate with rank rebuilds, selection toggles) compared field by field with a fresh rebuild and against the oracle; availability above 1023 clamps without dropping pieces. The engine and adapter suites pass with four assertions restated from lowest-index order to rank and adopted-byte terms, which DESIGN.md permits for the live engine."
+    state verified
+    result pass
+    method command
+    observed_at git:1a8d451aecf058c880b14445f215a5c52c7019f6
+    command "cargo test --workspace --all-targets"
+    artifact "perf-results/2026-10-22-picker/workspace-tests.log"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree 1a8d451 plus the picker change: 151 workspace tests passed. New core picker tests: 400 random sequences (1 to 6 files, zero-length files, random wanted and order, random verified, busy and availability) each checked against 9 random peers, the picked piece carries the oracle's (rank, availability) key and is eligible for that peer, or both pick None; 200 sequences each with 60 incremental mutations (availability, lease and release, verify and invalidate with rank rebuilds, selection toggles) compared field by field with a fresh rebuild and against the oracle; availability above 1023 clamps without dropping pieces. The engine and adapter suites pass with four assertions restated from lowest-index order to rank and adopted-byte terms, which DESIGN.md permits for the live engine.
+        """
+}
+
+record templartorrent.evidence.picker-scenario-and-gates/1 : evidence {
+    title "Same host, release, three runs of the localhost magnet-startup scenario after the change: magnet-to-first-verified 122952701/122641313/123222478 ns, total 328052967/328568762/329267437 ns, sampled RSS 5664768/5668864/5689344 B, against the baseline sample of 125156840 ns, 330281810 ns and 6254592 B. No regression; on a 4-piece fixture the picker is not on the critical path, so this shows absence of harm rather than the gain. Formatting, all-target Clippy with warnings denied (after fixing a needless range loop and a no-op struct update in the new module), release build, preview tests and preview Clippy all passed."
+    state verified
+    result pass
+    method command
+    observed_at git:1a8d451aecf058c880b14445f215a5c52c7019f6
+    command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_magnet_to_first_verified_metrics --nocapture"
+    artifact "perf-results/2026-10-22-picker/release-scenario-after.log"
+    summary """
+        Same host, release, three runs of the localhost magnet-startup scenario after the change: magnet-to-first-verified 122952701/122641313/123222478 ns, total 328052967/328568762/329267437 ns, sampled RSS 5664768/5668864/5689344 B, against the baseline sample of 125156840 ns, 330281810 ns and 6254592 B. No regression; on a 4-piece fixture the picker is not on the critical path, so this shows absence of harm rather than the gain. Formatting, all-target Clippy with warnings denied (after fixing a needless range loop and a no-op struct update in the new module), release build, preview tests and preview Clippy all passed.
+        """
+}
+
 record templartorrent.evidence.preview-live-commands/1 : evidence {
     title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0 (b940084d7 2026-09-28), uncommitted tree based on 72b01427. The preview live_commands filter passed 6 tests and filtered 4. LiveBridge still rejects data deletion, add, reannounce, and peer preference. No window was opened."
     state verified

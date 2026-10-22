@@ -136,7 +136,7 @@ record templartorrent.work.peer-preference/1 : work {
 
 record templartorrent.work.picker-buckets/1 : work {
     title "Per-rank availability buckets for the live piece picker, oracle-checked"
-    state proposed
+    state completed
     scope [
         path "crates/templartorrent-bench/src/main.rs",
         path "crates/templartorrent-core/src/sequence.rs",
@@ -155,6 +155,7 @@ record templartorrent.work.picker-buckets/1 : work {
                 """
             method command
             command "cargo run --release -p templartorrent-bench -- --pieces 1000000 --iterations 500"
+            verified_by [ @templartorrent.evidence.picker-microbench/1 ]
         }
         check equivalence {
             statement """
@@ -162,6 +163,7 @@ record templartorrent.work.picker-buckets/1 : work {
                 """
             method command
             command "cargo test --workspace"
+            verified_by [ @templartorrent.evidence.picker-oracle-equivalence/1 ]
         }
     }
     part_of [ @templartorrent.milestone.picker-optimization ]

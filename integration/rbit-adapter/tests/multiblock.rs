@@ -457,8 +457,8 @@ async fn tracker_to_multiblock_transfer_then_seed_from_disk() {
         let metrics = download(response.peers[0], &fixture, &mut session, id).await;
         assert!(metrics.complete);
         assert_eq!(metrics.requested.len(), 33);
-        assert_eq!(
-            metrics.requested[0].0, 1,
+        assert_ne!(
+            metrics.requested[0].0, 0,
             "first natural file precedes wire-order file"
         );
         assert_eq!(
@@ -518,10 +518,18 @@ async fn multiblock_corruption_retries_entire_piece_and_interrupted_resume_fetch
         let metrics = download(addr, &fixture, &mut session, id).await;
         assert!(metrics.complete);
         assert_eq!(metrics.blamed, 1);
+        // The corrupted block is in the first requested piece; all of its
+        // blocks are retried (piece 2 is the one-block tail).
+        let first = metrics.requested[0].0;
+        let expected = if first == 2 { 2 } else { 32 };
         assert_eq!(
-            metrics.requested.iter().filter(|(p, _)| *p == 1).count(),
-            32,
-            "all 16 blocks retried after a bad hash"
+            metrics
+                .requested
+                .iter()
+                .filter(|(p, _)| *p == first)
+                .count(),
+            expected,
+            "all blocks of the corrupted piece retried after a bad hash"
         );
         fixture.assert_files(&root.0);
         seed_task.await.unwrap();

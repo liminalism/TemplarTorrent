@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use templartorrent_core::{
     model::TorrentId,
+    picker::PieceIndex,
     sequence::{Sequence, SequenceError},
 };
 
@@ -48,6 +49,8 @@ pub struct LeaseCoordinator {
     peers: HashMap<PeerId, Vec<u64>>,
     outstanding: HashMap<u32, (PeerId, Lease)>,
     generation: u64,
+    /// Bucketed pickable pieces; rebuilt lazily when the sequence ranks change.
+    index: PieceIndex,
 }
 
 impl LeaseCoordinator {
@@ -55,17 +58,52 @@ impl LeaseCoordinator {
         let words = sequence.piece_count().div_ceil(64);
         let pieces = sequence.piece_count();
         let generation = sequence.generation();
+        let busy = vec![0; words];
+        let availability = vec![0; pieces];
+        let index = PieceIndex::new(&sequence, &busy, &availability, torrent.0);
         Self {
             torrent,
             sequence,
             piece_length,
             total,
-            busy: vec![0; words],
-            availability: vec![0; pieces],
+            busy,
+            availability,
             peers: HashMap::new(),
             outstanding: HashMap::new(),
             generation,
+            index,
         }
+    }
+
+    /// Ranks may have changed through `sequence_mut` (selection, order, file
+    /// completion); the index follows the sequence generation lazily.
+    fn sync_index(&mut self) {
+        if self.index.generation() != self.sequence.generation() {
+            self.index
+                .rebuild(&self.sequence, &self.busy, &self.availability);
+        }
+    }
+
+    fn index_pickable(&mut self, piece: usize) {
+        if piece >= self.sequence.piece_count() {
+            return;
+        }
+        let pickable = !self.sequence.is_verified(piece)
+            && self.busy[piece / 64] & (1u64 << (piece % 64)) == 0;
+        let rank = self.sequence.piece_ranks()[piece];
+        self.index
+            .set_pickable(piece, pickable, rank, self.availability[piece]);
+    }
+
+    /// Verification state of a piece was withdrawn (failed recheck, changed
+    /// file); the piece is pickable again unless leased.
+    pub fn invalidate(&mut self, piece: u32) -> Result<bool, EngineError> {
+        let index = usize::try_from(piece)
+            .map_err(|_| EngineError::Sequence(SequenceError::InvalidPiece))?;
+        let changed = self.sequence.invalidate(index)?;
+        self.sync_index();
+        self.index_pickable(index);
+        Ok(changed)
     }
 
     pub fn sequence(&self) -> &Sequence {
@@ -86,6 +124,8 @@ impl LeaseCoordinator {
         self.generation = self.generation.wrapping_add(1);
         self.outstanding.clear();
         self.busy.fill(0);
+        self.index
+            .rebuild(&self.sequence, &self.busy, &self.availability);
     }
 
     /// Remove a received span so pipeline refill never requests it again.
@@ -143,9 +183,11 @@ impl LeaseCoordinator {
         if bits.len() != self.busy.len() {
             return Err(EngineError::Sequence(SequenceError::ShapeMismatch));
         }
-        let Some(known) = self.peers.get_mut(&peer) else {
+        if !self.peers.contains_key(&peer) {
             return Err(EngineError::UnknownPeer);
-        };
+        }
+        self.sync_index();
+        let known = self.peers.get_mut(&peer).expect("checked above");
         for (i, word) in bits.iter().enumerate() {
             let added = word & !known[i];
             let mut added_bits = added;
@@ -155,6 +197,7 @@ impl LeaseCoordinator {
                 let index = i * 64 + bit;
                 if let Some(count) = self.availability.get_mut(index) {
                     *count = count.saturating_add(1);
+                    self.index.set_availability(index, *count);
                 }
             }
             known[i] |= word;
@@ -168,13 +211,16 @@ impl LeaseCoordinator {
         if index >= self.sequence.piece_count() {
             return Err(EngineError::Sequence(SequenceError::InvalidPiece));
         }
-        let Some(known) = self.peers.get_mut(&peer) else {
+        if !self.peers.contains_key(&peer) {
             return Err(EngineError::UnknownPeer);
-        };
+        }
+        self.sync_index();
+        let known = self.peers.get_mut(&peer).expect("checked above");
         let mask = 1u64 << (index % 64);
         if known[index / 64] & mask == 0 {
             known[index / 64] |= mask;
             self.availability[index] = self.availability[index].saturating_add(1);
+            self.index.set_availability(index, self.availability[index]);
         }
         Ok(())
     }
@@ -182,15 +228,27 @@ impl LeaseCoordinator {
     /// Pick one piece for a peer and lease it. Returns None when nothing is
     /// currently eligible from that peer.
     pub fn pick_for(&mut self, peer: PeerId, now_ns: u64) -> Result<Option<Lease>, EngineError> {
-        let Some(bits) = self.peers.get(&peer) else {
+        if !self.peers.contains_key(&peer) {
             return Err(EngineError::UnknownPeer);
-        };
-        let picked = self.sequence.pick(bits, &self.busy, &self.availability)?;
+        }
+        self.sync_index();
+        let bits = &self.peers[&peer];
+        if bits.len() != self.busy.len() {
+            return Err(EngineError::Sequence(SequenceError::ShapeMismatch));
+        }
+        let picked = self.index.pick(
+            bits,
+            &self.availability,
+            self.sequence.piece_ranks(),
+            self.sequence.verified_words(),
+            &self.busy,
+        );
         let Some(piece) = picked else {
             return Ok(None);
         };
         let piece_usize = piece as usize;
         self.busy[piece_usize / 64] |= 1u64 << (piece_usize % 64);
+        self.index_pickable(piece_usize);
         let lease = Lease {
             torrent: self.torrent,
             piece,
@@ -212,9 +270,10 @@ impl LeaseCoordinator {
             return Ok(LeaseOutcome::Stale);
         }
         self.release(lease.piece);
-        Ok(LeaseOutcome::Applied(
-            self.sequence.mark_verified(lease.piece as usize)?,
-        ))
+        let changed = self.sequence.mark_verified(lease.piece as usize)?;
+        self.sync_index();
+        self.index_pickable(lease.piece as usize);
+        Ok(LeaseOutcome::Applied(changed))
     }
 
     /// Release leases older than `timeout_ns` so a dead peer cannot wedge a piece.
@@ -276,13 +335,23 @@ impl LeaseCoordinator {
     pub fn adopt_verified(&mut self, piece: u32) -> Result<bool, EngineError> {
         let index = usize::try_from(piece)
             .map_err(|_| EngineError::Sequence(SequenceError::InvalidPiece))?;
-        Ok(self.sequence.mark_verified(index)?)
+        let changed = self.sequence.mark_verified(index)?;
+        self.sync_index();
+        self.index_pickable(index);
+        Ok(changed)
+    }
+
+    /// Pickable pieces the index currently holds, for diagnostics and tests.
+    pub fn pickable_len(&self) -> usize {
+        self.index.len()
     }
 
     fn release(&mut self, piece: u32) {
         let index = piece as usize;
         if index < self.sequence.piece_count() {
             self.busy[index / 64] &= !(1u64 << (index % 64));
+            self.sync_index();
+            self.index_pickable(index);
         }
         self.outstanding.remove(&piece);
     }
@@ -305,13 +374,16 @@ impl LeaseCoordinator {
     }
 
     fn subtract_availability(&mut self, bits: &[u64]) {
+        self.sync_index();
         for (i, word) in bits.iter().enumerate() {
             let mut remaining = *word;
             while remaining != 0 {
                 let bit = remaining.trailing_zeros() as usize;
                 remaining &= remaining - 1;
-                if let Some(count) = self.availability.get_mut(i * 64 + bit) {
+                let index = i * 64 + bit;
+                if let Some(count) = self.availability.get_mut(index) {
                     *count = count.saturating_sub(1);
+                    self.index.set_availability(index, *count);
                 }
             }
         }

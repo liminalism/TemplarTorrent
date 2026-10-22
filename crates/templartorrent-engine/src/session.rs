@@ -249,7 +249,7 @@ impl Session {
     pub fn upload_read_failed(&mut self, id: TorrentId, piece: u32) -> Result<(), EngineError> {
         self.cancel_work(id)?;
         let job = self.job_mut(id)?;
-        job.coordinator.sequence_mut().invalidate(piece as usize)?;
+        job.coordinator.invalidate(piece)?;
         job.state = JobState::Error;
         Ok(())
     }

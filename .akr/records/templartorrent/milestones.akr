@@ -153,7 +153,7 @@ record templartorrent.milestone.performance-baselines/1 : milestone {
 
 record templartorrent.milestone.picker-optimization/1 : milestone {
     title "Optimize the measured hot spot: O(P) piece selection"
-    state proposed
+    state completed
     scope [
         path "crates/templartorrent-bench/**",
         path "crates/templartorrent-core/src/sequence.rs",
@@ -173,6 +173,7 @@ record templartorrent.milestone.picker-optimization/1 : milestone {
                 """
             method command
             command "cargo run --release -p templartorrent-bench -- --pieces 100000 --iterations 500"
+            verified_by [ @templartorrent.evidence.picker-microbench/1 ]
         }
         check oracle-equivalence {
             statement """
@@ -180,6 +181,7 @@ record templartorrent.milestone.picker-optimization/1 : milestone {
                 """
             method command
             command "cargo test --workspace"
+            verified_by [ @templartorrent.evidence.picker-oracle-equivalence/1 ]
         }
         check scenario-before-after {
             statement """
@@ -187,6 +189,7 @@ record templartorrent.milestone.picker-optimization/1 : milestone {
                 """
             method command
             command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_magnet_to_first_verified_metrics --nocapture"
+            verified_by [ @templartorrent.evidence.picker-scenario-and-gates/1 ]
         }
     }
     after [ @templartorrent.milestone.performance-baselines ]

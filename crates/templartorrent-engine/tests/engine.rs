@@ -169,7 +169,10 @@ fn lease_round_trip_verifies_piece() {
     let requests = requests_of(&report);
     assert_eq!(requests.len(), 1, "one block requested, got {requests:?}");
     let (piece, begin, length) = requests[0];
-    assert_eq!((piece, begin, length), (0, 0, 16384));
+    // a.bin's pieces share rank and availability; the live picker's seeded
+    // tie-break may start on any of them.
+    assert!(piece < 3, "a.bin piece expected, got {piece}");
+    assert_eq!((begin, length), (0, 16384));
     session
         .inject_block(id, peer, piece, begin, vec![7u8; length as usize])
         .unwrap();
