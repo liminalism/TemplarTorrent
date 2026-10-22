@@ -56,6 +56,8 @@ second backend, external torrent process or another GUI stack.
 
 **supersedes** `@templartorrent.observation.complete-piece-status/7` · **verified_by** `@templartorrent.evidence.optimistic-rotation/1`, `@templartorrent.evidence.picker-microbench/1`, `@templartorrent.evidence.picker-oracle-equivalence/1`, `@templartorrent.evidence.ui-state-gates/1`
 
+> **Stale** — `watches "integration/**"` was matched by `2eaca51a`, which touched `integration/templartorrent/src/main.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#linux-client-with-persistence-bucketed-picker-optimistic-unchoke-and-saved-geometry-remaining-boundaries).
+
 ## Assessments
 
 _(none)_

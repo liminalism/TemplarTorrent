@@ -7,7 +7,13 @@
 
 What should not be trusted without re-checking: records the build flagged `stale` or `at_risk`. Neither flag means a record is wrong (D-003); both mean look at it. This view is generated on every successful build, including one that exits 0 with a long queue (D-024). An empty file on an active project is more often a sign the `watches` globs are wrong than a sign the knowledge is perfect.
 
-## Stale (1)
+## Stale (2)
+
+### Linux client with persistence, bucketed picker, optimistic unchoke and saved geometry; remaining boundaries
+
+`verified` · `@templartorrent.observation.complete-piece-status/8` · observation · **stale** · [Linux client with persistence, bucketed picker, optimistic unchoke and saved geometry; remaining boundaries](CURRENT-STATE.md#linux-client-with-persistence-bucketed-picker-optimistic-unchoke-and-saved-geometry-remaining-boundaries)
+
+**Cause** — `watches "integration/**"` was matched by `2eaca51a`, which touched `integration/templartorrent/src/main.rs`.
 
 ### Rbit orchestration boundary and librqbit session alternative
 
