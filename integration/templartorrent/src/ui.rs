@@ -2387,3 +2387,323 @@ impl PixelApp for App {
         self.desktop.activator.stop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! PixelKit's `close_slot` calls `PixelApp::on_exit`. These tests drive that
+    //! method, and the Add dialog's Ctrl+V path, without opening a window.
+    use super::{App, Dialog};
+    use crate::activate::{Activation, activate, spawn};
+    use crate::persist::{SessionStore, UiState, hex};
+    use crate::worker::{WorkerConfig, WorkerHandle};
+    use pixelkit_raster::WindowBuffer;
+    use pixelkit_shell::{KeyInput, Modifiers, Scale};
+    use pixelkit_text::font::{Face, FontSet};
+    use pixelkit_windowing::{PixelApp, Waker};
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+    use templartorrent_core::model::{JobState, Limits};
+    use templartorrent_rbit_adapter::driver::JobRecord;
+
+    /// Synthetic magnet. Not a swarm the test contacts.
+    const MAGNET: &str =
+        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=clipboard-probe";
+
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Owns the connection that published the probe text. On Wayland the
+    /// owner has to stay alive until the paste is read. Drop writes the
+    /// previous text back, or clears when there was none. A clipboard that
+    /// held only an image cannot be restored by this text round-trip.
+    struct ClipboardGuard {
+        clipboard: pixelkit_shell::Clipboard,
+        previous: Option<String>,
+        /// Set when the clipboard had no text. Cleared once that state is put back.
+        clear_on_drop: bool,
+    }
+
+    impl ClipboardGuard {
+        fn replace_text(text: &str) -> Result<Self, String> {
+            let mut clipboard = pixelkit_shell::Clipboard::new();
+            let previous = clipboard
+                .try_text()
+                .map_err(|error| format!("clipboard read failed: {error}"))?;
+            clipboard
+                .try_set_text(text.to_string())
+                .map_err(|error| format!("clipboard write failed: {error}"))?;
+            let guard = Self {
+                clipboard,
+                clear_on_drop: previous.is_none(),
+                previous,
+            };
+            match guard.clipboard.try_text() {
+                Ok(Some(current)) if current == text => Ok(guard),
+                Ok(_) => Err("clipboard did not keep the text just written".into()),
+                Err(error) => Err(format!("clipboard read-back failed: {error}")),
+            }
+        }
+
+        /// Put the previous text back and read it again. The error text does not
+        /// include clipboard contents.
+        fn restore(&mut self) -> Result<(), String> {
+            if let Some(text) = self.previous.clone() {
+                self.clipboard
+                    .try_set_text(text.clone())
+                    .map_err(|error| format!("clipboard restore failed: {error}"))?;
+                match self.clipboard.try_text() {
+                    Ok(Some(current)) if current == text => {
+                        self.previous = None;
+                        self.clear_on_drop = false;
+                        Ok(())
+                    }
+                    Ok(_) => Err("clipboard restore did not read back".into()),
+                    Err(error) => Err(format!("clipboard restore read failed: {error}")),
+                }
+            } else if self.clear_on_drop {
+                self.clipboard
+                    .try_clear()
+                    .map_err(|error| format!("clipboard clear failed: {error}"))?;
+                match self.clipboard.try_text() {
+                    Ok(None) => {
+                        self.clear_on_drop = false;
+                        Ok(())
+                    }
+                    Ok(Some(_)) => Err("clipboard clear left text behind".into()),
+                    Err(error) => Err(format!("clipboard clear read failed: {error}")),
+                }
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for ClipboardGuard {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    fn temp_root(label: &str) -> RemoveOnDrop {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "templartorrent-ui-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        RemoveOnDrop(root)
+    }
+
+    fn fonts() -> &'static FontSet {
+        static FONTS: OnceLock<&'static FontSet> = OnceLock::new();
+        FONTS.get_or_init(|| {
+            let path = crate::workflow::resolve_font(None).expect("a TrueType font");
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .expect("open font")
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .expect("read font");
+            assert!(bytes.len() <= 4 * 1024 * 1024, "font exceeds 4 MiB");
+            let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            let face = Face::from_bytes(bytes).expect("static TrueType font");
+            let face: &'static Face = Box::leak(Box::new(face));
+            let mut fonts = FontSet::new();
+            fonts.add(face);
+            Box::leak(Box::new(fonts))
+        })
+    }
+
+    fn worker(session: PathBuf) -> WorkerHandle {
+        WorkerHandle::start(WorkerConfig {
+            limits: Limits::default(),
+            allow_local_trackers: false,
+            public_trackers: Vec::new(),
+            public_tracker_path: session.join("public-trackers.txt"),
+            geo_db_path: None,
+            listen: "127.0.0.1:0".parse().expect("listen address"),
+            session_dir: Some(session),
+        })
+        .expect("worker")
+    }
+
+    fn activator_in(dir: &Path) -> crate::activate::Activator {
+        let activation = activate(dir, &[]).expect("activation listener");
+        let Activation::Primary { listener, path, .. } = activation else {
+            panic!("activation was forwarded");
+        };
+        spawn(listener, path)
+    }
+
+    fn seed_job(base: &Path) -> [u8; 20] {
+        std::fs::create_dir_all(base.join("job/owned-series")).unwrap();
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let torrent = rbit::TorrentBuilder::new("owned-series")
+            .version(rbit::TorrentVersion::V1)
+            .piece_length(16384)
+            .add_file("Episode02.bin", data[..20_000].to_vec())
+            .add_file("Episode01.bin", data[20_000..].to_vec())
+            .build()
+            .unwrap();
+        std::fs::write(base.join("job/owned-series/Episode02.bin"), &data[..20_000]).unwrap();
+        std::fs::write(base.join("job/owned-series/Episode01.bin"), &data[20_000..]).unwrap();
+        let meta = rbit::Metainfo::from_bytes(&torrent).unwrap();
+        let rbit::InfoHash::V1(hash) = meta.info_hash else {
+            panic!("fixture must be v1");
+        };
+        SessionStore::new(base.join("session"))
+            .save_job(&JobRecord {
+                info_hash: hash,
+                torrent,
+                destination: base.join("job"),
+                paused: false,
+                public_bootstrap: false,
+                wanted: vec![true, true],
+                order: vec![1, 0],
+                trackers: Vec::new(),
+                preferences: Vec::new(),
+            })
+            .unwrap();
+        hash
+    }
+
+    fn wait_until_seeding(handle: &WorkerHandle) {
+        let start = Instant::now();
+        loop {
+            let view = handle.view();
+            if view.snapshot.jobs.len() == 1
+                && matches!(
+                    view.snapshot.jobs[0].state,
+                    JobState::Complete | JobState::Seeding
+                )
+            {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "job never restored: {:?}",
+                view.note
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn window_close_saves_layout_and_resume() {
+        let root = temp_root("close");
+        let hash = seed_job(&root.0);
+        let session = root.0.join("session");
+        let client = worker(session.clone());
+        wait_until_seeding(&client);
+        let mut app = App::new(
+            fonts(),
+            client,
+            activator_in(&root.0.join("runtime")),
+            UiState::default(),
+            Some(SessionStore::new(session.clone())),
+        );
+        let mut buffer = WindowBuffer::new(960, 640);
+        app.render(&mut buffer, Scale::ONE);
+        let width = app.desktop.logical_size.0.round() as u32;
+        let height = app.desktop.logical_size.1.round() as u32;
+        let split = app.desktop.split;
+        assert_eq!(
+            (width, height),
+            (960, 640),
+            "the rendered frame is what close persists"
+        );
+        assert_ne!(
+            (width, height),
+            (UiState::default().width, UiState::default().height)
+        );
+        let socket = root.0.join("runtime/instance.sock");
+        assert!(socket.exists(), "the listener is up before close");
+        app.on_exit();
+        drop(app);
+        let loaded = SessionStore::new(session)
+            .load_ui()
+            .expect("ui record")
+            .expect("on_exit wrote ui state");
+        assert_eq!(loaded.width, width);
+        assert_eq!(loaded.height, height);
+        let expected_split = format!("{split:.4}").parse::<f32>().expect("split");
+        assert!(
+            (loaded.split - expected_split).abs() < 1e-6,
+            "saved {} expected {expected_split}",
+            loaded.split
+        );
+        assert!(!socket.exists(), "on_exit stops the activation listener");
+        let resume = std::fs::read_to_string(
+            root.0
+                .join("session")
+                .join(format!("{}.resume", hex(&hash))),
+        )
+        .expect("resume bitmap");
+        assert!(resume.starts_with("templartorrent-resume 1\n"), "{resume}");
+        assert!(resume.contains("barrier 1\n"), "{resume}");
+        assert!(
+            resume.contains("bits 1f\n"),
+            "five verified pieces, got {resume}"
+        );
+    }
+
+    #[test]
+    fn paste_magnet_from_the_system_clipboard() {
+        // Declared first so a later panic still restores the clipboard.
+        let mut clipboard = ClipboardGuard::replace_text(MAGNET).expect("system clipboard");
+        let root = temp_root("paste");
+        let session = root.0.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let mut app = App::new(
+            fonts(),
+            worker(session),
+            activator_in(&root.0.join("runtime")),
+            UiState::default(),
+            None,
+        );
+        app.attach(Waker::detached());
+        app.desktop.open_add();
+        app.on_modifiers(Modifiers {
+            control: true,
+            shift: false,
+            alt: false,
+            logo: false,
+        });
+        app.on_key(&KeyInput::Character('v'));
+        let mut buffer = WindowBuffer::new(1100, 800);
+        let start = Instant::now();
+        loop {
+            app.render(&mut buffer, Scale::ONE);
+            let Dialog::Add(add) = &app.desktop.dialog else {
+                panic!("add dialog closed");
+            };
+            if let Some(error) = add.magnet.clipboard_error() {
+                panic!("clipboard paste failed: {error}");
+            }
+            if add.magnet.text() == MAGNET {
+                assert!(add.torrent.text().is_empty());
+                assert!(add.destination.text().is_empty());
+                assert!(add.torrent.clipboard_error().is_none());
+                assert!(add.destination.clipboard_error().is_none());
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "magnet field did not receive the clipboard text"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.on_exit();
+        clipboard.restore().expect("clipboard restored");
+    }
+}
