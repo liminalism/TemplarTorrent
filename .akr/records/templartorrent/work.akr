@@ -511,3 +511,42 @@ record templartorrent.work.ui-state-persistence/1 : work {
         }
     }
 }
+
+record templartorrent.work.window-close-and-paste/1 : work {
+    title "Evidence for window close and native magnet paste"
+    state completed
+    scope [ path "integration/templartorrent/**" ]
+    intent """
+        Prove the PixelKit close path and Linux magnet paste that are already wired. App::on_exit, the method close_slot calls, saves the last rendered logical size and inspector split, shuts the worker so the resume bitmap is written, and stops the activation listener. With the Add dialog focused on the magnet field, Ctrl+V through the attached system clipboard worker inserts the clipboard text and leaves no clipboard error. The test restores the previous clipboard text.
+        """
+    note """
+        No per-block journal, RTT scoring, webseed, or UPnP. The paste check uses the Linux system clipboard and restores the previous text; an image-only clipboard cannot be put back. Windows paste stays untested. A compositor without data-control cannot serve this check.
+        """
+    acceptance {
+        check close-persists {
+            statement """
+                After one render, App::on_exit writes that frame's logical width, height and inspector split, removes the activation socket, and leaves a resume bitmap whose durability barrier is set and whose verified pieces are recorded.
+                """
+            method command
+            command "cargo test -p templartorrent --offline --lib window_close_saves_layout_and_resume -- --test-threads=1"
+            verified_by [ @templartorrent.evidence.window-close/1 ]
+        }
+        check gates {
+            statement """
+                Clippy with denied warnings is clean for the application, all targets, offline.
+                """
+            method command
+            command "cargo clippy -p templartorrent --all-targets --offline -- -D warnings"
+            verified_by [ @templartorrent.evidence.window-close-gates/1 ]
+        }
+        check native-paste {
+            statement """
+                With the system clipboard set to a magnet and the Add dialog focused on the magnet field, Ctrl+V through the attached clipboard worker inserts that magnet and reports no clipboard error. The previous clipboard text is restored.
+                """
+            method command
+            command "cargo test -p templartorrent --offline --lib paste_magnet_from_the_system_clipboard -- --test-threads=1"
+            verified_by [ @templartorrent.evidence.native-paste/1 ]
+        }
+    }
+    derived_from [ @templartorrent.observation.complete-piece-status ]
+}

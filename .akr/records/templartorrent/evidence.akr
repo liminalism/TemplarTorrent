@@ -361,6 +361,18 @@ record templartorrent.evidence.native-audit-after-fork/1 : evidence {
         """
 }
 
+record templartorrent.evidence.native-paste/1 : evidence {
+    title "Add dialog pasted a magnet from the system clipboard"
+    state verified
+    result pass
+    method command
+    observed_at git:66c3feac95d2c273004bdfdabd5062e27da6a6ea
+    command "cargo test -p templartorrent --offline --lib paste_magnet_from_the_system_clipboard -- --test-threads=1"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, rustc 1.99.0, commit 66c3fea, WAYLAND_DISPLAY=wayland-0, DISPLAY empty. The command passed one test in 0.16s. Ctrl+V with the control modifier set, through the attached system clipboard worker, left the focused Add-dialog magnet field equal to the probe magnet, left the torrent and destination fields empty, and left all three clipboard_error values empty. restore() then returned. A following wl-paste was not the probe magnet. The tests call the key callbacks directly; no window was opened. Windows was not run.
+        """
+}
+
 record templartorrent.evidence.no-fixture-live/1 : evidence {
     title "Live mode renders snapshots only"
     state verified
@@ -859,5 +871,29 @@ record templartorrent.evidence.ui-state-roundtrip/1 : evidence {
     artifact "perf-results/2026-10-22-ui-state/workspace-tests.log"
     summary """
         Ubuntu 26.04.1 x86_64, rustc 1.99.0, tree 14adab1 plus the ui-state change: 27 client tests passed including ui_state_roundtrips_and_clamps_hostile_values: a 1120x760 window with split 0.42 encodes and decodes, width 1 clamps to 260, height 999999 to 16384, split 7 to 0.9, an unknown version and a non-numeric width are rejected, and the store returns None before a save and the saved width after. The on_exit save in a real window was not exercised headlessly.
+        """
+}
+
+record templartorrent.evidence.window-close/1 : evidence {
+    title "Close path wrote layout, stopped activation, and left a resume bitmap"
+    state verified
+    result pass
+    method command
+    observed_at git:66c3feac95d2c273004bdfdabd5062e27da6a6ea
+    command "cargo test -p templartorrent --offline --lib window_close_saves_layout_and_resume -- --test-threads=1"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, rustc 1.99.0, commit 66c3fea. The command passed one test in 0.12s. It rendered a 960 by 640 buffer at scale 1, called App::on_exit, and the assertions held: saved width 960 and height 640 (the opening default is 300 by 500), the inspector split matched the four-decimal round trip, runtime/instance.sock was removed, and the resume file started with templartorrent-resume 1 and contained barrier 1 and bits 1f. Preview tests, the rest of the workspace suite and the release binary were not run.
+        """
+}
+
+record templartorrent.evidence.window-close-gates/1 : evidence {
+    title "Application clippy is clean after the close and paste tests"
+    state verified
+    result pass
+    method command
+    observed_at git:66c3feac95d2c273004bdfdabd5062e27da6a6ea
+    command "cargo clippy -p templartorrent --all-targets --offline -- -D warnings"
+    summary """
+        Ubuntu 26.04.1, Linux 7.0.0-31-generic, rustc 1.99.0, commit 66c3fea. cargo clippy -p templartorrent --all-targets --offline -- -D warnings exited 0. Preview tests, the rest of the workspace suite and the release binary were not run.
         """
 }

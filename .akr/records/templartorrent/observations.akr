@@ -371,7 +371,7 @@ record templartorrent.observation.complete-piece-status/10 : observation {
 
 record templartorrent.observation.complete-piece-status/11 : observation {
     title "Linux client with rustls 0.23.46 HTTPS announces and a resume bitmap; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22, Linux x86_64 Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, committed on master at 3bb7995. HTTPS tracker announces use rustls 0.23.46 with default features off and aws_lc_rs enabled, the cryptography provider that release turns on by default. Certificates are checked against the webpki public roots and the name in the tracker URL. ring is not compiled. aws-lc-sys is C, built with cmake, and is an accepted native boundary for tracker TLS. Brotli is not enabled. The resume bitmap from f1d59c5 is unchanged: a set bit is adopted without hashing only when the durability barrier is set and every file that piece spans still matches device, inode, size and mtime captured after sync_all. On this commit the adapter suite passed (21 lib, 26 driver, 11 localhost, 3 multiblock) and the application lib tests passed (29). Clippy with denied warnings was clean for the adapter, all targets. Preview tests, the rest of the workspace suite and the release binary were not re-run. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; no RTT or reliability scoring, only rates; webseed and UPnP unavailable; no headful interaction or clipboard paste in evidence; window close persists through the worker shutdown flush, with no headful close path in evidence; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows optional and untested.
         """
@@ -388,5 +388,30 @@ record templartorrent.observation.complete-piece-status/11 : observation {
         @templartorrent.evidence.rate-ranking,
         @templartorrent.evidence.resume-bitmap,
         @templartorrent.evidence.resume-bitmap-gates
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/12 : observation {
+    title "Linux client writes layout and resume on close and pastes a magnet; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22, Linux x86_64 Ubuntu 26.04.1, kernel 7.0.0-31-generic, rustc 1.99.0, WAYLAND_DISPLAY=wayland-0, DISPLAY empty, committed on master at 66c3fea. App::on_exit, the method PixelKit close_slot calls, after one 960 by 640 render at scale 1 wrote that logical size and the inspector split, removed the activation socket, and left a resume bitmap with barrier 1 and bits 1f. The Add dialog's focused magnet field received a system-clipboard magnet on Ctrl+V through the attached clipboard worker, with no clipboard error, and the previous clipboard text was written back. These tests call on_exit and the key callbacks directly. Clippy with denied warnings was clean for the application, all targets. Preview tests, the rest of the workspace suite and the release binary were not re-run. HTTPS tracker announces remain rustls 0.23.46 with aws_lc_rs, certificates checked, ring not compiled. The resume bitmap from f1d59c5 is unchanged. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; no RTT or reliability scoring, only rates; webseed and UPnP unavailable; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows paste and a real window event loop are untested.
+        """
+    observed_at git:66c3feac95d2c273004bdfdabd5062e27da6a6ea
+    method command
+    watches [ "crates/**", "integration/**", "vendor/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/11 ]
+    verified_by [
+        @templartorrent.evidence.announce-transport,
+        @templartorrent.evidence.https-rustls,
+        @templartorrent.evidence.https-rustls-audit,
+        @templartorrent.evidence.multi-lease-before-after,
+        @templartorrent.evidence.native-audit-after-fork,
+        @templartorrent.evidence.native-paste,
+        @templartorrent.evidence.rate-ranking,
+        @templartorrent.evidence.resume-bitmap,
+        @templartorrent.evidence.resume-bitmap-gates,
+        @templartorrent.evidence.window-close,
+        @templartorrent.evidence.window-close-gates
     ]
 }
