@@ -89,6 +89,40 @@ record templartorrent.work.file-storage/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.multi-lease-pipelining/1 : work {
+    title "Lease several small pieces per peer so the request pipeline fills across pieces"
+    state completed
+    scope [
+        path "crates/templartorrent-engine/src/lease.rs",
+        path "crates/templartorrent-engine/src/session.rs",
+        path "integration/rbit-adapter/tests/driver.rs"
+    ]
+    intent """
+        The 2048-piece scenario showed the scheduler re-offering only one outstanding lease per peer: with 16 KiB pieces that is one block in flight per peer, so throughput is bounded by round-trip latency regardless of the eight-slot pipeline. Change the per-peer scheduling loop to re-offer every outstanding lease and then lease further pieces while the peer has free pipeline slots, bounded by the pipeline cap, the global active-piece cap and the payload budget as before. Record release before and after samples of the scenario and keep every existing lease, fencing and budget test green.
+        """
+    note """
+        Opened 2026-10-22 from the scenario finding. Large pieces are unaffected because one lease already fills the pipeline.
+        """
+    acceptance {
+        check before-after {
+            statement """
+                Three release runs of the 2048-piece scenario after the change show higher throughput than three runs before it, with payload reservation and RSS reported.
+                """
+            method command
+            command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_large_piece_count_scenario_metrics --nocapture"
+            verified_by [ @templartorrent.evidence.multi-lease-before-after/1 ]
+        }
+        check regressions {
+            statement """
+                Engine lease, fencing, budget, assembly and adapter tests pass unchanged except where an assertion encoded the single-lease behaviour.
+                """
+            method command
+            command "cargo test --workspace --all-targets"
+            verified_by [ @templartorrent.evidence.multi-lease-regressions/1 ]
+        }
+    }
+}
+
 record templartorrent.work.optimistic-unchoke/1 : work {
     title "Rotating optimistic upload slot inside the configured slot total"
     state completed
@@ -200,6 +234,41 @@ record templartorrent.work.picker-buckets/1 : work {
         }
     }
     part_of [ @templartorrent.milestone.picker-optimization ]
+}
+
+record templartorrent.work.rate-ranked-slots/1 : work {
+    title "Per-peer payload rates, rate-ranked regular upload slots with hysteresis, rates in the Peers tab"
+    state completed
+    scope [
+        path "integration/rbit-adapter/src/driver.rs",
+        path "integration/rbit-adapter/tests/driver.rs",
+        path "integration/templartorrent/src/ui.rs",
+        path "integration/templartorrent/src/worker.rs"
+    ]
+    intent """
+        DESIGN.md section 6: compute per-peer rates from monotonic deltas with short smoothing and use verified useful throughput in upload allocation. The Driver counts payload bytes per wire in both directions, folds a 2-second window into a 3:1 blended rate, and ranks regular upload slots by preference, then by the rate the peer gives us while downloading (or takes from us while seeding), then by connection order, re-evaluating every 10 seconds so a single fast step cannot churn slots; a manual preference change bypasses the hold. PeerStatus and the Peers tab show the rates instead of dashes. A 2048-piece, 32 MiB localhost scenario test prints metrics for the scheduler path.
+        """
+    note """
+        2026-10-22. RTT and reliability are still not scored; the pure ranking function is unit-tested because the Driver uses real time.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Workspace tests, formatting and Clippy with warnings denied pass.
+                """
+            method command
+            command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings"
+            verified_by [ @templartorrent.evidence.rate-ranking-gates/1 ]
+        }
+        check ranking {
+            statement """
+                The pure ranking test orders preference, then descending rate, then arrival; the slot tests still pass; the 2048-piece scenario completes with every piece requested exactly once and prints its metric line.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter"
+            verified_by [ @templartorrent.evidence.rate-ranking/1 ]
+        }
+    }
 }
 
 record templartorrent.work.rbit-driver/1 : work {

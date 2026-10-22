@@ -1521,7 +1521,11 @@ impl Desktop {
             );
             ui.label_styled(
                 Rect::new(rect.x, rect.y + s.px(20), rect.w, s.px(20)),
-                &format!("{remote}, {local}, remote {interest}    down —    up —"),
+                &format!(
+                    "{remote}, {local}, remote {interest}    down {}    up {}",
+                    rate_text(peer.down_bps),
+                    rate_text(peer.up_bps)
+                ),
                 *small,
                 MUTED,
                 Align::Left,

@@ -70,18 +70,37 @@ impl Fixture {
         Self::with_version(salt, private, TorrentVersion::V1)
     }
     fn torrent_bytes(salt: u8, private: bool, version: TorrentVersion) -> (Vec<u8>, Vec<u8>) {
-        let data: Vec<_> = (0..3 * PIECE + 73)
+        Self::torrent_bytes_sized(salt, private, version, PIECE, 3 * PIECE + 73)
+    }
+    fn torrent_bytes_sized(
+        salt: u8,
+        private: bool,
+        version: TorrentVersion,
+        piece: usize,
+        size: usize,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let data: Vec<_> = (0..size)
             .map(|i| ((i / 16384) as u8).wrapping_mul(23) ^ (i as u8).wrapping_add(salt))
             .collect();
         let torrent = TorrentBuilder::new("owned-series")
             .version(version)
             .private(private)
-            .piece_length(PIECE as u64)
-            .add_file("Episode02.bin", data[..PIECE].to_vec())
-            .add_file("Episode01.bin", data[PIECE..].to_vec())
+            .piece_length(piece as u64)
+            .add_file("Episode02.bin", data[..piece].to_vec())
+            .add_file("Episode01.bin", data[piece..].to_vec())
             .build()
             .unwrap();
         (data, torrent)
+    }
+    /// Many small pieces: the scheduler, not the wire, is what this stresses.
+    fn large(salt: u8, pieces: usize) -> Arc<Self> {
+        let (data, torrent) =
+            Self::torrent_bytes_sized(salt, false, TorrentVersion::V1, 16384, pieces * 16384);
+        let meta = Metainfo::from_bytes(&torrent).unwrap();
+        let InfoHash::V1(hash) = meta.info_hash else {
+            panic!("fixture must be v1");
+        };
+        Arc::new(Self { data, meta, hash })
     }
     /// A hybrid fixture keeps its v1 info hash so a magnet resolves to it; the
     /// driver must then reject the metadata rather than treating it as v1.
@@ -299,10 +318,11 @@ async fn serve(conn: &mut PeerConnection, fixture: &Fixture, stats: &Stats, faul
                 }
                 served += 1;
                 stats.requests.lock().unwrap().push((index, begin));
+                let piece_len = fixture.meta.info.piece_length as usize;
                 assert!((index as usize) < count && length > 0 && length <= 16384);
-                let start = index as usize * PIECE + begin as usize;
+                let start = index as usize * piece_len + begin as usize;
                 let end = start + length as usize;
-                assert!(end <= fixture.data.len() && begin as usize + length as usize <= PIECE);
+                assert!(end <= fixture.data.len() && begin as usize + length as usize <= piece_len);
                 if fault.silent {
                     continue;
                 }
@@ -2046,6 +2066,71 @@ async fn driver_optimistic_slot_rotates_one_slot_between_interested_peers() {
         assert!(b.seen().contains(&"unchoke"));
         assert_eq!(seed.optimistic_peer(), Some(holders[2]));
         seed.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_large_piece_count_scenario_metrics() {
+    timeout(Duration::from_secs(120), async {
+        let root = Root::new();
+        let pieces = 2048;
+        let fixture = Fixture::large(89, pieces);
+        let a = Server::start_at("127.0.0.1", fixture.clone(), Fault::default()).await;
+        let b = Server::start_at("127.0.0.2", fixture.clone(), Fault::default()).await;
+        let mut driver = Driver::with_peer_id(Limits::default(), [29; 20]).unwrap();
+        let start = Instant::now();
+        let id = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[a.source, b.source],
+                false,
+            )
+            .await
+            .unwrap();
+        driver.connect_peer(id, b.source).await.unwrap();
+        let mut peak_reserved = 0usize;
+        let mut peak_rss = 0usize;
+        let mut peak_down = 0u64;
+        loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(100),
+                "large transfer stalled"
+            );
+            let report = driver.step(Duration::from_millis(10)).await.unwrap();
+            assert!(report.peer_errors.is_empty(), "{:?}", report.peer_errors);
+            peak_reserved = peak_reserved.max(driver.payload_stats().reserved_bytes);
+            if let Some(rss) = process_rss() {
+                peak_rss = peak_rss.max(rss);
+            }
+            for row in driver.peer_status(id) {
+                peak_down = peak_down.max(row.down_bps);
+            }
+            if driver.snapshot().jobs[0].state == JobState::Complete {
+                break;
+            }
+        }
+        let elapsed = start.elapsed();
+        fixture.assert_files(&root.job());
+        let requests =
+            a.stats.requests.lock().unwrap().len() + b.stats.requests.lock().unwrap().len();
+        assert_eq!(
+            requests, pieces,
+            "every 16 KiB piece is one block, requested once"
+        );
+        println!(
+            "TT_LARGE_METRIC {{\"pieces\":{pieces},\"payload_bytes\":{},\"elapsed_ns\":{},\"throughput_bytes_s\":{},\"payload_reserved_peak_bytes\":{peak_reserved},\"process_rss_peak_sampled_bytes\":{peak_rss},\"peak_peer_down_bps_observed\":{peak_down},\"profile\":\"{}\"}}",
+            fixture.data.len(),
+            elapsed.as_nanos(),
+            fixture.data.len() as u128 * 1_000_000_000 / elapsed.as_nanos().max(1),
+            if cfg!(debug_assertions) { "debug" } else { "release" }
+        );
+        driver.shutdown().await;
         a.close().await;
         b.close().await;
     })

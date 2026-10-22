@@ -798,8 +798,10 @@ async fn localhost_transfer_completes_with_verified_bytes() {
             panic!("unexpected disconnect on a clean transfer");
         };
         assert!(blamed.is_empty(), "clean transfer blamed: {blamed:?}");
+        // All four small pieces pipeline at once, so the peak is the whole
+        // 50 KB fixture's working set (three copies), never more.
         assert!(
-            max_budget <= 65_536,
+            max_budget <= 3 * 50_000,
             "payload budget peaked at {max_budget} bytes"
         );
         assert_eq!(session.snapshot().payload_budget_used, 0);

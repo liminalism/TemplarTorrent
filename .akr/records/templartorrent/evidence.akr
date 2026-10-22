@@ -298,6 +298,32 @@ record templartorrent.evidence.localhost-transfer/1 : evidence {
         """
 }
 
+record templartorrent.evidence.multi-lease-before-after/1 : evidence {
+    title "Ubuntu 26.04.1 i7-13700H, rustc 1.99.0, release, tree 3ed3709 plus the changes. 2048-piece 32 MiB scenario over two loopback seeders, three runs each: before 42.27/42.30/42.23 s at 794 KB/s with payload reservation peak 98304 B and RSS about 38.9 MB; after 5.25/5.30/5.26 s at 6.34 to 6.39 MB/s with reservation peak 1081344 B and RSS about 40.2 MB. Eight times faster with the reservation still far inside the 48 MiB budget. The 4-piece small scenario run alone: total 164 to 165 ms against 328 ms before, first verified write unchanged at 123 ms, reservation peak 393216 B against 196608, RSS 5.4 MB unchanged. before-large-scenario.log and after-small-scenario-alone.log hold the raw lines."
+    state verified
+    result pass
+    method command
+    observed_at git:3ed370905442455c343eb05d181a71b5c8c657bf
+    command "cargo test --release -p templartorrent-rbit-adapter --test driver -- driver_large_piece_count_scenario_metrics --nocapture"
+    artifact "perf-results/2026-10-22-multi-lease/after-large-scenario.log"
+    summary """
+        Ubuntu 26.04.1 i7-13700H, rustc 1.99.0, release, tree 3ed3709 plus the changes. 2048-piece 32 MiB scenario over two loopback seeders, three runs each: before 42.27/42.30/42.23 s at 794 KB/s with payload reservation peak 98304 B and RSS about 38.9 MB; after 5.25/5.30/5.26 s at 6.34 to 6.39 MB/s with reservation peak 1081344 B and RSS about 40.2 MB. Eight times faster with the reservation still far inside the 48 MiB budget. The 4-piece small scenario run alone: total 164 to 165 ms against 328 ms before, first verified write unchanged at 123 ms, reservation peak 393216 B against 196608, RSS 5.4 MB unchanged. before-large-scenario.log and after-small-scenario-alone.log hold the raw lines.
+        """
+}
+
+record templartorrent.evidence.multi-lease-regressions/1 : evidence {
+    title "Same host and tree: 158 workspace tests passed, formatting and all-target Clippy with warnings denied clean after a filter_map lint fix, release build ok. Four assertions that encoded the single-lease behaviour were restated: the assembly test now allows up to two piece working sets at the peak, the engine round-trip and expiry tests expect the four small pieces to pipeline in round one with the pipelined pieces' permits still held, and the localhost bounded-memory test caps the peak at the whole 50 KB fixture's working set."
+    state verified
+    result pass
+    method command
+    observed_at git:3ed370905442455c343eb05d181a71b5c8c657bf
+    command "cargo test --workspace --all-targets"
+    artifact "perf-results/2026-10-22-multi-lease/workspace-tests.log"
+    summary """
+        Same host and tree: 158 workspace tests passed, formatting and all-target Clippy with warnings denied clean after a filter_map lint fix, release build ok. Four assertions that encoded the single-lease behaviour were restated: the assembly test now allows up to two piece working sets at the peak, the engine round-trip and expiry tests expect the four small pieces to pipeline in round one with the pipelined pieces' permits still held, and the localhost bounded-memory test caps the peak at the whole 50 KB fixture's working set.
+        """
+}
+
 record templartorrent.evidence.native-audit-after-fork/1 : evidence {
     title "Ubuntu 26.04.1, rustc 1.99.0, tree 2b9ca3f plus the rbit fork: cargo tree on the workspace graph reports no package named ring, rustls or reqwest (each query fails with \"did not match any packages\"). The full runtime package list is in the log; the only -sys or native-signal crates are OS bindings: drm-sys, libc, linux-raw-sys, wayland-sys. Build scripts in the graph belong to pure-Rust crates (ahash, crc32c, crossbeam, getrandom, rustix, serde, smithay-client-toolkit and others). This audits the Linux default graph only; the pixelkit-preview workspace has no rbit dependency."
     state verified
@@ -486,6 +512,32 @@ record templartorrent.evidence.production-linux-client/1 : evidence {
     command "cargo test --manifest-path integration/templartorrent/Cargo.toml --offline -- --test-threads=1"
     summary """
         Same host and uncommitted tree. Production crate tests: 10 passed, 0 failed, including activation forwarding, worker limit/add/remove/preference acks, and the snapshot fingerprint. Clippy --all-targets -D warnings passed. cargo build produced integration/templartorrent/target/debug/templartorrent; --help exited 0 and an unknown flag exited 2. Adapter driver tests driver_pause_and_remove_join_network_tasks_and_retain_data and driver_tracker_discovery_reannounce_and_safe_delete passed. No display, clipboard paste, or Internet transfer ran.
+        """
+}
+
+record templartorrent.evidence.rate-ranking/1 : evidence {
+    title "Same host and tree: adapter tests passed including the pure ranking test (preference rank, then descending rate, then arrival; blend 3:1 with decay), both upload-slot tests with the preference change bypassing the 10 s hold, the optimistic rotation test, and the new 2048-piece scenario asserting every piece requested exactly once with peer rates observed up to 3.3 MB/s. Rates reach the Peers tab through PeerStatus and PeerView."
+    state verified
+    result pass
+    method command
+    observed_at git:3ed370905442455c343eb05d181a71b5c8c657bf
+    command "cargo test -p templartorrent-rbit-adapter"
+    artifact "perf-results/2026-10-22-multi-lease/workspace-tests.log"
+    summary """
+        Same host and tree: adapter tests passed including the pure ranking test (preference rank, then descending rate, then arrival; blend 3:1 with decay), both upload-slot tests with the preference change bypassing the 10 s hold, the optimistic rotation test, and the new 2048-piece scenario asserting every piece requested exactly once with peer rates observed up to 3.3 MB/s. Rates reach the Peers tab through PeerStatus and PeerView.
+        """
+}
+
+record templartorrent.evidence.rate-ranking-gates/1 : evidence {
+    title "Same host and tree: 158 workspace tests, formatting and Clippy with warnings denied clean."
+    state verified
+    result pass
+    method command
+    observed_at git:3ed370905442455c343eb05d181a71b5c8c657bf
+    command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings"
+    artifact "perf-results/2026-10-22-multi-lease/clippy.log"
+    summary """
+        Same host and tree: 158 workspace tests, formatting and Clippy with warnings denied clean.
         """
 }
 

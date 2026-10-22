@@ -299,6 +299,19 @@ impl LeaseCoordinator {
             .find_map(|(holder, lease)| (*holder == peer).then_some(lease))
     }
 
+    /// Every lease this peer holds, in piece order, so the session can
+    /// re-offer unrequested spans of all of them before leasing more.
+    pub fn leases_of(&self, peer: PeerId) -> Vec<Lease> {
+        let mut leases: Vec<Lease> = self
+            .outstanding
+            .values()
+            .filter(|(holder, _)| *holder == peer)
+            .map(|(_, lease)| lease.clone())
+            .collect();
+        leases.sort_by_key(|lease| lease.piece);
+        leases
+    }
+
     /// Release a piece back to the pickable pool without verifying it.
     pub fn release_piece(&mut self, piece: u32) {
         self.release(piece);

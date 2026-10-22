@@ -13,7 +13,7 @@ use templartorrent_engine::{
     EngineError,
     event::PeerId,
     peer::{PeerAction, PeerMessage},
-    session::{JobSpec, Session},
+    session::{JobSpec, Session, piece_working_set},
     worker::{PieceReader, PieceSink, PieceVerifier, SinkError},
 };
 
@@ -167,7 +167,8 @@ fn lease_round_trip_verifies_piece() {
     let peer = ready_peer(&mut session, id);
     let report = session.update(0, &AcceptAll);
     let requests = requests_of(&report);
-    assert_eq!(requests.len(), 1, "one block requested, got {requests:?}");
+    // Every 16 KiB piece is one block; all four pipeline in the first round.
+    assert_eq!(requests.len(), 4, "all pieces pipelined, got {requests:?}");
     let (piece, begin, length) = requests[0];
     // a.bin's pieces share rank and availability; the live picker's seeded
     // tie-break may start on any of them.
@@ -181,7 +182,13 @@ fn lease_round_trip_verifies_piece() {
     assert_eq!(report.dropped_stale, 0);
     let snap = session.snapshot();
     assert_eq!(snap.jobs[0].verified_bytes, 16384);
-    assert_eq!(snap.payload_budget_used, 0, "permit released after write");
+    // The written piece's permit is gone; the three still-pipelined pieces
+    // keep exactly their working sets reserved.
+    assert_eq!(
+        snap.payload_budget_used,
+        2 * piece_working_set(16384).unwrap() + piece_working_set(848).unwrap(),
+        "permit released after write"
+    );
 }
 
 #[test]
@@ -474,7 +481,8 @@ fn duplicate_and_invalid_blocks_are_dropped() {
     let id = session.add(spec()).unwrap();
     let peer = ready_peer(&mut session, id);
     let report = session.update(0, &AcceptAll);
-    let (piece, begin, length) = requests_of(&report)[0];
+    let requests = requests_of(&report);
+    let (piece, begin, length) = requests[0];
     session
         .inject_block(id, peer, piece, begin, vec![7u8; length as usize])
         .unwrap();
@@ -483,13 +491,13 @@ fn duplicate_and_invalid_blocks_are_dropped() {
     session
         .inject_block(id, peer, piece, begin, vec![7u8; length as usize])
         .unwrap();
-    // Wrong length for a pending request: invalid.
+    // Wrong length for a still-pending request (the other pieces were
+    // pipelined in the first round): invalid.
     let report = session.update(0, &AcceptAll);
     let mut stale = report.dropped_stale;
-    let next = requests_of(&report);
-    assert!(!next.is_empty());
+    let next = requests[1];
     session
-        .inject_block(id, peer, next[0].0, next[0].1, vec![7u8; 1])
+        .inject_block(id, peer, next.0, next.1, vec![7u8; 1])
         .unwrap();
     let report = session.update(0, &AcceptAll);
     stale += report.dropped_stale;
@@ -502,7 +510,7 @@ fn lease_expiry_releases_dead_piece() {
     let id = session.add(spec()).unwrap();
     let peer = ready_peer(&mut session, id);
     let report = session.update(0, &AcceptAll);
-    assert_eq!(report.leases_issued, 1);
+    assert_eq!(report.leases_issued, 4, "one lease per small piece");
     // Peer goes silent: after the timeout the piece returns to the pool and
     // a later round leases it again.
     session.disconnect(id, peer).unwrap();

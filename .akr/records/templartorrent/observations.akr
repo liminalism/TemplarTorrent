@@ -315,7 +315,7 @@ record templartorrent.observation.complete-piece-status/7 : observation {
 
 record templartorrent.observation.complete-piece-status/8 : observation {
     title "Linux client with persistence, bucketed picker, optimistic unchoke and saved geometry; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22 evening, Linux x86_64/Rust 1.99.0, committed on master through 14adab1 plus the ui-state commit that follows. Since rev 6: the live picker uses a (rank, availability) bucket index 65x to 170x below the O(P) oracle pick with randomized oracle-equivalence tests; one optimistic upload slot rotates every 30 s inside the configured total; window size and inspector split persist across launches. Milestones for steps 2 to 5 (baselines and picker optimization), persistence and the two standalone work items are completed with evidence. 153 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings clean; release binary builds. Remaining boundaries: no throughput, RTT or reliability peer scoring (slots follow preference, rotation and connection order); no resume bitmap, so every launch rechecks from disk; download order inside one file is no longer ascending because the in-bucket tie-break is seeded; no large-piece-count end-to-end scenario, only microbench evidence for the picker; no headful interaction, clipboard paste, window-close save or Internet swarm test in evidence; ring 0.17.14 reaches the tree through rbit's unconditional reqwest/rustls dependency, recorded as open question ring-release-gate; Windows optional and untested; perf-results/ is gitignored and local.
         """
@@ -328,5 +328,23 @@ record templartorrent.observation.complete-piece-status/8 : observation {
         @templartorrent.evidence.picker-microbench,
         @templartorrent.evidence.picker-oracle-equivalence,
         @templartorrent.evidence.ui-state-gates
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/9 : observation {
+    title "Linux client with forked rbit (no ring), rate-ranked choking, multi-piece pipelining; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22 late, Linux x86_64/Rust 1.99.0, committed on master through 3ed3709 plus the rate-ranking and multi-lease commit that follows. Since rev 8: rbit 0.2.2 is forked in-tree with reqwest optional, so cargo tree finds no ring, rustls or reqwest; HTTP announces use an application-owned bounded transport and https trackers are refused with a visible reason; regular upload slots rank by preference then measured per-peer rate with a 10 s hold, one optimistic slot rotates every 30 s, and the Peers tab shows rates; the scheduler leases several small pieces per peer, taking a 2048-piece 32 MiB localhost scenario from 42.3 s to 5.3 s in release with the payload reservation peak at 1.03 MiB inside the 48 MiB budget. 158 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings clean; release binary builds. Remaining boundaries: no RTT or reliability scoring, only rates; no resume bitmap, so every launch rechecks from disk; https trackers unsupported until a reviewed pure-Rust TLS stack is chosen; webseed and UPnP unavailable; no headful interaction, clipboard paste, window-close save or Internet swarm test in evidence; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows optional and untested; perf-results/ is gitignored and local.
+        """
+    observed_at git:3ed370905442455c343eb05d181a71b5c8c657bf
+    method command
+    watches [ "crates/**", "integration/**", "vendor/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/8 ]
+    verified_by [
+        @templartorrent.evidence.announce-transport,
+        @templartorrent.evidence.multi-lease-before-after,
+        @templartorrent.evidence.native-audit-after-fork,
+        @templartorrent.evidence.rate-ranking
     ]
 }

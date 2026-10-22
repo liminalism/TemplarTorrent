@@ -51,6 +51,11 @@ const PREFERENCE_CAP: usize = 256;
 const AVOID_PIPELINE: usize = 2;
 /// How often the optimistic upload slot moves to another interested peer.
 const OPTIMISTIC_INTERVAL_S: u64 = 30;
+/// How often regular upload slots are re-ranked by measured rates. Between
+/// evaluations the previous order holds, which is the hysteresis against churn.
+const CHOKE_INTERVAL_S: u64 = 10;
+/// Per-peer payload rates are sampled over this window and blended 3:1.
+const RATE_WINDOW: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +100,10 @@ pub struct PeerStatus {
     pub remote_interested: bool,
     pub we_choke: bool,
     pub preference: PeerPreference,
+    /// Payload received from this peer, smoothed, bytes per second.
+    pub down_bps: u64,
+    /// Payload sent to this peer, smoothed, bytes per second.
+    pub up_bps: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +205,11 @@ struct Wire {
     uploads: VecDeque<(u32, u32, u32)>,
     uploading: bool,
     metadata_id: Option<u8>,
+    /// Payload bytes in the current rate window and the smoothed rates.
+    window_down: u64,
+    window_up: u64,
+    down_bps: u64,
+    up_bps: u64,
 }
 struct WireCommand {
     message: Message,
@@ -285,6 +299,10 @@ pub struct Driver {
     /// Elapsed seconds of the last rotation decision.
     optimistic_rotated_s: u64,
     optimistic_interval_s: u64,
+    /// Regular slot order from the last evaluation, and when it was made.
+    choke_order: Vec<PeerId>,
+    choke_evaluated_s: Option<u64>,
+    rate_sampled: Instant,
 }
 
 impl Driver {
@@ -315,7 +333,31 @@ impl Driver {
             optimistic: None,
             optimistic_rotated_s: 0,
             optimistic_interval_s: OPTIMISTIC_INTERVAL_S,
+            choke_order: Vec::new(),
+            choke_evaluated_s: None,
+            rate_sampled: Instant::now(),
         })
+    }
+
+    /// Fold the current window into each wire's smoothed rates once per
+    /// [`RATE_WINDOW`]. A quiet window decays the rate toward zero.
+    fn sample_rates(&mut self) {
+        let elapsed = self.rate_sampled.elapsed();
+        if elapsed < RATE_WINDOW {
+            return;
+        }
+        let millis = u64::try_from(elapsed.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        for wire in self.wires.values_mut() {
+            let down = wire.window_down.saturating_mul(1000) / millis;
+            let up = wire.window_up.saturating_mul(1000) / millis;
+            wire.down_bps = blend_rate(wire.down_bps, down);
+            wire.up_bps = blend_rate(wire.up_bps, up);
+            wire.window_down = 0;
+            wire.window_up = 0;
+        }
+        self.rate_sampled = Instant::now();
     }
 
     /// Rotation period of the optimistic upload slot; tests shorten it.
@@ -754,6 +796,10 @@ impl Driver {
                 uploads: VecDeque::new(),
                 uploading: false,
                 metadata_id: None,
+                window_down: 0,
+                window_up: 0,
+                down_bps: 0,
+                up_bps: 0,
             },
         );
         let pipeline = pipeline_for(self.peer_preference(id, source.address));
@@ -1003,6 +1049,7 @@ impl Driver {
                 let _ = self.session.uploaded(event.torrent, event.uploaded);
                 if let Some(wire) = self.wires.get_mut(&event.peer) {
                     wire.uploading = false;
+                    wire.window_up = wire.window_up.saturating_add(u64::from(event.uploaded));
                 }
             }
             if !self.wires.contains_key(&event.peer) {
@@ -1192,6 +1239,9 @@ impl Driver {
                 self.session.set_peer_choking(id, peer, true)
             }
             Message::Piece { index, begin, data } => {
+                if let Some(wire) = self.wires.get_mut(&peer) {
+                    wire.window_down = wire.window_down.saturating_add(data.len() as u64);
+                }
                 self.session
                     .inject_block(id, peer, index, begin, data.to_vec())
             }
@@ -1272,7 +1322,7 @@ impl Driver {
     /// choked, so a single slot rotates rather than a second appearing. The
     /// first interval after start runs on preference alone.
     fn upload_order(&mut self, rows: &Snapshot) -> Vec<PeerId> {
-        let ordered = self.peers_by_preference();
+        let ordered = self.regular_order(rows);
         let slots = self.limits.upload_peer_slots;
         if slots == 0 {
             self.optimistic = None;
@@ -1450,6 +1500,7 @@ impl Driver {
             let _ = self.session.uploaded(event.torrent, event.uploaded);
             if let Some(wire) = self.wires.get_mut(&event.peer) {
                 wire.uploading = false;
+                wire.window_up = wire.window_up.saturating_add(u64::from(event.uploaded));
             }
         }
         if !self.wires.contains_key(&event.peer) {
@@ -1554,6 +1605,7 @@ impl Driver {
     /// This method never manufactures progress and has no dependency on rendering.
     pub async fn step(&mut self, wait: Duration) -> Result<DriverReport> {
         let mut report = DriverReport::default();
+        self.sample_rates();
         self.accept_incoming().await;
         let failures = std::mem::take(&mut self.pending_failures);
         for (peer, error) in failures {
@@ -1616,6 +1668,8 @@ impl Driver {
                 remote_interested: wire.interested,
                 we_choke: wire.choked,
                 preference: self.peer_preference(id, wire.source.address),
+                down_bps: wire.down_bps,
+                up_bps: wire.up_bps,
             })
             .collect();
         rows.sort_by_key(|row| row.address);
@@ -1867,6 +1921,9 @@ impl Driver {
                 job.sources.retain(|source| source.address.ip() != ip);
             }
         }
+        // A manual preference applies now; the rate-ranking hysteresis must
+        // not delay it.
+        self.choke_evaluated_s = None;
         let peers: Vec<_> = self
             .wires
             .iter()
@@ -1900,6 +1957,52 @@ impl Driver {
             .iter()
             .find(|(_, wire)| wire.torrent == id && wire.source.address == address)
             .and_then(|(peer, _)| self.session.peer_pipeline(id, *peer).ok())
+    }
+
+    /// Regular slot order: preference first, then the peer that currently
+    /// gives us the most verified payload (or, for a seeding job, takes the
+    /// most), then connection order. Re-ranked every [`CHOKE_INTERVAL_S`];
+    /// peers that arrived since are appended, so an order never churns on a
+    /// single fast step.
+    fn regular_order(&mut self, rows: &Snapshot) -> Vec<PeerId> {
+        let now = self.elapsed_s();
+        let due = self
+            .choke_evaluated_s
+            .is_none_or(|at| now.saturating_sub(at) >= CHOKE_INTERVAL_S);
+        if due {
+            let mut entries: Vec<(u8, u64, u64, PeerId)> = self
+                .wires
+                .iter()
+                .map(|(peer, wire)| {
+                    let seeding = rows
+                        .jobs
+                        .iter()
+                        .any(|job| job.id == wire.torrent && job.state == JobState::Seeding);
+                    let score = if seeding { wire.up_bps } else { wire.down_bps };
+                    (
+                        preference_rank(self.peer_preference(wire.torrent, wire.source.address)),
+                        score,
+                        peer.0,
+                        *peer,
+                    )
+                })
+                .collect();
+            self.choke_order = rank_peers(&mut entries);
+            self.choke_evaluated_s = Some(now);
+            return self.choke_order.clone();
+        }
+        self.choke_order
+            .retain(|peer| self.wires.contains_key(peer));
+        let mut extra: Vec<PeerId> = self
+            .wires
+            .keys()
+            .copied()
+            .filter(|peer| !self.choke_order.contains(peer))
+            .collect();
+        extra.sort_unstable_by_key(|peer| peer.0);
+        let mut order = self.choke_order.clone();
+        order.extend(extra);
+        order
     }
 
     /// Connected peers ordered Prefer, Normal, Avoid, then by connection id.
@@ -2386,6 +2489,22 @@ fn pipeline_for(preference: PeerPreference) -> usize {
     }
 }
 
+/// Preference rank ascending, then measured score descending, then
+/// connection order. Pure so the policy is testable without a clock.
+fn rank_peers(entries: &mut [(u8, u64, u64, PeerId)]) -> Vec<PeerId> {
+    entries
+        .sort_unstable_by_key(|(rank, score, order, _)| (*rank, std::cmp::Reverse(*score), *order));
+    entries.iter().map(|(_, _, _, peer)| *peer).collect()
+}
+
+fn blend_rate(previous: u64, instant: u64) -> u64 {
+    if previous == 0 {
+        instant
+    } else {
+        (previous.saturating_mul(3).saturating_add(instant)) / 4
+    }
+}
+
 fn preference_rank(preference: PeerPreference) -> u8 {
     match preference {
         PeerPreference::Prefer => 0,
@@ -2484,5 +2603,29 @@ async fn peer_actor(
                 uploaded: 0,
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn regular_slots_rank_preference_then_rate_then_arrival() {
+        let peer = |n: u64| PeerId(n);
+        let mut entries = vec![
+            (1, 50_000, 1, peer(1)),
+            (0, 10, 2, peer(2)),
+            (1, 90_000, 3, peer(3)),
+            (2, 999_999, 4, peer(4)),
+            (1, 90_000, 0, peer(0)),
+        ];
+        assert_eq!(
+            rank_peers(&mut entries),
+            vec![peer(2), peer(0), peer(3), peer(1), peer(4)]
+        );
+        assert_eq!(blend_rate(0, 400), 400);
+        assert_eq!(blend_rate(400, 0), 300);
+        assert_eq!(blend_rate(1_000, 2_000), 1_250);
     }
 }

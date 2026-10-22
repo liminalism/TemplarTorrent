@@ -1197,36 +1197,50 @@ impl Session {
         if !productive {
             return;
         }
-        // Re-offer the peer's outstanding lease, else pick a fresh piece.
-        for _ in 0..self.jobs[index]
-            .peers
-            .get(&peer)
-            .map(|actor| actor.free_slots())
-            .unwrap_or(0)
-        {
-            let torrent = self.jobs[index].id;
-            let lease = self.jobs[index]
-                .coordinator
-                .lease_of(peer)
-                .cloned()
-                .or_else(
-                    || match self.jobs[index].coordinator.pick_for(peer, now_ns) {
-                        Ok(lease) => {
-                            if lease.is_some() {
-                                report.leases_issued += 1;
-                            }
-                            lease
-                        }
-                        Err(error) => {
-                            report.errors.push(error);
-                            None
-                        }
-                    },
-                );
-            let Some(lease) = lease else {
-                break;
+        // Re-offer every outstanding lease of this peer, then lease further
+        // pieces while pipeline slots remain. Small pieces therefore pipeline
+        // across pieces instead of one block per round trip; a large piece
+        // already fills the pipeline, so nothing changes for it. Bounds stay
+        // the pipeline cap, the global active-piece cap and the payload budget.
+        let torrent = self.jobs[index].id;
+        for lease in self.jobs[index].coordinator.leases_of(peer) {
+            if self.free_slots(index, peer) == 0 {
+                return;
+            }
+            if self.verifying.contains(&(torrent.0, lease.piece)) {
+                continue;
+            }
+            let actions = self.jobs[index]
+                .peers
+                .get_mut(&peer)
+                .map(|actor| {
+                    actor.request_blocks(&lease, |length| {
+                        self.arbiter.reserve_down(u64::from(length), now_ns)
+                    })
+                })
+                .unwrap_or_default();
+            report
+                .outbox
+                .extend(actions.into_iter().map(|action| OutboxEntry {
+                    torrent,
+                    peer,
+                    action,
+                }));
+        }
+        while self.free_slots(index, peer) > 0 {
+            let lease = match self.jobs[index].coordinator.pick_for(peer, now_ns) {
+                Ok(Some(lease)) => {
+                    report.leases_issued += 1;
+                    lease
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    report.errors.push(error);
+                    break;
+                }
             };
             if self.verifying.contains(&(torrent.0, lease.piece)) {
+                self.jobs[index].coordinator.release_piece(lease.piece);
                 break;
             }
             let key = (torrent.0, lease.piece);
@@ -1267,8 +1281,8 @@ impl Session {
                 })
                 .unwrap_or_default();
             if actions.is_empty() {
-                // Release only when nothing for this piece is still flying;
-                // otherwise the lease stays out until its blocks land.
+                // The rate budget refused the first block: release only when
+                // nothing for this piece is flying and nothing has landed.
                 let flying = self.jobs[index]
                     .peers
                     .get(&peer)
@@ -1292,6 +1306,14 @@ impl Session {
                     action,
                 }));
         }
+    }
+
+    fn free_slots(&self, index: usize, peer: PeerId) -> usize {
+        self.jobs[index]
+            .peers
+            .get(&peer)
+            .map(|actor| actor.free_slots())
+            .unwrap_or(0)
     }
 
     fn apply_outcome(&mut self, outcome: WorkOutcome, report: &mut SessionReport) {

@@ -135,7 +135,13 @@ fn multi_block_pipeline_refills_out_of_order_with_short_tail_and_file_promotion(
         [1, 2]
     );
     assert_eq!(seen.len(), 33);
-    assert_eq!(peak, piece_working_set(LENGTH as usize).unwrap());
+    // The next piece is leased while the current one's last blocks land, so
+    // at most two piece working sets are reserved at once, never more.
+    let working_set = piece_working_set(LENGTH as usize).unwrap();
+    assert!(
+        peak >= working_set && peak <= 2 * working_set,
+        "peak {peak} outside one to two working sets of {working_set}"
+    );
     let snap = session.snapshot();
     assert_eq!(snap.jobs[0].verified_bytes, 2 * LENGTH + 37);
     assert_eq!(snap.jobs[0].state, JobState::Seeding);
