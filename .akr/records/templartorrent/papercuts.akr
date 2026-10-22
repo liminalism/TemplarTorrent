@@ -46,6 +46,18 @@ record templartorrent.papercut.capturing-the-templartorrent-window-on-display/1 
     created_at 2026-10-17
 }
 
+record templartorrent.papercut.committing-the-resume-bitmap-failed-with-author/1 : papercut {
+    title "Committing the resume bitmap failed with \"Author identity unknown\"…"
+    state verified
+    statement """
+        Committing the resume bitmap failed with "Author identity unknown" because this repository has no local user.name or user.email, and the environment did not set them either. History is entirely dk <dkoepke@protonmail.com>. The commit went through by passing those as GIT_AUTHOR_* and GIT_COMMITTER_* for that command, without writing git config.
+        """
+    observed_at git:f1d59c5a23138dd76b7509100baf43a2ed10292e
+    about "git"
+    author "grok"
+    created_at 2026-10-22
+}
+
 record templartorrent.papercut.in-integration-rbit-adapter-tests-driver-rs-the/1 : papercut {
     title "In integration/rbit-adapter/tests/driver.rs the `hold` fixture fault…"
     state verified

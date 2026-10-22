@@ -333,7 +333,7 @@ record templartorrent.observation.complete-piece-status/8 : observation {
 
 record templartorrent.observation.complete-piece-status/9 : observation {
     title "Linux client with forked rbit (no ring), rate-ranked choking, multi-piece pipelining; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22 late, Linux x86_64/Rust 1.99.0, committed on master through 3ed3709 plus the rate-ranking and multi-lease commit that follows. Since rev 8: rbit 0.2.2 is forked in-tree with reqwest optional, so cargo tree finds no ring, rustls or reqwest; HTTP announces use an application-owned bounded transport and https trackers are refused with a visible reason; regular upload slots rank by preference then measured per-peer rate with a 10 s hold, one optimistic slot rotates every 30 s, and the Peers tab shows rates; the scheduler leases several small pieces per peer, taking a 2048-piece 32 MiB localhost scenario from 42.3 s to 5.3 s in release with the payload reservation peak at 1.03 MiB inside the 48 MiB budget. 158 workspace tests and 10 preview tests pass; formatting and Clippy with denied warnings clean; release binary builds. Remaining boundaries: no RTT or reliability scoring, only rates; no resume bitmap, so every launch rechecks from disk; https trackers unsupported until a reviewed pure-Rust TLS stack is chosen; webseed and UPnP unavailable; no headful interaction, clipboard paste, window-close save or Internet swarm test in evidence; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows optional and untested; perf-results/ is gitignored and local.
         """
@@ -346,5 +346,25 @@ record templartorrent.observation.complete-piece-status/9 : observation {
         @templartorrent.evidence.multi-lease-before-after,
         @templartorrent.evidence.native-audit-after-fork,
         @templartorrent.evidence.rate-ranking
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/10 : observation {
+    title "Linux client with a durability-gated resume bitmap; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22, Linux x86_64 Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, committed on master at f1d59c5. A schema-versioned resume bitmap (templartorrent-resume 1) sits beside the job record. A set bit is adopted without hashing only when the record carries a durability barrier and every file that piece spans still matches the device, inode, size and mtime captured after sync_all. A changed file is hashed. A missing, barrier-less or malformed bitmap trusts nothing and leaves a visible note. The bitmap is written on command save, at most every 10 seconds when verified bytes change, and on worker shutdown before jobs are dropped. 169 workspace tests passed on that commit. Formatting and Clippy with denied warnings were clean on storage, engine, the rbit adapter and the application. Preview tests and the release binary were not re-run. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; no RTT or reliability scoring, only rates; https trackers stay refused until a reviewed pure-Rust TLS stack is chosen; webseed and UPnP unavailable; no headful interaction or clipboard paste in evidence; window close persists through the worker shutdown flush, with no headful close path in evidence; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows optional and untested.
+        """
+    observed_at git:f1d59c5a23138dd76b7509100baf43a2ed10292e
+    method command
+    watches [ "crates/**", "integration/**", "vendor/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/9 ]
+    verified_by [
+        @templartorrent.evidence.announce-transport,
+        @templartorrent.evidence.multi-lease-before-after,
+        @templartorrent.evidence.native-audit-after-fork,
+        @templartorrent.evidence.rate-ranking,
+        @templartorrent.evidence.resume-bitmap,
+        @templartorrent.evidence.resume-bitmap-gates
     ]
 }

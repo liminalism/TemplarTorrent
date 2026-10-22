@@ -580,6 +580,30 @@ record templartorrent.evidence.rbit-driver-regressions/1 : evidence {
         """
 }
 
+record templartorrent.evidence.resume-bitmap/1 : evidence {
+    title "Resume bitmap trusts unchanged files and rechecks the rest"
+    state verified
+    result pass
+    method command
+    observed_at git:f1d59c5a23138dd76b7509100baf43a2ed10292e
+    command "cargo test --offline --workspace -- --test-threads=8"
+    summary """
+        Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, commit f1d59c5. cargo fmt on storage, engine, the rbit adapter and the application, then cargo test --offline --workspace -- --test-threads=8: 169 tests passed, 0 failed. That includes storage durable_identity refusing a replaced file, engine adopt_trusted skipping reads of trusted pieces and skipping a leased piece, five resume unit tests (unchanged files trusted, a changed file rechecked, missing barrier and short bitfield rejected, spare high bits and a file-count mismatch rejected, LSB packing), driver_resume_bitmap_trusts_unchanged_files_only (trusted 4, then trusted 1 and checked 3 after an Episode01 mtime change, then failed 1 after an Episode02 byte flip), the persist round-trip with a missing barrier loaded as untrusted, and the worker shutdown test that writes barrier 1 and on the next launch refuses barrier 0 with a visible note while the job stays complete. A following cargo test -p templartorrent-rbit-adapter --offline -- --test-threads=8 passed the adapter tests again, including the 26 driver tests. Preview tests and the release binary were not run.
+        """
+}
+
+record templartorrent.evidence.resume-bitmap-gates/1 : evidence {
+    title "Clippy denied warnings clean on the resume-bitmap packages"
+    state verified
+    result pass
+    method command
+    observed_at git:f1d59c5a23138dd76b7509100baf43a2ed10292e
+    command "cargo clippy -p templartorrent-storage -p templartorrent-engine -p templartorrent-rbit-adapter -p templartorrent --all-targets --offline -- -D warnings"
+    summary """
+        Ubuntu 26.04.1, rustc 1.99.0, same tree as f1d59c5. After two manual modulo checks were replaced with is_multiple_of, cargo clippy on storage, engine, the rbit adapter and the application, all targets, offline, with warnings denied, finished with no diagnostics.
+        """
+}
+
 record templartorrent.evidence.resume-recheck-tests/1 : evidence {
     title "Resume recheck: 17/17 engine tests pass"
     state verified

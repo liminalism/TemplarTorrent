@@ -311,6 +311,42 @@ record templartorrent.work.rbit-driver/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.resume-bitmap/1 : work {
+    title "Durable resume bitmap with file identity before skipping a recheck"
+    state completed
+    scope [
+        path "crates/templartorrent-engine/**",
+        path "crates/templartorrent-storage/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/**"
+    ]
+    intent """
+        Persist a schema-versioned resume bitmap of pieces whose bytes were data-synced before the bit was recorded, together with each file's device, inode, size and mtime. On the next launch, adopt a bit without hashing only when every file that piece spans still has that identity and the record carries a durability barrier. A missing, torn, or barrier-less record, or a changed file, forces a hash of just the uncertain pieces. Flush the bitmap in batches (command save, at most every 10 seconds when verified bytes changed, and worker shutdown), never once per block.
+        """
+    note """
+        HTTPS trackers stay refused. Choosing a pure-Rust TLS stack is a separate reviewed decision and is not part of this work.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Clippy with denied warnings is clean for storage, engine, the rbit adapter and the application, all targets, offline.
+                """
+            method command
+            command "cargo clippy -p templartorrent-storage -p templartorrent-engine -p templartorrent-rbit-adapter -p templartorrent --all-targets --offline -- -D warnings"
+            verified_by [ @templartorrent.evidence.resume-bitmap-gates/1 ]
+        }
+        check identity-trust {
+            statement """
+                A set bit is adopted without hashing only when the resume record has a durability barrier and every file that piece spans still matches device, inode, size and mtime. A changed file is hashed, a missing barrier or a malformed record trusts nothing and says why, and worker shutdown writes a bitmap the next launch can refuse.
+                """
+            method command
+            command "cargo test --offline --workspace -- --test-threads=8"
+            verified_by [ @templartorrent.evidence.resume-bitmap/1 ]
+        }
+    }
+    derived_from [ @templartorrent.observation.complete-piece-status ]
+}
+
 record templartorrent.work.resume-recheck/1 : work {
     title "Resume recheck without rewrite"
     state completed
