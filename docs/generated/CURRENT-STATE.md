@@ -46,6 +46,8 @@ The library can be considered separately from its UI, but replacing rbit conflic
 with AGENTS.md's explicit backend constraint. Retained rbit and did not add a
 second backend, external torrent process or another GUI stack.
 
+> **Stale** — `watches "AGENTS.md"` was matched by `cb822df2`, which touched `AGENTS.md`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#rbit-orchestration-boundary-and-librqbit-session-alternative).
+
 ### Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries
 
 `verified` · `@templartorrent.observation.complete-piece-status/5`
@@ -53,6 +55,8 @@ second backend, external torrent process or another GUI stack.
 2026-10-22 uncommitted Linux x86_64/Rust 1.99.0 tree based on 72b01427. AGENTS.md steps 1 to 3 are completed milestones. Beyond the 2026-10-15 seeding state, the tree now holds a production crate `integration/templartorrent` (binary templartorrent): a worker thread owns the rbit Driver on a current-thread runtime, publishes coalesced SessionView snapshots with reliable per-sequence acks, and the PixelKit window has Add (magnet or .torrent, folder browser, space check, public bootstrap flag), Limits, Remove with an unchecked delete-data checkbox, Files order/wanted controls, Trackers with cooldown-gated reannounce, and a Peers tab. Owner-only Unix-socket single-instance activation forwards magnets; peer country comes only from a user-supplied MMDB; font is auto-detected. The storage crate deletes through openat/unlinkat with O_NOFOLLOW, inode identity from the still-open handle, hardlink refusal and no root removal. Tracker discovery, periodic refresh and public augmentation after metadata proves a public torrent exist in the Driver. Local peer preference is implemented today: a per-job table keyed by peer IP where Block closes and refuses the address, Avoid narrows the request pipeline to two blocks, and Prefer is retained first and unchoked first. 138 root and adapter tests, 21 of them in the production crate, and 10 preview tests passed; formatting and Clippy with denied warnings passed in all three workspaces; a release binary built. Evidence and hashes are in perf-results/2026-10-22-peer-preference/. Remaining boundaries: no automatic peer scoring or optimistic-unchoke rotation; no session persistence, so jobs and preferences are lost on restart; no forced-crash restart test; no bounded global file-handle cache beyond the 128 files per job cap; no headful window run, Linux clipboard paste check or Internet swarm in evidence; rbit can still allocate a 16 MiB receive frame before application checks; ring 0.17.14 still reaches the tree through rbit/reqwest/rustls so the native-source release gate is open; Windows is optional and untested.
 
 **supersedes** `@templartorrent.observation.complete-piece-status/4` · **verified_by** `@templartorrent.evidence.peer-preference-client/1`, `@templartorrent.evidence.peer-preference-driver/1`, `@templartorrent.evidence.peer-preference-gates/1`, `@templartorrent.evidence.production-linux-client/1`
+
+> **Stale** — `watches "crates/**"` was matched by `cb822df2`, which touched `crates/templartorrent-core/src/budget.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#linux-production-client-with-driver-worker-protected-deletion-and-local-peer-preference-remaining-boundaries).
 
 ## Assessments
 

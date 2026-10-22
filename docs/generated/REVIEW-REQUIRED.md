@@ -7,9 +7,19 @@
 
 What should not be trusted without re-checking: records the build flagged `stale` or `at_risk`. Neither flag means a record is wrong (D-003); both mean look at it. This view is generated on every successful build, including one that exits 0 with a long queue (D-024). An empty file on an active project is more often a sign the `watches` globs are wrong than a sign the knowledge is perfect.
 
-## Stale (0)
+## Stale (2)
 
-_(none)_
+### Rbit orchestration boundary and librqbit session alternative
+
+`verified` · `@templartorrent.observation.backend-session-comparison/1` · observation · **stale** · [Rbit orchestration boundary and librqbit session alternative](CURRENT-STATE.md#rbit-orchestration-boundary-and-librqbit-session-alternative)
+
+**Cause** — `watches "AGENTS.md"` was matched by `cb822df2`, which touched `AGENTS.md`.
+
+### Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries
+
+`verified` · `@templartorrent.observation.complete-piece-status/5` · observation · **stale** · [Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries](CURRENT-STATE.md#linux-production-client-with-driver-worker-protected-deletion-and-local-peer-preference-remaining-boundaries)
+
+**Cause** — `watches "crates/**"` was matched by `cb822df2`, which touched `crates/templartorrent-core/src/budget.rs`.
 
 ## At risk (0)
 
