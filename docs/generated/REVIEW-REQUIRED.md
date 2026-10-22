@@ -9,17 +9,17 @@ What should not be trusted without re-checking: records the build flagged `stale
 
 ## Stale (2)
 
+### Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries
+
+`verified` · `@templartorrent.observation.complete-piece-status/5` · observation · **stale** · [Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries](CURRENT-STATE.md#linux-production-client-with-driver-worker-protected-deletion-and-local-peer-preference-remaining-boundaries)
+
+**Cause** — `watches "crates/**"` was matched by `44a6e7e7`, which touched `crates/templartorrent-engine/src/session.rs`.
+
 ### Rbit orchestration boundary and librqbit session alternative
 
 `verified` · `@templartorrent.observation.backend-session-comparison/1` · observation · **stale** · [Rbit orchestration boundary and librqbit session alternative](CURRENT-STATE.md#rbit-orchestration-boundary-and-librqbit-session-alternative)
 
 **Cause** — `watches "AGENTS.md"` was matched by `cb822df2`, which touched `AGENTS.md`.
-
-### Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries
-
-`verified` · `@templartorrent.observation.complete-piece-status/5` · observation · **stale** · [Linux production client with Driver worker, protected deletion and local peer preference; remaining boundaries](CURRENT-STATE.md#linux-production-client-with-driver-worker-protected-deletion-and-local-peer-preference-remaining-boundaries)
-
-**Cause** — `watches "crates/**"` was matched by `cb822df2`, which touched `crates/templartorrent-core/src/budget.rs`.
 
 ## At risk (0)
 

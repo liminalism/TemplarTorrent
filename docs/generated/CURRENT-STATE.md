@@ -56,7 +56,7 @@ second backend, external torrent process or another GUI stack.
 
 **supersedes** `@templartorrent.observation.complete-piece-status/4` · **verified_by** `@templartorrent.evidence.peer-preference-client/1`, `@templartorrent.evidence.peer-preference-driver/1`, `@templartorrent.evidence.peer-preference-gates/1`, `@templartorrent.evidence.production-linux-client/1`
 
-> **Stale** — `watches "crates/**"` was matched by `cb822df2`, which touched `crates/templartorrent-core/src/budget.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#linux-production-client-with-driver-worker-protected-deletion-and-local-peer-preference-remaining-boundaries).
+> **Stale** — `watches "crates/**"` was matched by `44a6e7e7`, which touched `crates/templartorrent-engine/src/session.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#linux-production-client-with-driver-worker-protected-deletion-and-local-peer-preference-remaining-boundaries).
 
 ## Assessments
 
