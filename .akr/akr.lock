@@ -5,8 +5,7 @@ build {
     tool "akr 0.5.2"
     grammar "0.1"
     vocabulary "0.2"
-    commit git:cb822df2ae21ce9f5fed50e680de3bab5f3b8c3c
-    source_graph "sha256:0bfaaae170db8381e7f803a37a7a2894a38ed7aebde0755d00210c8558a14dbd"
+    source_graph "sha256:5daa0cc24e90ea304f444ec93473775e93dcfd90bbd82b5d88700c81241cf2ab"
 }
 
 source ".akr/project.akr" {
@@ -15,12 +14,12 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/templartorrent/evidence.akr" {
-    hash "sha256:baf87e8683b2df77600de1bdfb8a131485a470fd7ca41579f2d1e16322dd277e"
-    records 41
+    hash "sha256:b58fb0c67ec87cdfad295d6794ed0fb2e8d55552d649ca319f38d63440ce2458"
+    records 45
 }
 
 source ".akr/records/templartorrent/milestones.akr" {
-    hash "sha256:f834dd2c257d3b722ff63daf485af5984d0d3d2976067ff0d2fff5ff67e14513"
+    hash "sha256:86c51c671d5a57ca2eeced6088d3fd1905b4c57ee8e6b8ad551df75f65ddf9d3"
     records 3
 }
 
@@ -102,7 +101,7 @@ resolution @templartorrent.work.file-storage/1 {
 resolution @templartorrent.work.peer-preference/1 {
     slot part_of
     to @templartorrent.milestone.safety-and-peer-policy/1
-    hash "sha256:a7970863ea3b06b2a013f6026d6e648ac46a3ad8743cff8f68f1ce0a9f730c15"
+    hash "sha256:c12cba20929909c69e98cea361e63b8c57efd6d184ef4f5dfb223fcd571072c7"
 }
 
 resolution @templartorrent.work.rbit-driver/1 {
@@ -376,6 +375,26 @@ seal @templartorrent.evidence.step2a-workspace-gates/1 {
     hash "sha256:ab5bdd36097d1961aee7dbd43fb7b4e00d7a3f62770df66ac0444416bc82a1a8"
 }
 
+seal @templartorrent.evidence.step4-capability-gates/1 {
+    state verified
+    hash "sha256:e0b3795bf3edd6b00ef71171192b0b1639be6e775367c8eb60051a28821aae83"
+}
+
+seal @templartorrent.evidence.step4-forced-crash-restart/1 {
+    state verified
+    hash "sha256:6f48bfaaf81da9867a68df2956ca81ac7236246fd020c0fda983ba7c72a5cc55"
+}
+
+seal @templartorrent.evidence.step4-offline-country-client/1 {
+    state verified
+    hash "sha256:1caad669bf26341f29f7fcc7c92ed3ff56190d82845be0fa14d1e676b26232f8"
+}
+
+seal @templartorrent.evidence.step4-protected-deletion/1 {
+    state verified
+    hash "sha256:0c911d8bed0e939a62a2ad46e5da40812ea7caac172c8fc6c016b751bfbe47c2"
+}
+
 seal @templartorrent.milestone.local-v1-transfer/1 {
     state completed
     hash "sha256:fb515082392c7afb8982a4ce5baceed8d4d22e89506a2f698338c2895dba13fe"
@@ -387,8 +406,8 @@ seal @templartorrent.milestone.native-app-wiring/1 {
 }
 
 seal @templartorrent.milestone.safety-and-peer-policy/1 {
-    state active
-    hash "sha256:a7970863ea3b06b2a013f6026d6e648ac46a3ad8743cff8f68f1ce0a9f730c15"
+    state completed
+    hash "sha256:c12cba20929909c69e98cea361e63b8c57efd6d184ef4f5dfb223fcd571072c7"
 }
 
 seal @templartorrent.observation.backend-session-comparison/1 {

@@ -67,20 +67,31 @@ struct Fixture {
 }
 impl Fixture {
     fn new(salt: u8, private: bool) -> Arc<Self> {
+        Self::with_version(salt, private, TorrentVersion::V1)
+    }
+    fn torrent_bytes(salt: u8, private: bool, version: TorrentVersion) -> (Vec<u8>, Vec<u8>) {
         let data: Vec<_> = (0..3 * PIECE + 73)
             .map(|i| ((i / 16384) as u8).wrapping_mul(23) ^ (i as u8).wrapping_add(salt))
             .collect();
         let torrent = TorrentBuilder::new("owned-series")
-            .version(TorrentVersion::V1)
+            .version(version)
             .private(private)
             .piece_length(PIECE as u64)
             .add_file("Episode02.bin", data[..PIECE].to_vec())
             .add_file("Episode01.bin", data[PIECE..].to_vec())
             .build()
             .unwrap();
+        (data, torrent)
+    }
+    /// A hybrid fixture keeps its v1 info hash so a magnet resolves to it; the
+    /// driver must then reject the metadata rather than treating it as v1.
+    fn with_version(salt: u8, private: bool, version: TorrentVersion) -> Arc<Self> {
+        let (data, torrent) = Self::torrent_bytes(salt, private, version);
         let meta = Metainfo::from_bytes(&torrent).unwrap();
-        let InfoHash::V1(hash) = meta.info_hash else {
-            panic!("fixture must be v1");
+        let hash = match meta.info_hash {
+            InfoHash::V1(hash) => hash,
+            InfoHash::Hybrid { v1, .. } => *v1.as_bytes(),
+            InfoHash::V2(_) => panic!("fixture needs a v1 info hash"),
         };
         Arc::new(Self { data, meta, hash })
     }
@@ -114,6 +125,8 @@ struct Fault {
     hold: bool,
     /// Record every request and keep reading, but never send a block.
     silent: bool,
+    /// Sleep before answering each request so a transfer stays observable.
+    delay_ms: u64,
     control_flood: bool,
     hold_metadata: bool,
     disconnect_after: Option<usize>,
@@ -292,6 +305,9 @@ async fn serve(conn: &mut PeerConnection, fixture: &Fixture, stats: &Stats, faul
                 assert!(end <= fixture.data.len() && begin as usize + length as usize <= PIECE);
                 if fault.silent {
                     continue;
+                }
+                if fault.delay_ms != 0 {
+                    tokio::time::sleep(Duration::from_millis(fault.delay_ms)).await;
                 }
                 if fault.hold {
                     std::future::pending::<()>().await;
@@ -1604,6 +1620,202 @@ async fn driver_peer_preference_orders_upload_slots() {
         seed.shutdown().await;
         a.close().await;
         b.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_rejects_v2_and_hybrid_before_any_storage_exists() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        for version in [TorrentVersion::V2, TorrentVersion::Hybrid] {
+            let (_, bytes) = Fixture::torrent_bytes(61, false, version);
+            assert_eq!(
+                Driver::magnet_from_torrent_bytes(&bytes).unwrap_err().0,
+                "v2/hybrid torrents are not supported"
+            );
+        }
+        let mut driver = driver();
+        let v2_magnet = format!("magnet:?xt=urn:btmh:1220{}", "ab".repeat(32));
+        let unused = PeerSource {
+            address: "127.0.0.1:1".parse().unwrap(),
+            origin: PeerOrigin::OriginalTracker(1),
+        };
+        assert_eq!(
+            driver
+                .add_magnet(
+                    &v2_magnet,
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[unused],
+                    false
+                )
+                .await
+                .unwrap_err()
+                .0,
+            "v2/hybrid magnets are not supported"
+        );
+        // A hybrid torrent carries a v1 info hash, so BEP-9 resolution succeeds
+        // and the gate must fire on the metadata itself.
+        let hybrid = Fixture::with_version(67, false, TorrentVersion::Hybrid);
+        assert!(hybrid.meta.is_hybrid());
+        let server = Server::start(hybrid.clone(), Fault::default()).await;
+        assert_eq!(
+            driver
+                .add_magnet(
+                    &hybrid.magnet(),
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[server.source],
+                    false
+                )
+                .await
+                .unwrap_err()
+                .0,
+            "v2/hybrid torrents are not supported by this driver"
+        );
+        assert!(
+            server.stats.metadata.load(Ordering::SeqCst) > 0,
+            "metadata was fetched and then rejected"
+        );
+        assert!(
+            !root.job().exists(),
+            "no destination may exist after rejection"
+        );
+        assert!(driver.snapshot().jobs.is_empty());
+        assert_eq!(driver.connection_count(), 0);
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        assert_eq!(driver.payload_stats().reserved_bytes, 0);
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Entry point for the forced-crash test's child process. It only acts when
+/// the parent sets `TEMPLARTORRENT_CRASH_CHILD`; otherwise it is a no-op.
+#[test]
+fn crash_child_entry_point() {
+    if std::env::var_os("TEMPLARTORRENT_CRASH_CHILD").is_none() {
+        return;
+    }
+    let magnet = std::env::var("TEMPLARTORRENT_CRASH_MAGNET").unwrap();
+    let destination = PathBuf::from(std::env::var_os("TEMPLARTORRENT_CRASH_DEST").unwrap());
+    let peer: std::net::SocketAddr = std::env::var("TEMPLARTORRENT_CRASH_PEER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut child = driver();
+        child
+            .add_magnet(
+                &magnet,
+                &destination,
+                ExistingData::Refuse,
+                &[PeerSource {
+                    address: peer,
+                    origin: PeerOrigin::OriginalTracker(1),
+                }],
+                false,
+            )
+            .await
+            .unwrap();
+        // Run until the parent kills this process; never shut down cleanly.
+        loop {
+            child.step(Duration::from_millis(10)).await.unwrap();
+        }
+    });
+}
+
+#[tokio::test]
+async fn driver_restart_after_forced_process_kill_rechecks_and_completes() {
+    timeout(Duration::from_secs(60), async {
+        let root = Root::new();
+        let fixture = Fixture::new(71, false);
+        let server = Server::start(
+            fixture.clone(),
+            Fault {
+                delay_ms: 40,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_child_entry_point", "--test-threads=1"])
+            .env("TEMPLARTORRENT_CRASH_CHILD", "1")
+            .env("TEMPLARTORRENT_CRASH_MAGNET", fixture.magnet())
+            .env("TEMPLARTORRENT_CRASH_DEST", root.job())
+            .env(
+                "TEMPLARTORRENT_CRASH_PEER",
+                server.source.address.to_string(),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // One lease per peer: the request for a later piece is only issued
+        // after the previous piece verified and reached disk with a data sync.
+        // Nine served requests therefore mean two durable pieces at least.
+        let start = Instant::now();
+        loop {
+            let served = server.stats.requests.lock().unwrap().len();
+            if served >= 9 {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("child exited early with {status}");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(45),
+                "child never transferred"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "SIGKILL must not look like a clean exit");
+        let served_before_kill = server.stats.requests.lock().unwrap().len();
+        assert!(
+            (9..13).contains(&served_before_kill),
+            "the child must die mid-transfer, served {served_before_kill} of 13"
+        );
+        server.stats.requests.lock().unwrap().clear();
+        assert!(
+            root.job().exists(),
+            "the killed process left its destination"
+        );
+        let mut restarted = driver();
+        restarted
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Recheck,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        let adopted = restarted.snapshot().jobs[0].verified_bytes;
+        assert!(
+            adopted >= PIECE as u64,
+            "recheck must adopt at least one durable piece, got {adopted}"
+        );
+        complete(&mut restarted).await;
+        let after = server.stats.requests.lock().unwrap().len();
+        assert!(
+            after <= 13 - 4,
+            "restart must request only missing pieces: {after} after {served_before_kill}"
+        );
+        assert!(after + served_before_kill >= 13);
+        fixture.assert_files(&root.job());
+        restarted.shutdown().await;
+        server.close().await;
     })
     .await
     .unwrap();

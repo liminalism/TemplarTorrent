@@ -501,3 +501,55 @@ record templartorrent.evidence.step2a-workspace-gates/1 : evidence {
         Workspace green with engine member: fmt clean, clippy -D warnings exit 0, 43 tests pass
         """
 }
+
+record templartorrent.evidence.step4-capability-gates/1 : evidence {
+    title "Same host. New test driver_rejects_v2_and_hybrid_before_any_storage_exists: rbit-built v2 and hybrid torrent files are refused by magnet_from_torrent_bytes with \"v2/hybrid torrents are not supported\"; a btmh magnet is refused by add_magnet with \"v2/hybrid magnets are not supported\"; a hybrid torrent reached through its v1 info hash has its metadata fetched over BEP-9 and then refused with \"v2/hybrid torrents are not supported by this driver\", after which no destination directory exists, no job, connection, metadata permit or payload reservation remains. Existing driver_bootstrap_privacy_and_private_tracker_scope_are_enforced passed: private metadata revokes public bootstrap and private jobs stay on one original tracker scope."
+    state verified
+    result pass
+    method command
+    observed_at git:21f43b73b4c20f8cbd742cb7dc162a2893906a3e
+    command "cargo test -p templartorrent-rbit-adapter --test driver"
+    artifact "perf-results/2026-10-22-step4-checks/adapter-driver-tests.log"
+    summary """
+        Same host. New test driver_rejects_v2_and_hybrid_before_any_storage_exists: rbit-built v2 and hybrid torrent files are refused by magnet_from_torrent_bytes with "v2/hybrid torrents are not supported"; a btmh magnet is refused by add_magnet with "v2/hybrid magnets are not supported"; a hybrid torrent reached through its v1 info hash has its metadata fetched over BEP-9 and then refused with "v2/hybrid torrents are not supported by this driver", after which no destination directory exists, no job, connection, metadata permit or payload reservation remains. Existing driver_bootstrap_privacy_and_private_tracker_scope_are_enforced passed: private metadata revokes public bootstrap and private jobs stay on one original tracker scope.
+        """
+}
+
+record templartorrent.evidence.step4-forced-crash-restart/1 : evidence {
+    title "Same host. New test driver_restart_after_forced_process_kill_rechecks_and_completes spawns the test binary as a child process running a real Driver against an owned loopback seeder that delays each block 40 ms, SIGKILLs the child after 9 to 12 of 13 blocks were served, then a fresh Driver opens the same destination with ExistingData::Recheck, adopts at least one full piece from disk, requests at most 9 blocks and finishes with files equal to the fixture. Passed 5 of 5 repeated runs at about 0.7 s each. The kill is a process kill, not an in-process drop; no power loss or filesystem fault injection."
+    state verified
+    result pass
+    method command
+    observed_at git:21f43b73b4c20f8cbd742cb7dc162a2893906a3e
+    command "cargo test -p templartorrent-rbit-adapter --test driver"
+    artifact "perf-results/2026-10-22-step4-checks/adapter-driver-tests.log"
+    summary """
+        Same host. New test driver_restart_after_forced_process_kill_rechecks_and_completes spawns the test binary as a child process running a real Driver against an owned loopback seeder that delays each block 40 ms, SIGKILLs the child after 9 to 12 of 13 blocks were served, then a fresh Driver opens the same destination with ExistingData::Recheck, adopts at least one full piece from disk, requests at most 9 blocks and finishes with files equal to the fixture. Passed 5 of 5 repeated runs at about 0.7 s each. The kill is a process kill, not an in-process drop; no power loss or filesystem fault injection.
+        """
+}
+
+record templartorrent.evidence.step4-offline-country-client/1 : evidence {
+    title "Same host. 21 production client tests passed including geo tests: special addresses never resolve to a country, ISO codes must be two ASCII letters, a missing database reports failure without blocking, the lookup cache counts misses and stays bounded, and explicit path beats environment and defaults; the worker reports \"not loaded\" without a database. A source grep of geo.rs and the adapter lib for reqwest, hyper, http, dns, lookup_host, TcpStream and UdpSocket found no match; client_name takes only the sanitized extension-handshake string capped at 80 characters with an Unknown fallback. Peer-ID client fallback is not implemented. No live MMDB lookup was run because no database is bundled."
+    state verified
+    result pass
+    method command
+    observed_at git:21f43b73b4c20f8cbd742cb7dc162a2893906a3e
+    command "cargo test -p templartorrent"
+    artifact "perf-results/2026-10-22-step4-checks/offline-lookup-audit.log"
+    summary """
+        Same host. 21 production client tests passed including geo tests: special addresses never resolve to a country, ISO codes must be two ASCII letters, a missing database reports failure without blocking, the lookup cache counts misses and stays bounded, and explicit path beats environment and defaults; the worker reports "not loaded" without a database. A source grep of geo.rs and the adapter lib for reqwest, hyper, http, dns, lookup_host, TcpStream and UdpSocket found no match; client_name takes only the sanitized extension-handshake string capped at 80 characters with an Unknown fallback. Peer-ID client fallback is not implemented. No live MMDB lookup was run because no database is bundled.
+        """
+}
+
+record templartorrent.evidence.step4-protected-deletion/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree at cb822df plus uncommitted test additions: 11 storage tests passed including delete_refuses_hardlink_symlink_and_swapped_inode_without_removing_the_job, delete_removes_only_job_files_and_keeps_the_root, closing_job_releases_storage_without_deleting_files, symlinks_are_refused and hostile_paths_are_rejected; 22 adapter driver tests passed including driver_pause_and_remove_join_network_tasks_and_retain_data (hardlink refusal before job removal, data retained and directory renamable after remove without delete) and driver_tracker_discovery_reannounce_and_safe_delete. Linux openat/unlinkat path only; no Windows run."
+    state verified
+    result pass
+    method command
+    observed_at git:21f43b73b4c20f8cbd742cb7dc162a2893906a3e
+    command "cargo test -p templartorrent-storage && cargo test -p templartorrent-rbit-adapter --test driver"
+    artifact "perf-results/2026-10-22-step4-checks/storage-tests.log"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree at cb822df plus uncommitted test additions: 11 storage tests passed including delete_refuses_hardlink_symlink_and_swapped_inode_without_removing_the_job, delete_removes_only_job_files_and_keeps_the_root, closing_job_releases_storage_without_deleting_files, symlinks_are_refused and hostile_paths_are_rejected; 22 adapter driver tests passed including driver_pause_and_remove_join_network_tasks_and_retain_data (hardlink refusal before job removal, data retained and directory renamable after remove without delete) and driver_tracker_discovery_reannounce_and_safe_delete. Linux openat/unlinkat path only; no Windows run.
+        """
+}

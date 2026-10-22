@@ -109,7 +109,7 @@ record templartorrent.milestone.native-app-wiring/1 : milestone {
 
 record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
     title "Protected storage, crash/private-discovery tests, capability gates and peer preference"
-    state active
+    state completed
     scope [
         path "crates/templartorrent-engine/**",
         path "crates/templartorrent-storage/**",
@@ -129,6 +129,7 @@ record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
                 """
             method command
             command "cargo test -p templartorrent-rbit-adapter"
+            verified_by [ @templartorrent.evidence.step4-capability-gates/1 ]
         }
         check forced-crash-restart {
             statement """
@@ -136,6 +137,7 @@ record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
                 """
             method command
             command "cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.step4-forced-crash-restart/1 ]
         }
         check offline-country-client {
             statement """
@@ -143,6 +145,7 @@ record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
                 """
             method command
             command "cargo test -p templartorrent"
+            verified_by [ @templartorrent.evidence.step4-offline-country-client/1 ]
         }
         check peer-preference-driver {
             statement """
@@ -166,6 +169,7 @@ record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
                 """
             method command
             command "cargo test -p templartorrent-storage && cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.step4-protected-deletion/1 ]
         }
     }
     after [ @templartorrent.milestone.native-app-wiring ]
