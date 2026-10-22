@@ -16,3 +16,6 @@ pixelkit-windowing = { git = "https://github.com/liminalism/pixelkit", rev = "61
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
 libc = "0.2.190"
 maxminddb = "0.32"
+
+[dev-dependencies]
+rbit = "=0.2.2"

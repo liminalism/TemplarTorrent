@@ -384,6 +384,42 @@ fn end_to_end_transfer_completes_and_seeds() {
 }
 
 #[test]
+fn selection_changes_resettle_completion_without_a_new_piece() {
+    let mut session = session();
+    let id = session.add(spec()).unwrap();
+    let peer = ready_peer(&mut session, id);
+    // Only a.bin wanted: pieces 0..=2 (the boundary piece included).
+    session.set_wanted(id, 1, false).unwrap();
+    for _ in 0..40 {
+        let report = session.update(0, &AcceptAll);
+        for (piece, begin, length) in requests_of(&report) {
+            session
+                .inject_block(id, peer, piece, begin, vec![piece as u8; length as usize])
+                .unwrap();
+        }
+        if session.snapshot().jobs[0].state == JobState::Seeding {
+            break;
+        }
+    }
+    let snap = session.snapshot();
+    assert_eq!(snap.jobs[0].state, JobState::Seeding);
+    assert_eq!(snap.jobs[0].wanted_bytes, 40_000);
+    // Wanting b.bin again reopens the job without any network event.
+    session.set_wanted(id, 1, true).unwrap();
+    assert_eq!(session.snapshot().jobs[0].state, JobState::Downloading);
+    assert_eq!(session.snapshot().jobs[0].wanted_bytes, 50_000);
+    // Dropping it again completes immediately: nothing new was verified.
+    session.set_wanted(id, 1, false).unwrap();
+    assert_eq!(session.snapshot().jobs[0].state, JobState::Seeding);
+    // A paused job keeps its state until resume re-evaluates it.
+    session.pause(id).unwrap();
+    session.set_wanted(id, 1, true).unwrap();
+    assert_eq!(session.snapshot().jobs[0].state, JobState::Paused);
+    session.resume(id).unwrap();
+    assert_eq!(session.snapshot().jobs[0].state, JobState::Downloading);
+}
+
+#[test]
 fn pause_resume_remove_lifecycle() {
     let mut session = session();
     let id = session.add(spec()).unwrap();

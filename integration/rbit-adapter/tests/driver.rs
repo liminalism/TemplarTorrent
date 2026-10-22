@@ -1820,3 +1820,183 @@ async fn driver_restart_after_forced_process_kill_rechecks_and_completes() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn driver_export_and_restore_job_record_rechecks_without_peers() {
+    timeout(DEADLINE, async {
+        // Part 1: a completed job with a narrowed selection, custom order and
+        // local preferences round-trips through a record into a fresh driver.
+        let root = Root::new();
+        let fixture = Fixture::new(73, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut first = driver();
+        let id = first
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                true,
+            )
+            .await
+            .unwrap();
+        first.set_file_wanted(id, 0, false).unwrap();
+        first.set_file_order(id, vec![1, 0]).unwrap();
+        first
+            .set_peer_preference(id, "127.0.0.9:1".parse().unwrap(), PeerPreference::Block)
+            .await
+            .unwrap();
+        first
+            .set_peer_preference(id, "127.0.0.8:1".parse().unwrap(), PeerPreference::Avoid)
+            .await
+            .unwrap();
+        complete(&mut first).await;
+        let record = first.export_job(id).unwrap();
+        assert_eq!(record.info_hash, fixture.hash);
+        assert!(record.torrent.starts_with(b"d4:info"));
+        assert_eq!(
+            Driver::magnet_from_torrent_bytes(&record.torrent).unwrap(),
+            fixture.magnet()
+        );
+        assert_eq!(record.destination, first.destination(id).unwrap());
+        assert!(!record.paused);
+        assert!(record.public_bootstrap);
+        assert_eq!(record.wanted, vec![false, true]);
+        assert_eq!(record.order, vec![1, 0]);
+        assert!(record.trackers.is_empty());
+        assert_eq!(
+            record.preferences,
+            vec![
+                ("127.0.0.8".parse().unwrap(), PeerPreference::Avoid),
+                ("127.0.0.9".parse().unwrap(), PeerPreference::Block),
+            ]
+        );
+        assert!(!format!("{record:?}").contains("127.0.0.9"));
+        first.remove(id, false).await.unwrap();
+        drop(first);
+        server.stats.requests.lock().unwrap().clear();
+
+        let mut second = driver();
+        let restored = second.restore_job(&record).await.unwrap();
+        let row = second.snapshot().jobs[0].clone();
+        assert_eq!(row.id, restored);
+        assert_eq!(&*row.name, "owned-series");
+        assert_eq!(row.state, JobState::Complete, "adopted from disk");
+        assert_eq!(row.verified_bytes, row.wanted_bytes);
+        assert_eq!(row.wanted_bytes, (2 * PIECE + 73) as u64);
+        assert_eq!(
+            second.destination(restored),
+            Some(record.destination.clone())
+        );
+        let files = second.file_progress(restored).unwrap();
+        assert_eq!(
+            files.iter().map(|f| f.wanted).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        assert_eq!(second.export_job(restored).unwrap().order, vec![1, 0]);
+        assert_eq!(
+            second.peer_preference(restored, "127.0.0.9:4".parse().unwrap()),
+            PeerPreference::Block
+        );
+        assert_eq!(
+            second.peer_preference(restored, "127.0.0.8:4".parse().unwrap()),
+            PeerPreference::Avoid
+        );
+        assert_eq!(second.connection_count(), 0, "restore contacts no peer");
+        assert!(server.stats.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            second.restore_job(&record).await.unwrap_err().0,
+            "torrent already exists"
+        );
+        let mut tampered = record.clone();
+        tampered.torrent[12] ^= 0x01;
+        assert!(second.restore_job(&tampered).await.is_err());
+        let mut mismatched = record.clone();
+        mismatched.info_hash[0] ^= 0xff;
+        assert_eq!(
+            second.restore_job(&mismatched).await.unwrap_err().0,
+            "stored torrent does not match its record"
+        );
+        assert_eq!(second.snapshot().jobs.len(), 1);
+        second.shutdown().await;
+        server.close().await;
+
+        // Part 2: a paused partial job restores as paused with its verified
+        // bytes, then completes through its saved tracker after resume.
+        let root = Root::new();
+        let fixture = Fixture::new(79, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker_addr = tracker_listener.local_addr().unwrap();
+        let tracker_task = tokio::spawn(http_tracker(tracker_listener, server.source.address));
+        let mut third = driver();
+        let id = third
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        while third.snapshot().jobs[0].verified_bytes == 0 {
+            third.step(Duration::from_millis(10)).await.unwrap();
+        }
+        third.pause(id).await.unwrap();
+        let verified = third.snapshot().jobs[0].verified_bytes;
+        assert!(verified >= PIECE as u64 && verified < fixture.data.len() as u64);
+        let mut record = third.export_job(id).unwrap();
+        assert!(record.paused);
+        record
+            .trackers
+            .push((format!("http://{tracker_addr}/announce"), true));
+        third.remove(id, false).await.unwrap();
+        drop(third);
+        server.stats.requests.lock().unwrap().clear();
+
+        let mut fourth = driver();
+        fourth.set_allow_local_trackers(true);
+        fourth.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let id = fourth.restore_job(&record).await.unwrap();
+        let row = fourth.snapshot().jobs[0].clone();
+        assert_eq!(row.state, JobState::Paused);
+        assert!(row.verified_bytes >= verified);
+        assert_eq!(fourth.tracker_status(id).unwrap().len(), 1);
+        assert_eq!(fourth.connection_count(), 0);
+        fourth.resume(id).await.unwrap();
+        assert_eq!(fourth.snapshot().jobs[0].state, JobState::Downloading);
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "tracker never supplied the peer"
+            );
+            fourth.step(Duration::from_millis(10)).await.unwrap();
+            if fourth
+                .snapshot()
+                .jobs
+                .iter()
+                .all(|row| matches!(row.state, JobState::Complete | JobState::Seeding))
+            {
+                break;
+            }
+        }
+        assert!(
+            !server
+                .stats
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(piece, _)| *piece == 1),
+            "adopted pieces are not requested again"
+        );
+        fixture.assert_files(&root.job());
+        fourth.shutdown().await;
+        server.close().await;
+        tracker_task.abort();
+    })
+    .await
+    .unwrap();
+}

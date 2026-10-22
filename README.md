@@ -90,7 +90,8 @@ layout/policy demonstrator, not a connectivity test or production UI.
 | Engine | Real rbit type wrappers and bitfield conversion | Magnets-to-payload transfer loop, metadata exchange, hashing/storage |
 | UI | Native PixelKit split panes and fixture inspector | Add/limits/remove dialogs, real commands/acks, file browser |
 | Peers | Typed state, local Prefer/Avoid/Block applied to upload slots, pipelines, retention and reconnection, MMDB country lookup | Automatic scoring, optimistic rotation, peer-ID client fallback, flag atlas |
-| Removal | Default-safe intent and lexical checks | Handle-relative storage/deletion, quiescence and crash recovery |
+| Removal | Default-safe intent, Linux handle-relative no-follow deletion with inode identity and hardlink refusal, forced-kill restart recheck | Windows reparse-aware deletion, crash journal |
+| Persistence | Per-job records and settings under `$XDG_DATA_HOME/templartorrent/session`, atomic writes, recheck on launch | Resume bitmap/journal, window geometry and split ratio |
 | Performance | Scalar/AVX2 kernel, microbench JSONL | End-to-end local swarm, actual RSS/startup/CPU evidence |
 
 All executable application/reference source supplied here is Rust. This is **not** a

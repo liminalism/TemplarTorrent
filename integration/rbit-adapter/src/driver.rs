@@ -134,6 +134,40 @@ struct Job {
     /// Local preference by peer IP, so a blocked peer cannot return on
     /// another ephemeral port. Normal entries are not stored.
     preferences: HashMap<IpAddr, PeerPreference>,
+    /// Whether the user allowed public discovery for this magnet.
+    bootstrap: bool,
+}
+
+/// Everything needed to reinstall a job without the network: the metainfo
+/// envelope, where it lives, what the user intended, and local policy.
+/// Tracker URLs may carry passkeys; `Debug` redacts them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    pub info_hash: [u8; 20],
+    /// `d4:info<raw>e`, accepted by [`Driver::magnet_from_torrent_bytes`].
+    pub torrent: Vec<u8>,
+    pub destination: PathBuf,
+    pub paused: bool,
+    pub public_bootstrap: bool,
+    pub wanted: Vec<bool>,
+    pub order: Vec<usize>,
+    /// `(url, original)`; added trackers are re-derived from the public list.
+    pub trackers: Vec<(String, bool)>,
+    pub preferences: Vec<(IpAddr, PeerPreference)>,
+}
+impl fmt::Debug for JobRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JobRecord")
+            .field("torrent_bytes", &self.torrent.len())
+            .field("destination", &self.destination)
+            .field("paused", &self.paused)
+            .field("public_bootstrap", &self.public_bootstrap)
+            .field("wanted", &self.wanted)
+            .field("order", &self.order)
+            .field("trackers", &self.trackers.len())
+            .field("preferences", &self.preferences.len())
+            .finish_non_exhaustive()
+    }
 }
 #[derive(Default)]
 struct Jobs(HashMap<TorrentId, Job>);
@@ -630,6 +664,7 @@ impl Driver {
                 last_error: None,
                 trackers: Vec::new(),
                 preferences: HashMap::new(),
+                bootstrap: public_bootstrap,
             },
         );
         if self
@@ -850,6 +885,17 @@ impl Driver {
         if !runnable.contains(&id) {
             self.pause(id).await?;
             self.jobs.0.get_mut(&id).unwrap().queued = true;
+            return Ok(());
+        }
+        if sources.is_empty()
+            && self
+                .jobs
+                .0
+                .get(&id)
+                .is_some_and(|job| !job.trackers.is_empty())
+        {
+            // A restored job knows no peers yet; its trackers announce on
+            // their normal schedule and supply them.
             return Ok(());
         }
         timeout(Duration::from_secs(30), async {
@@ -1487,6 +1533,222 @@ impl Driver {
             .collect();
         rows.sort_by_key(|row| row.address);
         rows
+    }
+
+    pub fn info_hash(&self, id: TorrentId) -> Option<[u8; 20]> {
+        match self.jobs.0.get(&id)?.torrent.meta.info_hash {
+            InfoHash::V1(hash) => Some(hash),
+            _ => None,
+        }
+    }
+
+    /// Snapshot one job for persistence. `paused` is the user's intent: a job
+    /// parked only by the download-slot cap is still running.
+    pub fn export_job(&mut self, id: TorrentId) -> Result<JobRecord> {
+        let state = self
+            .session
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.state)
+            .ok_or(DriverError("unknown job"))?;
+        let progress = self
+            .session
+            .file_progress(id)
+            .map_err(|_| DriverError("unknown job"))?;
+        let order = self
+            .session
+            .file_order(id)
+            .map_err(|_| DriverError("unknown job"))?;
+        let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
+        let InfoHash::V1(info_hash) = job.torrent.meta.info_hash else {
+            return Err(DriverError("unsupported torrent"));
+        };
+        let raw = job.torrent.meta.raw_info();
+        let mut torrent = Vec::with_capacity(raw.len() + 8);
+        torrent.extend_from_slice(b"d4:info");
+        torrent.extend_from_slice(raw);
+        torrent.push(b'e');
+        let mut preferences: Vec<_> = job
+            .preferences
+            .iter()
+            .map(|(ip, preference)| (*ip, *preference))
+            .collect();
+        preferences.sort_by_key(|(ip, _)| *ip);
+        Ok(JobRecord {
+            info_hash,
+            torrent,
+            destination: job.destination.clone(),
+            paused: state == JobState::Paused && !job.queued,
+            public_bootstrap: job.bootstrap,
+            wanted: progress.iter().map(|file| file.wanted).collect(),
+            order,
+            trackers: job
+                .trackers
+                .iter()
+                .map(|tracker| (tracker.url.clone(), tracker.origin == "original"))
+                .collect(),
+            preferences,
+        })
+    }
+
+    /// Reinstall a saved job from its stored metainfo. The destination is
+    /// rechecked from disk; no peer is contacted. Saved trackers the job
+    /// already knew are admitted (their hosts resolve) and announce on their
+    /// normal schedule; a private job keeps only original trackers. An
+    /// invalid saved selection or order is dropped and noted, never applied.
+    pub async fn restore_job(&mut self, record: &JobRecord) -> Result<TorrentId> {
+        let (torrent, hash) =
+            ValidatedV1::from_torrent_bytes(&record.torrent, &self.metadata_budget)
+                .map_err(DriverError)?;
+        if hash != record.info_hash {
+            return Err(DriverError("stored torrent does not match its record"));
+        }
+        if self
+            .jobs
+            .0
+            .values()
+            .any(|job| matches!(job.torrent.meta.info_hash, InfoHash::V1(h) if h == hash))
+        {
+            return Err(DriverError("torrent already exists"));
+        }
+        let id = self
+            .session
+            .add(JobSpec {
+                name: torrent.name().into(),
+                files: torrent.files(),
+                piece_length: torrent.piece_length(),
+                max_pieces: MAX_DRIVER_PIECES,
+            })
+            .map_err(|_| DriverError("torrent exceeds session admission limits"))?;
+        let admitted =
+            (|| {
+                let root = prepare_destination(&record.destination, ExistingData::Recheck)?;
+                if self.jobs.0.values().any(|job| {
+                    job.destination.starts_with(&root) || root.starts_with(&job.destination)
+                }) {
+                    return Err(DriverError("destination already owned by another job"));
+                }
+                self.store
+                    .add_job(id, &root, &torrent.paths, torrent.piece_length())
+                    .map_err(|_| DriverError("payload storage admission failed"))?;
+                self.session
+                    .recheck(id, &self.store, &torrent)
+                    .map_err(|_| DriverError("resume recheck failed"))?;
+                Ok(root)
+            })();
+        let root = match admitted {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = self.session.remove(id, false);
+                let _ = self.store.close_job(id);
+                return Err(error);
+            }
+        };
+        let mut last_error = None;
+        if record.wanted.len() == torrent.paths.len() {
+            for (index, wanted) in record.wanted.iter().enumerate() {
+                if !wanted && self.session.set_wanted(id, index, false).is_err() {
+                    last_error = Some("saved file selection was invalid");
+                }
+            }
+        } else if !record.wanted.is_empty() {
+            last_error = Some("saved file selection was invalid");
+        }
+        if !record.order.is_empty() && self.session.set_order(id, record.order.clone()).is_err() {
+            last_error = Some("saved file order was invalid");
+        }
+        let private = torrent.is_private();
+        let mut trackers: Vec<Tracked> = Vec::new();
+        let mut originals = 0u64;
+        for (url, original) in record.trackers.iter().take(crate::discovery::MAX_TRACKERS) {
+            if private && !*original {
+                continue;
+            }
+            let Ok(admitted) =
+                crate::discovery::admit_tracker(url, self.allow_local_trackers).await
+            else {
+                continue;
+            };
+            if trackers
+                .iter()
+                .any(|known| known.url == admitted.tracker.url)
+            {
+                continue;
+            }
+            let origin_id = if *original {
+                originals += 1;
+                originals
+            } else {
+                0
+            };
+            trackers.push(Tracked {
+                url: admitted.tracker.url,
+                origin: if *original { "original" } else { "added" },
+                origin_id,
+                local: admitted.local,
+                seeds: None,
+                peers: None,
+                last_error: None,
+            });
+        }
+        // A private job without an original tracker can never admit a peer.
+        let private_tracker = private.then(|| {
+            trackers
+                .iter()
+                .find(|tracker| tracker.origin == "original")
+                .map_or(u64::MAX, |tracker| tracker.origin_id)
+        });
+        let mut preferences = HashMap::new();
+        for (ip, preference) in record.preferences.iter().take(PREFERENCE_CAP) {
+            if *preference != PeerPreference::Normal {
+                preferences.insert(*ip, *preference);
+            }
+        }
+        self.jobs.0.insert(
+            id,
+            Job {
+                torrent,
+                sources: Vec::new(),
+                private_tracker,
+                destination: root,
+                queued: false,
+                last_error,
+                trackers: Vec::new(),
+                preferences,
+                bootstrap: record.public_bootstrap,
+            },
+        );
+        for tracker in trackers {
+            if self.session.add_tracker(id).is_err() {
+                break;
+            }
+            if let Some(job) = self.jobs.0.get_mut(&id) {
+                job.trackers.push(tracker);
+            }
+        }
+        if record.paused {
+            self.pause(id).await?;
+            return Ok(id);
+        }
+        // Running intent still respects the download-slot cap.
+        let rows = self.snapshot();
+        let running = rows
+            .jobs
+            .iter()
+            .filter(|row| row.id != id && row.state == JobState::Downloading)
+            .count();
+        let state = rows
+            .jobs
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.state);
+        if state == Some(JobState::Downloading) && running >= self.limits.download_jobs {
+            self.pause(id).await?;
+            self.jobs.0.get_mut(&id).unwrap().queued = true;
+        }
+        Ok(id)
     }
 
     /// Local preference for one peer address in one job. Keyed by IP, so an

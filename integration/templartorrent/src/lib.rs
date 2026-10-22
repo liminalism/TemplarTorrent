@@ -4,6 +4,7 @@
 
 pub mod activate;
 pub mod geo;
+pub mod persist;
 mod space;
 pub mod ui;
 pub mod worker;
@@ -21,6 +22,7 @@ mod source_tests {
             include_str!("workflow.rs"),
             include_str!("activate.rs"),
             include_str!("geo.rs"),
+            include_str!("persist.rs"),
             include_str!("space.rs"),
         ];
         for kind in ["series", "album"] {

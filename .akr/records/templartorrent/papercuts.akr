@@ -123,6 +123,17 @@ record templartorrent.papercut.resuming-from-the-ledger-the-inherited/1 : paperc
     created_at 2026-10-22
 }
 
+record templartorrent.papercut.session-set-wanted-only-re-evaluated-job/1 : papercut {
+    title "Session::set_wanted only re-evaluated job completion when a piece…"
+    state verified
+    statement """
+        Session::set_wanted only re-evaluated job completion when a piece verified or a recheck finished, so a restored job whose saved selection was applied after its recheck stayed Downloading with everything it wanted already on disk; the same stall affected a live job that deselects its last incomplete file. Fixed with resettle_completion in the engine and a regression test; anyone adding a new selection mutator must call it too.
+        """
+    observed_at git:bc5a25057784b680316a863936561d5836a65716
+    author "claude"
+    created_at 2026-10-22
+}
+
 record templartorrent.papercut.the-pinned-rbit-crate-also-uses-peer-rs-rather/1 : papercut {
     title "The pinned rbit crate also uses peer.rs rather than peer/mod.rs. The…"
     state verified

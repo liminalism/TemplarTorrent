@@ -433,7 +433,32 @@ impl Session {
             .coordinator
             .sequence_mut()
             .set_wanted(file, wanted)?;
-        self.cancel_work(id)
+        self.cancel_work(id)?;
+        self.resettle_completion(id)
+    }
+
+    /// A selection change can finish a job whose remaining wanted files are
+    /// already verified, or reopen a seeding job that now wants more. Paused
+    /// and errored jobs keep their state; the next resume re-evaluates.
+    fn resettle_completion(&mut self, id: TorrentId) -> Result<(), EngineError> {
+        let job = self.job_mut(id)?;
+        let complete = Self::is_complete(job);
+        match job.state {
+            JobState::Downloading if complete => job.state = JobState::Seeding,
+            JobState::Seeding if !complete => job.state = JobState::Downloading,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The current file-order permutation, as accepted by [`Session::set_order`].
+    pub fn file_order(&self, id: TorrentId) -> Result<Vec<usize>, EngineError> {
+        let job = self
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .ok_or(EngineError::UnknownJob)?;
+        Ok(job.coordinator.sequence().order().to_vec())
     }
 
     pub fn set_order(&mut self, id: TorrentId, order: Vec<usize>) -> Result<(), EngineError> {

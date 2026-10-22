@@ -13,6 +13,7 @@ use templartorrent_rbit_adapter::driver::{Driver, ExistingData};
 use tokio::sync::{mpsc, watch};
 
 use crate::geo::GeoDb;
+use crate::persist::{SessionStore, Settings};
 use crate::space;
 use crate::workflow;
 
@@ -227,6 +228,8 @@ pub struct WorkerConfig {
     pub public_tracker_path: PathBuf,
     pub geo_db_path: Option<PathBuf>,
     pub listen: SocketAddr,
+    /// Where job records and settings live; `None` disables persistence.
+    pub session_dir: Option<PathBuf>,
 }
 
 pub enum Request {
@@ -348,6 +351,7 @@ struct Memory {
     note: Option<String>,
     rates: std::collections::HashMap<u64, workflow::RateCarry>,
     rated_at: Option<Instant>,
+    store: Option<SessionStore>,
 }
 
 async fn run_session(
@@ -365,6 +369,7 @@ async fn run_session(
         note: None,
         rates: std::collections::HashMap::new(),
         rated_at: None,
+        store: config.session_dir.clone().map(SessionStore::new),
     };
     let mut engine = match Driver::new(config.limits) {
         Ok(mut driver) => {
@@ -384,6 +389,7 @@ async fn run_session(
         Err(error) => Engine::Down(error.0),
     };
     let mut last = publish(&mut engine, &mut memory, &shared);
+    restore_session(&mut engine, &mut memory).await;
     loop {
         if *stop.borrow() {
             break;
@@ -420,6 +426,108 @@ async fn run_session(
     }
     if let Engine::Live { driver, .. } = &mut engine {
         driver.shutdown().await;
+    }
+}
+
+/// Apply saved settings, then reinstall every saved job through a disk
+/// recheck. Nothing here contacts a peer; saved trackers announce on their
+/// own schedule once the driver steps. Skipped records are reported once.
+async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
+    let Some(store) = &memory.store else {
+        return;
+    };
+    let Engine::Live { driver, .. } = engine else {
+        return;
+    };
+    let mut notes = Vec::new();
+    match store.load_settings() {
+        Ok(Some(settings)) => {
+            memory.allow_local = settings.allow_local_trackers;
+            driver.set_allow_local_trackers(settings.allow_local_trackers);
+            if driver.set_limits(settings.limits).await.is_err() {
+                notes.push("saved limits were rejected".to_string());
+            }
+        }
+        Ok(None) => {}
+        Err(error) => notes.push(format!("settings not loaded: {error}")),
+    }
+    let (records, errors) = store.load_jobs();
+    let mut restored = 0usize;
+    let mut skipped = errors.len();
+    let mut first_skip = errors.into_iter().next();
+    for record in &records {
+        match driver.restore_job(record).await {
+            Ok(_) => restored += 1,
+            Err(error) => {
+                skipped += 1;
+                first_skip.get_or_insert_with(|| format!("saved job skipped: {}", error.0));
+            }
+        }
+    }
+    if restored > 0 || skipped > 0 {
+        let mut note = format!("Restored {restored} saved job(s)");
+        if skipped > 0 {
+            note.push_str(&format!(
+                "; {skipped} skipped: {}",
+                first_skip.unwrap_or_default()
+            ));
+        }
+        notes.push(note);
+    }
+    if !notes.is_empty() {
+        memory.note = Some(notes.join(". "));
+    }
+}
+
+fn save_job(driver: &mut Driver, store: &SessionStore, id: TorrentId) -> Result<(), String> {
+    let record = driver.export_job(id).map_err(|error| error.0.to_string())?;
+    store.save_job(&record)
+}
+
+fn save_settings(driver: &Driver, memory: &Memory) -> Result<(), String> {
+    let Some(store) = &memory.store else {
+        return Ok(());
+    };
+    store.save_settings(&Settings {
+        limits: driver.limits().clone(),
+        allow_local_trackers: memory.allow_local,
+    })
+}
+
+/// After an accepted command, persist what it changed. A failed save is
+/// reported in the status note; the live state is already applied.
+fn persist_after(
+    engine: &mut Engine,
+    memory: &mut Memory,
+    command: &Command,
+    added: Option<TorrentId>,
+    removed: Option<[u8; 20]>,
+) {
+    let Engine::Live { driver, .. } = engine else {
+        return;
+    };
+    let Some(store) = &memory.store else {
+        return;
+    };
+    let result = match command {
+        Command::Add { .. } => match added {
+            Some(id) => save_job(driver, store, id),
+            None => Ok(()),
+        },
+        Command::Pause(id)
+        | Command::Resume(id)
+        | Command::SetFileOrder { id, .. }
+        | Command::SetFileWanted { id, .. }
+        | Command::SetPeerPreference { id, .. } => save_job(driver, store, *id),
+        Command::Remove { .. } => match removed {
+            Some(hash) => store.remove_job(&hash),
+            None => Ok(()),
+        },
+        Command::SetLimits(_) => save_settings(driver, memory),
+        Command::Reannounce { .. } | Command::Inspect { .. } | Command::Shutdown => Ok(()),
+    };
+    if let Err(error) = result {
+        memory.note = Some(format!("session not saved: {error}"));
     }
 }
 
@@ -619,7 +727,14 @@ async fn dispatch(
     match request {
         Request::Command { seq, command } => {
             let stop = matches!(command, Command::Shutdown);
-            let result = run_command(engine, shared, command).await;
+            let removed = match (&command, &*engine) {
+                (Command::Remove { id, .. }, Engine::Live { driver, .. }) => driver.info_hash(*id),
+                _ => None,
+            };
+            let result = run_command(engine, shared, &command).await;
+            if let Ok(added) = &result {
+                persist_after(engine, memory, &command, *added, removed);
+            }
             push_ack(
                 &mut memory.acks,
                 Ack {
@@ -687,6 +802,9 @@ async fn dispatch(
             memory.allow_local = allow;
             if let Engine::Live { driver, .. } = engine {
                 driver.set_allow_local_trackers(allow);
+                if let Err(error) = save_settings(driver, memory) {
+                    memory.note = Some(format!("session not saved: {error}"));
+                }
             }
             false
         }
@@ -700,7 +818,12 @@ async fn dispatch(
     }
 }
 
-async fn run_command(engine: &mut Engine, shared: &Shared, command: Command) -> Result<(), String> {
+/// `Ok(Some(id))` only for an accepted Add, so the new job can be saved.
+async fn run_command(
+    engine: &mut Engine,
+    shared: &Shared,
+    command: &Command,
+) -> Result<Option<TorrentId>, String> {
     let Engine::Live { driver, .. } = engine else {
         return Err("the session driver did not start".into());
     };
@@ -717,40 +840,43 @@ async fn run_command(engine: &mut Engine, shared: &Shared, command: Command) -> 
             } else {
                 ExistingData::Refuse
             };
-            driver
+            return driver
                 .add_magnet_with_discovery(
-                    &source,
-                    &destination,
+                    source,
+                    destination,
                     existing,
                     &[],
-                    public_magnet_bootstrap,
+                    *public_magnet_bootstrap,
                 )
                 .await
-                .map(|_| ())
+                .map(Some)
+                .map_err(|error| error.0.to_string());
         }
-        Command::Pause(id) => driver.pause(id).await,
-        Command::Resume(id) => driver.resume(id).await,
-        Command::Remove { id, delete_data } => driver.remove(id, delete_data).await,
-        Command::SetLimits(limits) => driver.set_limits(limits).await,
-        Command::SetFileOrder { id, file_indices } => driver.set_file_order(id, file_indices),
+        Command::Pause(id) => driver.pause(*id).await,
+        Command::Resume(id) => driver.resume(*id).await,
+        Command::Remove { id, delete_data } => driver.remove(*id, *delete_data).await,
+        Command::SetLimits(limits) => driver.set_limits(limits.clone()).await,
+        Command::SetFileOrder { id, file_indices } => {
+            driver.set_file_order(*id, file_indices.clone())
+        }
         Command::SetFileWanted {
             id,
             file_index,
             wanted,
-        } => driver.set_file_wanted(id, file_index, wanted),
-        Command::Reannounce { id, tracker_index } => driver.reannounce(id, tracker_index).await,
+        } => driver.set_file_wanted(*id, *file_index, *wanted),
+        Command::Reannounce { id, tracker_index } => driver.reannounce(*id, *tracker_index).await,
         Command::SetPeerPreference {
             id,
             address,
             preference,
-        } => driver.set_peer_preference(id, address, preference).await,
+        } => driver.set_peer_preference(*id, *address, *preference).await,
         Command::Inspect { id, .. } => {
-            *lock(&shared.selected) = id;
+            *lock(&shared.selected) = *id;
             Ok(())
         }
         Command::Shutdown => Ok(()),
     };
-    outcome.map_err(|error| error.0.to_string())
+    outcome.map(|()| None).map_err(|error| error.0.to_string())
 }
 
 fn push_ack(acks: &mut Vec<Ack>, ack: Ack) {
@@ -824,6 +950,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use templartorrent_core::model::{InspectorTab, PeerPreference};
+    use templartorrent_rbit_adapter::driver::JobRecord;
 
     fn rate_job(down_bps: u64) -> templartorrent_core::model::TorrentRow {
         templartorrent_core::model::TorrentRow {
@@ -851,6 +978,7 @@ mod tests {
             public_tracker_path: PathBuf::from("public-trackers.txt"),
             geo_db_path: None,
             listen: "127.0.0.1:0".parse().unwrap(),
+            session_dir: None,
         }
     }
 
@@ -892,6 +1020,7 @@ mod tests {
             note: None,
             rates: std::collections::HashMap::new(),
             rated_at: None,
+            store: None,
         };
         let shared = Shared {
             view: Arc::new(Mutex::new(SessionView::idle(
@@ -996,5 +1125,120 @@ mod tests {
             .expect("inspect ack");
         assert!(ack.accepted, "{}", ack.message);
         handle.shutdown();
+    }
+
+    #[test]
+    fn restores_saved_jobs_and_settings_then_removes_the_record() {
+        let base = std::env::temp_dir().join(format!(
+            "templartorrent-worker-restore-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("job/owned-series")).unwrap();
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let torrent = rbit::TorrentBuilder::new("owned-series")
+            .version(rbit::TorrentVersion::V1)
+            .piece_length(16384)
+            .add_file("Episode02.bin", data[..20_000].to_vec())
+            .add_file("Episode01.bin", data[20_000..].to_vec())
+            .build()
+            .unwrap();
+        std::fs::write(base.join("job/owned-series/Episode02.bin"), &data[..20_000]).unwrap();
+        std::fs::write(base.join("job/owned-series/Episode01.bin"), &data[20_000..]).unwrap();
+        let meta = rbit::Metainfo::from_bytes(&torrent).unwrap();
+        let rbit::InfoHash::V1(hash) = meta.info_hash else {
+            panic!("fixture must be v1");
+        };
+        let store = SessionStore::new(base.join("session"));
+        store
+            .save_settings(&Settings {
+                limits: Limits {
+                    download_jobs: 2,
+                    ..Limits::default()
+                },
+                allow_local_trackers: true,
+            })
+            .unwrap();
+        store
+            .save_job(&JobRecord {
+                info_hash: hash,
+                torrent,
+                destination: base.join("job"),
+                paused: false,
+                public_bootstrap: false,
+                wanted: vec![true, true],
+                order: vec![1, 0],
+                trackers: Vec::new(),
+                preferences: vec![("10.0.0.9".parse().unwrap(), PeerPreference::Block)],
+            })
+            .unwrap();
+        // A bad record sits beside it and must only produce a note.
+        std::fs::write(
+            store.dir().join(format!("{}.job", "ab".repeat(20))),
+            "nonsense",
+        )
+        .unwrap();
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            session_dir: Some(base.join("session")),
+            ..config()
+        })
+        .unwrap();
+        let start = Instant::now();
+        let view = loop {
+            let view = handle.view();
+            if view.snapshot.jobs.len() == 1 && view.note.is_some() {
+                break view;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "job never restored: {:?}",
+                view.note
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let job = view.snapshot.jobs[0].clone();
+        assert_eq!(&*job.name, "owned-series");
+        assert!(
+            matches!(job.state, JobState::Complete | JobState::Seeding),
+            "{:?}",
+            job.state
+        );
+        assert_eq!(job.verified_bytes, 70_000);
+        assert_eq!(view.limits.download_jobs, 2);
+        assert!(view.allow_local_trackers);
+        let note = view.note.clone().unwrap();
+        assert!(note.contains("Restored 1"), "{note}");
+        assert!(note.contains("1 skipped"), "{note}");
+        handle
+            .try_request(Request::Command {
+                seq: 1,
+                command: Command::SetLimits(Limits {
+                    download_jobs: 4,
+                    ..Limits::default()
+                }),
+            })
+            .unwrap();
+        let ack = handle.wait_ack(1, Duration::from_secs(5)).unwrap();
+        assert!(ack.accepted, "{}", ack.message);
+        assert_eq!(
+            store.load_settings().unwrap().unwrap().limits.download_jobs,
+            4
+        );
+        handle
+            .try_request(Request::Command {
+                seq: 2,
+                command: Command::Remove {
+                    id: job.id,
+                    delete_data: false,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(2, Duration::from_secs(5)).unwrap();
+        assert!(ack.accepted, "{}", ack.message);
+        let (records, _) = store.load_jobs();
+        assert!(records.is_empty(), "the record is gone after removal");
+        assert!(base.join("job/owned-series/Episode01.bin").exists());
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

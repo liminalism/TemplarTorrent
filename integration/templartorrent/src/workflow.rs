@@ -17,6 +17,10 @@ transfer until Add is confirmed.
 Peer country lookup uses --geoip-db FILE, $TEMPLARTORRENT_GEOIP_DB, or
 ~/.local/share/templartorrent/GeoLite2-Country.mmdb. Without a database,
 peers show -- for the country.
+
+Jobs, limits and peer preferences are saved under
+$XDG_DATA_HOME/templartorrent/session (default ~/.local/share) and restored
+on the next launch after a disk recheck. Removing a job deletes its record.
 ";
 
 pub const FONT_CANDIDATES: &[&str] = &[
@@ -157,6 +161,15 @@ pub const PREFERENCE_NOTE: [&str; 2] = [
     "Applies to the selected peer's IP address for this job.",
     "Block closes it and refuses reconnection; blocking the only supplier can stall completion.",
 ];
+
+/// `$XDG_DATA_HOME/templartorrent` or `~/.local/share/templartorrent`.
+pub fn data_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from(".local/share"));
+    base.join("templartorrent")
+}
 
 pub fn public_tracker_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")

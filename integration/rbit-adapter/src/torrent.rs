@@ -128,8 +128,44 @@ impl ValidatedV1 {
             raw_info,
             buffered,
             piece_count: _,
-            mut permits,
+            permits,
         } = fetched;
+        Ok((
+            Self::from_raw_info(raw_info, hash, budget, permits)?,
+            buffered,
+        ))
+    }
+
+    /// Stored metainfo bytes: a `.torrent` file or the `d4:info…e` envelope
+    /// that [`crate::driver::Driver::export_job`] writes. Same gates as the
+    /// network path; the raw info copy is charged to the metadata budget.
+    pub(crate) fn from_torrent_bytes(
+        bytes: &[u8],
+        budget: &ByteBudget,
+    ) -> Result<(Self, [u8; 20]), &'static str> {
+        if bytes.len() > MAX_METADATA_SIZE {
+            return Err("torrent file exceeds 16 MiB limit");
+        }
+        let meta = Metainfo::from_bytes(bytes).map_err(|_| "invalid torrent file")?;
+        let InfoHash::V1(hash) = meta.info_hash else {
+            return Err("v2/hybrid torrents are not supported by this driver");
+        };
+        let raw_info = meta.raw_info().to_vec();
+        let permit = budget
+            .try_acquire(raw_info.len())
+            .ok_or("metadata budget exhausted")?;
+        Ok((
+            Self::from_raw_info(raw_info, hash, budget, vec![permit])?,
+            hash,
+        ))
+    }
+
+    fn from_raw_info(
+        raw_info: Vec<u8>,
+        hash: [u8; 20],
+        budget: &ByteBudget,
+        mut permits: Vec<Permit>,
+    ) -> Result<Self, &'static str> {
         // Check again at the admission boundary; callers cannot mutate raw_info
         // and accidentally retain the resolver's authority for different bytes.
         if raw_info.len() > MAX_METADATA_SIZE || <[u8; 20]>::from(Sha1::digest(&raw_info)) != hash {
@@ -157,14 +193,11 @@ impl ValidatedV1 {
         if !matches!(meta.info_hash, InfoHash::V1(h) if h == hash) || !meta.info.is_v1() {
             return Err("v2/hybrid torrents are not supported by this driver");
         }
-        Ok((
-            Self {
-                meta,
-                paths,
-                _permits: permits,
-            },
-            buffered,
-        ))
+        Ok(Self {
+            meta,
+            paths,
+            _permits: permits,
+        })
     }
 
     pub fn name(&self) -> &str {

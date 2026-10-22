@@ -68,6 +68,7 @@ fn run(launch: Launch) -> Result<(), String> {
         listen: "0.0.0.0:0"
             .parse()
             .map_err(|_| "the listen address is invalid".to_string())?,
+        session_dir: Some(workflow::data_dir().join("session")),
     })?;
     let activator = spawn(listener, path);
     let mut app = App::new(fonts, client, activator);

@@ -193,6 +193,51 @@ record templartorrent.work.seam-hardening/1 : work {
     part_of [ @templartorrent.milestone.local-v1-transfer ]
 }
 
+record templartorrent.work.session-persistence/1 : work {
+    title "Driver job records, client session store, worker restore and save hooks"
+    state completed
+    scope [
+        path "crates/templartorrent-engine/src/session.rs",
+        path "integration/rbit-adapter/src/driver.rs",
+        path "integration/rbit-adapter/src/torrent.rs",
+        path "integration/rbit-adapter/tests/driver.rs",
+        path "integration/templartorrent/**"
+    ]
+    intent """
+        Driver::export_job and Driver::restore_job move a job through a JobRecord (info hash, metainfo envelope, destination, paused intent, bootstrap flag, file selection and order, tracker URLs with origin, peer preferences) with the restore built from stored bytes, a disk recheck and no peer contact. The client gains a persist module writing <hash>.job text records, <hash>.torrent bytes and a settings file atomically under the XDG data directory, bounded on read. The worker restores settings and jobs at start, saves the affected job after each accepted state-changing command, saves settings after limit changes and deletes records on remove.
+        """
+    note """
+        Every launch rechecks from disk; no resume bitmap is persisted. A restored job with no known peers relies on its trackers announcing on their normal schedule.
+        """
+    acceptance {
+        check client {
+            statement """
+                Client tests cover record and settings roundtrip, atomic write, malformed and oversized rejection, and a worker that restores a saved complete job and settings, removes the record on Remove and saves changed limits.
+                """
+            method command
+            command "cargo test -p templartorrent"
+            verified_by [ @templartorrent.evidence.persistence-client/1 ]
+        }
+        check driver {
+            statement """
+                Adapter test exports and restores records for a completed and a paused partial job, verifies selection, order, preferences, destination and adopted bytes, rejects a tampered record and a duplicate, and completes the partial job through its saved tracker after resume.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.persistence-driver/1 ]
+        }
+        check gates {
+            statement """
+                Formatting and all-target Clippy with warnings denied pass in the root workspace.
+                """
+            method command
+            command "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings"
+            verified_by [ @templartorrent.evidence.persistence-gates/1 ]
+        }
+    }
+    part_of [ @templartorrent.milestone.session-persistence ]
+}
+
 record templartorrent.work.transfer-seed-loop/1 : work {
     title "Transfer and seed loop"
     state completed

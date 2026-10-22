@@ -283,6 +283,45 @@ record templartorrent.evidence.peer-preference-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.persistence-client/1 : evidence {
+    title "Same host and tree: 26 production client tests passed. persist tests: record text roundtrip with Debug redacting tracker URLs; eight malformed mutations each rejected with a specific reason plus a relative destination; settings roundtrip and zero-budget rejection; store save leaves no .tmp file, second save replaces in place, corrupt text, missing torrent file, stray name and oversized record are each reported, remove is idempotent. Worker test: with a saved settings file, a saved complete job on disk and a nonsense sibling record, the worker restored limits (download_jobs 2) and the local-tracker flag, the job appeared Complete or Seeding with 70000 verified bytes and the note read Restored 1 with 1 skipped; SetLimits rewrote the settings file; Remove without data deletion removed the record and kept the files. Headless only."
+    state verified
+    result pass
+    method command
+    observed_at git:bc5a25057784b680316a863936561d5836a65716
+    command "cargo test -p templartorrent"
+    artifact "perf-results/2026-10-22-persistence/client-tests.log"
+    summary """
+        Same host and tree: 26 production client tests passed. persist tests: record text roundtrip with Debug redacting tracker URLs; eight malformed mutations each rejected with a specific reason plus a relative destination; settings roundtrip and zero-budget rejection; store save leaves no .tmp file, second save replaces in place, corrupt text, missing torrent file, stray name and oversized record are each reported, remove is idempotent. Worker test: with a saved settings file, a saved complete job on disk and a nonsense sibling record, the worker restored limits (download_jobs 2) and the local-tracker flag, the job appeared Complete or Seeding with 70000 verified bytes and the note read Restored 1 with 1 skipped; SetLimits rewrote the settings file; Remove without data deletion removed the record and kept the files. Headless only.
+        """
+}
+
+record templartorrent.evidence.persistence-driver/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree at bc5a250 plus the persistence changes: 23 adapter driver tests passed including driver_export_and_restore_job_record_rechecks_without_peers. A completed job with one file deselected, order [1,0] and Block/Avoid preferences exported a record whose envelope reproduces the fixture magnet; a fresh Driver restored it to Complete from disk with the same destination, selection, order and preferences, zero connections and zero requests to the still-running seeder; a duplicate restore and a tampered or mismatched record were refused with the job intact. A paused partial job restored as Paused with its verified bytes, resumed with only a saved loopback HTTP tracker, obtained the peer from that tracker and completed without re-requesting the adopted piece. Engine regression test selection_changes_resettle_completion_without_a_new_piece passed."
+    state verified
+    result pass
+    method command
+    observed_at git:bc5a25057784b680316a863936561d5836a65716
+    command "cargo test -p templartorrent-rbit-adapter --test driver"
+    artifact "perf-results/2026-10-22-persistence/workspace-tests.log"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree at bc5a250 plus the persistence changes: 23 adapter driver tests passed including driver_export_and_restore_job_record_rechecks_without_peers. A completed job with one file deselected, order [1,0] and Block/Avoid preferences exported a record whose envelope reproduces the fixture magnet; a fresh Driver restored it to Complete from disk with the same destination, selection, order and preferences, zero connections and zero requests to the still-running seeder; a duplicate restore and a tampered or mismatched record were refused with the job intact. A paused partial job restored as Paused with its verified bytes, resumed with only a saved loopback HTTP tracker, obtained the peer from that tracker and completed without re-requesting the adopted piece. Engine regression test selection_changes_resettle_completion_without_a_new_piece passed.
+        """
+}
+
+record templartorrent.evidence.persistence-gates/1 : evidence {
+    title "Same host and tree: 148 workspace tests across all targets passed, formatting and all-target Clippy with warnings denied passed in the root workspace after fixing an unused import and a manual is_multiple_of, 10 preview tests and preview Clippy passed, and cargo build --release produced target/release/templartorrent. The root Cargo.lock gained rbit as a dev-dependency of the client crate; no new runtime dependency."
+    state verified
+    result pass
+    method command
+    observed_at git:bc5a25057784b680316a863936561d5836a65716
+    command "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release -p templartorrent"
+    artifact "perf-results/2026-10-22-persistence/clippy.log"
+    summary """
+        Same host and tree: 148 workspace tests across all targets passed, formatting and all-target Clippy with warnings denied passed in the root workspace after fixing an unused import and a manual is_multiple_of, 10 preview tests and preview Clippy passed, and cargo build --release produced target/release/templartorrent. The root Cargo.lock gained rbit as a dev-dependency of the client crate; no new runtime dependency.
+        """
+}
+
 record templartorrent.evidence.preview-live-commands/1 : evidence {
     title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0 (b940084d7 2026-09-28), uncommitted tree based on 72b01427. The preview live_commands filter passed 6 tests and filtered 4. LiveBridge still rejects data deletion, add, reannounce, and peer preference. No window was opened."
     state verified

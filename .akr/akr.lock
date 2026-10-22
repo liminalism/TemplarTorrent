@@ -5,7 +5,7 @@ build {
     tool "akr 0.5.2"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:5daa0cc24e90ea304f444ec93473775e93dcfd90bbd82b5d88700c81241cf2ab"
+    source_graph "sha256:b63b2bcb2d87f8fe5cb478bb476d4dc581a1c8b4dc40baf087b06f59fd160c4a"
 }
 
 source ".akr/project.akr" {
@@ -14,13 +14,13 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/templartorrent/evidence.akr" {
-    hash "sha256:b58fb0c67ec87cdfad295d6794ed0fb2e8d55552d649ca319f38d63440ce2458"
-    records 45
+    hash "sha256:c8f823185f3ec9c2db66ec92659f6558a6fefc828df0bebb0244fdee1e50f00b"
+    records 48
 }
 
 source ".akr/records/templartorrent/milestones.akr" {
-    hash "sha256:86c51c671d5a57ca2eeced6088d3fd1905b4c57ee8e6b8ad551df75f65ddf9d3"
-    records 3
+    hash "sha256:2eae1d3cb56c160607a8ccd1bf7a4065e19c54265b6eea8ad145004693e36ff7"
+    records 4
 }
 
 source ".akr/records/templartorrent/observations.akr" {
@@ -29,19 +29,25 @@ source ".akr/records/templartorrent/observations.akr" {
 }
 
 source ".akr/records/templartorrent/papercuts.akr" {
-    hash "sha256:dbb68f745fde08f9399cf7c09a19792d5ab4fc369b06c02a0d14b2ed944450ea"
-    records 17
+    hash "sha256:9edb9286f200d95c51bfd74ccb29cbfac3fceae30b62b2e76ce49b3e8bd4514e"
+    records 18
 }
 
 source ".akr/records/templartorrent/work.akr" {
-    hash "sha256:ce4148d634ffc932b42000da461c17c8a79bb38170350b96ed273cc8eb008c4f"
-    records 11
+    hash "sha256:640ae6dc4b25386f3ba1b5e8f283755b19665ca61664a938eec3b2ad40f04d80"
+    records 12
 }
 
 resolution @templartorrent.milestone.safety-and-peer-policy/1 {
     slot after
     to @templartorrent.milestone.native-app-wiring/1
     hash "sha256:f6b628dbd63c5fc2e7f2bd174100c7c269f93175cfd5710338a6d806c6108b4c"
+}
+
+resolution @templartorrent.milestone.session-persistence/1 {
+    slot after
+    to @templartorrent.milestone.safety-and-peer-policy/1
+    hash "sha256:c12cba20929909c69e98cea361e63b8c57efd6d184ef4f5dfb223fcd571072c7"
 }
 
 resolution @templartorrent.observation.complete-piece-status/5 {
@@ -132,6 +138,12 @@ resolution @templartorrent.work.seam-hardening/1 {
     slot part_of
     to @templartorrent.milestone.local-v1-transfer/1
     hash "sha256:fb515082392c7afb8982a4ce5baceed8d4d22e89506a2f698338c2895dba13fe"
+}
+
+resolution @templartorrent.work.session-persistence/1 {
+    slot part_of
+    to @templartorrent.milestone.session-persistence/1
+    hash "sha256:93cdd66d10bcaa6406993c05eb3c49e1e1668682be5f51ed2e235a7e5bbf1598"
 }
 
 resolution @templartorrent.work.transfer-seed-loop/1 {
@@ -285,6 +297,21 @@ seal @templartorrent.evidence.peer-preference-gates/1 {
     hash "sha256:fde92e261c178e2bd623e2bb5da453f3477be467674a1d4ba16ba12b27459b3b"
 }
 
+seal @templartorrent.evidence.persistence-client/1 {
+    state verified
+    hash "sha256:cabcc418225b7b40d271083b239b99f884be3fb3682164780b26cf2e83826e62"
+}
+
+seal @templartorrent.evidence.persistence-driver/1 {
+    state verified
+    hash "sha256:c604b8564d4dc18334cf33a9b39ed7f023fb92cddd00d54ae9dd24af0ce5428d"
+}
+
+seal @templartorrent.evidence.persistence-gates/1 {
+    state verified
+    hash "sha256:81ac04de5f34130b03fd35d5932b8562642a9da806d21583b7e105b9c1369b6b"
+}
+
 seal @templartorrent.evidence.preview-live-commands/1 {
     state verified
     hash "sha256:80bce6c08c9b5b29c195533b8d4b29339183ffce681a16ccca805433d8a90730"
@@ -410,6 +437,11 @@ seal @templartorrent.milestone.safety-and-peer-policy/1 {
     hash "sha256:c12cba20929909c69e98cea361e63b8c57efd6d184ef4f5dfb223fcd571072c7"
 }
 
+seal @templartorrent.milestone.session-persistence/1 {
+    state completed
+    hash "sha256:93cdd66d10bcaa6406993c05eb3c49e1e1668682be5f51ed2e235a7e5bbf1598"
+}
+
 seal @templartorrent.observation.backend-session-comparison/1 {
     state verified
     hash "sha256:28e83a4a6e65a682aee630d78040cf096b52dc34e4bb032fc3cd5faaa71b0e9d"
@@ -495,6 +527,11 @@ seal @templartorrent.papercut.resuming-from-the-ledger-the-inherited/1 {
     hash "sha256:631f977cea47e59129af4679a512502bf80acb11cdaff33d7bafc254b9ea00bd"
 }
 
+seal @templartorrent.papercut.session-set-wanted-only-re-evaluated-job/1 {
+    state verified
+    hash "sha256:b2830d2e6377e0ba7b9960e5874e75b0fbd0862d85abbbcba1e9bc9d6d642e9f"
+}
+
 seal @templartorrent.papercut.the-pinned-rbit-crate-also-uses-peer-rs-rather/1 {
     state verified
     hash "sha256:7cf5cd1828a39b4978435559c922bfe2b9144bf2959840e74d280faaf7e0fab7"
@@ -563,6 +600,11 @@ seal @templartorrent.work.resume-recheck/1 {
 seal @templartorrent.work.seam-hardening/1 {
     state completed
     hash "sha256:0ef3cad4100def1cfd0bca0e0f45a5d27a663837448b39a20b957b6824a6b2a6"
+}
+
+seal @templartorrent.work.session-persistence/1 {
+    state completed
+    hash "sha256:c6be67a3c7fe82e9f622bfb233a36faaac50bde5c4b5df4733fa32d3623c7221"
 }
 
 seal @templartorrent.work.transfer-seed-loop/1 {

@@ -2569,6 +2569,7 @@ dependencies = [
  "pixelkit-text",
  "pixelkit-ui",
  "pixelkit-windowing",
+ "rbit",
  "templartorrent-core",
  "templartorrent-rbit-adapter",
  "tokio",

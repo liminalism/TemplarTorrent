@@ -174,3 +174,42 @@ record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
     }
     after [ @templartorrent.milestone.native-app-wiring ]
 }
+
+record templartorrent.milestone.session-persistence/1 : milestone {
+    title "Session persistence: jobs, settings and preferences survive a restart"
+    state completed
+    scope [ path "integration/rbit-adapter/**", path "integration/templartorrent/**" ]
+    intent """
+        DESIGN.md sections 1 and 7: the Linux client saves schema-versioned per-job records (original torrent bytes, destination, running or paused intent, file selection and order, tracker URLs, peer preferences) and global settings under the XDG data directory with atomic temp-file-and-rename writes, and on the next launch restores every job through a disk recheck off the UI thread without contacting any peer or tracker that the job did not already know. Removal deletes the record. A corrupt or oversized record is skipped with a visible reason, never a panic.
+        """
+    note """
+        Opened 2026-10-22 after the step 4 milestone completed. No resume bitmap is persisted yet: every launch rechecks from disk, which is the conservative choice DESIGN.md permits. Restoring a job does not re-resolve metadata over the network because the torrent bytes are kept.
+        """
+    acceptance {
+        check client-roundtrip {
+            statement """
+                Production client tests show a record encoding and decoding to equal values, atomic writes leaving either the old or the new file, oversized or malformed records rejected with a reason, and the worker restoring saved jobs and settings on start and deleting the record on remove.
+                """
+            method command
+            command "cargo test -p templartorrent"
+            verified_by [ @templartorrent.evidence.persistence-client/1 ]
+        }
+        check driver-restore {
+            statement """
+                An adapter test exports a job record from one Driver, restores it into a fresh Driver from the stored torrent bytes with ExistingData::Recheck and no peer, and observes the same destination, name, file selection, file order and peer preferences, with verified bytes adopted from disk and completion once a tracker or peer is reachable.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.persistence-driver/1 ]
+        }
+        check gates {
+            statement """
+                Formatting and all-target Clippy with warnings denied pass in the root workspace.
+                """
+            method command
+            command "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings"
+            verified_by [ @templartorrent.evidence.persistence-gates/1 ]
+        }
+    }
+    after [ @templartorrent.milestone.safety-and-peer-policy ]
+}
