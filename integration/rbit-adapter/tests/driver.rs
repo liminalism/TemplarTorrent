@@ -1995,3 +1995,60 @@ async fn driver_export_and_restore_job_record_rechecks_without_peers() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn driver_optimistic_slot_rotates_one_slot_between_interested_peers() {
+    timeout(Duration::from_secs(30), async {
+        let root = Root::new();
+        let fixture = Fixture::new(83, false);
+        let (mut seed, id) = seed_fixture(&root, &fixture).await;
+        seed.set_limits(Limits {
+            upload_peer_slots: 1,
+            payload_budget_bytes: 6 * PIECE,
+            ..Limits::default()
+        })
+        .await
+        .unwrap();
+        seed.set_optimistic_interval_secs(1);
+        let a = Leech::start("127.0.0.1", fixture.hash).await;
+        let b = Leech::start("127.0.0.2", fixture.hash).await;
+        seed.connect_peer(id, a.source).await.unwrap();
+        seed.connect_peer(id, b.source).await.unwrap();
+        let unchoked = |seed: &Driver| {
+            seed.peer_status(id)
+                .into_iter()
+                .filter(|row| !row.we_choke)
+                .map(|row| row.address)
+                .collect::<Vec<_>>()
+        };
+        let start = Instant::now();
+        let mut holders = Vec::new();
+        while holders.len() < 3 {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "slot never rotated: {holders:?}"
+            );
+            seed.step(Duration::from_millis(10)).await.unwrap();
+            let now = unchoked(&seed);
+            assert!(now.len() <= 1, "one slot must never become two: {now:?}");
+            if let Some(holder) = now.first()
+                && holders.last() != Some(holder)
+            {
+                holders.push(*holder);
+            }
+        }
+        assert!(holders.contains(&a.source.address) && holders.contains(&b.source.address));
+        assert_eq!(
+            holders[0], holders[2],
+            "rotation returns to the first holder"
+        );
+        assert!(a.seen().contains(&"unchoke") && a.seen().contains(&"choke"));
+        assert!(b.seen().contains(&"unchoke"));
+        assert_eq!(seed.optimistic_peer(), Some(holders[2]));
+        seed.shutdown().await;
+        a.close().await;
+        b.close().await;
+    })
+    .await
+    .unwrap();
+}

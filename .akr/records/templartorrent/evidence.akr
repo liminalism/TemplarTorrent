@@ -283,6 +283,32 @@ record templartorrent.evidence.no-fixture-live/1 : evidence {
         """
 }
 
+record templartorrent.evidence.optimistic-gates/1 : evidence {
+    title "Same host and tree: 152 workspace tests passed, formatting and all-target Clippy with warnings denied clean."
+    state verified
+    result pass
+    method command
+    observed_at git:61709b07b189fc1b4f3e192941b7c651c0f0341b
+    command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings"
+    artifact "perf-results/2026-10-22-choker/workspace-tests.log"
+    summary """
+        Same host and tree: 152 workspace tests passed, formatting and all-target Clippy with warnings denied clean.
+        """
+}
+
+record templartorrent.evidence.optimistic-rotation/1 : evidence {
+    title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree 61709b0 plus the optimistic-slot change: 24 adapter driver tests passed. New test driver_optimistic_slot_rotates_one_slot_between_interested_peers: a seeding Driver with one upload slot and a one-second rotation period, two interested leech fixtures on 127.0.0.1 and 127.0.0.2; the slot went to the first peer, then the second, then back to the first, with at most one unchoked peer at every step and both peers seeing unchoke; 3 of 3 repeats at about 3.0 s. The existing preference test with the default 30-second period still unchokes the preferred peer first, and Avoid never disconnects."
+    state verified
+    result pass
+    method command
+    observed_at git:61709b07b189fc1b4f3e192941b7c651c0f0341b
+    command "cargo test -p templartorrent-rbit-adapter --test driver"
+    artifact "perf-results/2026-10-22-choker/rotation-repeats.log"
+    summary """
+        Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree 61709b0 plus the optimistic-slot change: 24 adapter driver tests passed. New test driver_optimistic_slot_rotates_one_slot_between_interested_peers: a seeding Driver with one upload slot and a one-second rotation period, two interested leech fixtures on 127.0.0.1 and 127.0.0.2; the slot went to the first peer, then the second, then back to the first, with at most one unchoked peer at every step and both peers seeing unchoke; 3 of 3 repeats at about 3.0 s. The existing preference test with the default 30-second period still unchokes the preferred peer first, and Avoid never disconnects.
+        """
+}
+
 record templartorrent.evidence.peer-preference-client/1 : evidence {
     title "Same host and tree: 21 production client tests passed. The worker now forwards SetPeerPreference to Driver::set_peer_preference and the ack for an unknown job reads \"unknown job\" instead of the former \"peer scoring\" rejection; PeerView carries socket and preference; the Peers tab label no longer calls the feature unavailable and preference_text covers the four choices. Headless only; no window was opened and no clipboard paste ran."
     state verified

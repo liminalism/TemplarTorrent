@@ -89,6 +89,39 @@ record templartorrent.work.file-storage/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.optimistic-unchoke/1 : work {
+    title "Rotating optimistic upload slot inside the configured slot total"
+    state completed
+    scope [
+        path "integration/rbit-adapter/src/driver.rs",
+        path "integration/rbit-adapter/tests/driver.rs"
+    ]
+    intent """
+        DESIGN.md section 6: re-evaluate upload allocations periodically with one optimistic slot inside the configured total whenever slots are above zero and an interested peer would otherwise stay choked; with a one-slot limit rotate that slot instead of adding a second. The Driver orders slots as optimistic peer first, then Prefer, Normal, Avoid in stable connection order; the optimistic peer changes every 30 seconds (test-adjustable) to the next eligible peer by connection id that preference order leaves choked, and a vanished optimistic peer hands the slot back to preference order until the next rotation. The first interval after start runs on preference alone.
+        """
+    note """
+        Done 2026-10-22. Still no throughput, RTT or reliability scoring; hysteresis comes from the stable preference order and the fixed rotation period.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Workspace tests, formatting and all-target Clippy with warnings denied pass.
+                """
+            method command
+            command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings"
+            verified_by [ @templartorrent.evidence.optimistic-gates/1 ]
+        }
+        check rotation {
+            statement """
+                With one upload slot and two interested leeches, the slot moves from the first peer to the second and back on the rotation period, never two slots at once, and the preference test with the default period still unchokes the preferred peer first.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver"
+            verified_by [ @templartorrent.evidence.optimistic-rotation/1 ]
+        }
+    }
+}
+
 record templartorrent.work.peer-preference/1 : work {
     title "Local peer preference: Prefer/Normal/Avoid/Block through Driver, worker and Peers tab"
     state completed

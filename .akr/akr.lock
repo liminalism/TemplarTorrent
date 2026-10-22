@@ -5,8 +5,7 @@ build {
     tool "akr 0.5.2"
     grammar "0.1"
     vocabulary "0.2"
-    commit git:3f1c4789484a4e40fbd76a5930ce219242a2946f
-    source_graph "sha256:4e11837af82260bd62d831f0f5e0409a1006c268d1591f383d6246a528e73deb"
+    source_graph "sha256:add092e8409c455eae84daea43043434e66686b9feca32856ee2dcde4b2c3dee"
 }
 
 source ".akr/project.akr" {
@@ -15,8 +14,8 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/templartorrent/evidence.akr" {
-    hash "sha256:6a43429b9b76ae5ae7336c21c370261d6cc25549fa2726836d2ac3ebe3a0438f"
-    records 54
+    hash "sha256:aeeca5120a0a410459dbe961d06e5c585ed03f32b2a444233e1bde9ce4aa108a"
+    records 56
 }
 
 source ".akr/records/templartorrent/milestones.akr" {
@@ -40,8 +39,8 @@ source ".akr/records/templartorrent/questions.akr" {
 }
 
 source ".akr/records/templartorrent/work.akr" {
-    hash "sha256:84e23896997b4c18a579e3ba22ccab2a03400d9fc1b4bea4d082e4bf3c1c456c"
-    records 13
+    hash "sha256:5d0cda82c7222360ea46b1dfa6692cb2b2490abaccf9ca14d222080f918910cb"
+    records 14
 }
 
 resolution @templartorrent.milestone.performance-baselines/1 {
@@ -349,6 +348,16 @@ seal @templartorrent.evidence.localhost-transfer/1 {
 seal @templartorrent.evidence.no-fixture-live/1 {
     state verified
     hash "sha256:b41e2f9057b039d3f5ae557dac76c5592fd4f22b7e74e67d04742bc0dff1a9d4"
+}
+
+seal @templartorrent.evidence.optimistic-gates/1 {
+    state verified
+    hash "sha256:15d33b2d9f9886f9a26475c1d6e1f5d1e45007e194daf591400da90f298aee0f"
+}
+
+seal @templartorrent.evidence.optimistic-rotation/1 {
+    state verified
+    hash "sha256:a62323b7ae58ea2f12e1a0922735d9f8e0d4cfdf5f29b3ea25fc51d00dc179da"
 }
 
 seal @templartorrent.evidence.peer-preference-client/1 {
@@ -684,6 +693,11 @@ seal @templartorrent.work.engine-scaffold/1 {
 seal @templartorrent.work.file-storage/1 {
     state completed
     hash "sha256:fdd496ebfddaa430dd4baf997e1afdfcc5f36440e73919603a3cc47f9cc72905"
+}
+
+seal @templartorrent.work.optimistic-unchoke/1 {
+    state completed
+    hash "sha256:0656447331c050d09d8e1d16db03d7631543609d7c6898d0bbb748697f69cb3f"
 }
 
 seal @templartorrent.work.peer-preference/1 {

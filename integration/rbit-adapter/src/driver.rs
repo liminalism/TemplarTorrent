@@ -49,6 +49,8 @@ const PREFERENCE_CAP: usize = 256;
 /// Request pipeline for an avoided peer; it stays usable for pieces nobody
 /// else supplies but takes a smaller share.
 const AVOID_PIPELINE: usize = 2;
+/// How often the optimistic upload slot moves to another interested peer.
+const OPTIMISTIC_INTERVAL_S: u64 = 30;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +280,11 @@ pub struct Driver {
     upload_ownership: Arc<UploadOwnership>,
     allow_local_trackers: bool,
     public_trackers: Vec<String>,
+    /// Current optimistic unchoke and when it was granted, in elapsed seconds.
+    optimistic: Option<(PeerId, u64)>,
+    /// Elapsed seconds of the last rotation decision.
+    optimistic_rotated_s: u64,
+    optimistic_interval_s: u64,
 }
 
 impl Driver {
@@ -305,7 +312,22 @@ impl Driver {
             upload_ownership: Arc::default(),
             allow_local_trackers: false,
             public_trackers: Vec::new(),
+            optimistic: None,
+            optimistic_rotated_s: 0,
+            optimistic_interval_s: OPTIMISTIC_INTERVAL_S,
         })
+    }
+
+    /// Rotation period of the optimistic upload slot; tests shorten it.
+    pub fn set_optimistic_interval_secs(&mut self, seconds: u64) {
+        self.optimistic_interval_s = seconds.max(1);
+    }
+
+    /// Peer currently holding the optimistic slot, if any.
+    pub fn optimistic_peer(&self) -> Option<SocketAddr> {
+        self.optimistic
+            .and_then(|(peer, _)| self.wires.get(&peer))
+            .map(|wire| wire.source.address)
     }
     pub fn set_allow_local_trackers(&mut self, allow: bool) {
         self.allow_local_trackers = allow;
@@ -1244,11 +1266,76 @@ impl Driver {
         Ok(())
     }
 
+    /// Slot order: the optimistic peer first, then Prefer, Normal, Avoid in
+    /// stable connection order. One slot inside the configured total rotates
+    /// every interval to an interested peer that preference order would leave
+    /// choked, so a single slot rotates rather than a second appearing. The
+    /// first interval after start runs on preference alone.
+    fn upload_order(&mut self, rows: &Snapshot) -> Vec<PeerId> {
+        let ordered = self.peers_by_preference();
+        let slots = self.limits.upload_peer_slots;
+        if slots == 0 {
+            self.optimistic = None;
+            return ordered;
+        }
+        let now = self.elapsed_s();
+        let eligible = |driver: &Self, peer: PeerId| {
+            driver.wires.get(&peer).is_some_and(|wire| {
+                wire.interested
+                    && driver.session.upload_admitted(wire.torrent)
+                    && rows.jobs.iter().any(|job| {
+                        job.id == wire.torrent
+                            && matches!(job.state, JobState::Downloading | JobState::Seeding)
+                    })
+            })
+        };
+        // A vanished or uninterested optimistic peer hands its slot back to
+        // preference order until the next rotation; no early reassignment.
+        if self
+            .optimistic
+            .is_some_and(|(peer, _)| !eligible(self, peer))
+        {
+            self.optimistic = None;
+        }
+        if now.saturating_sub(self.optimistic_rotated_s) >= self.optimistic_interval_s {
+            self.optimistic_rotated_s = now;
+            // Regular slots are the configured total minus the optimistic one.
+            let regular: Vec<PeerId> = ordered
+                .iter()
+                .copied()
+                .filter(|peer| eligible(self, *peer))
+                .take(slots.saturating_sub(1))
+                .collect();
+            let last = self.optimistic.map(|(peer, _)| peer.0);
+            let mut candidates: Vec<PeerId> = ordered
+                .iter()
+                .copied()
+                .filter(|peer| eligible(self, *peer) && !regular.contains(peer))
+                .collect();
+            candidates.sort_unstable_by_key(|peer| peer.0);
+            let next = match last {
+                Some(last) => candidates
+                    .iter()
+                    .copied()
+                    .find(|peer| peer.0 > last)
+                    .or_else(|| candidates.first().copied()),
+                None => candidates.first().copied(),
+            };
+            self.optimistic = next.map(|peer| (peer, now));
+        }
+        match self.optimistic {
+            Some((peer, _)) => {
+                let mut order = vec![peer];
+                order.extend(ordered.into_iter().filter(|other| *other != peer));
+                order
+            }
+            None => ordered,
+        }
+    }
+
     async fn service_uploads(&mut self) {
         let rows = self.session.snapshot();
-        // Preferred peers take upload slots first, avoided peers last; ties
-        // keep the stable connection order.
-        let peers = self.peers_by_preference();
+        let peers = self.upload_order(&rows);
         let mut slots = 0;
         for peer in peers {
             let Some(wire) = self.wires.get(&peer) else {
