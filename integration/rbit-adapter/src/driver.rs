@@ -1991,7 +1991,8 @@ impl Driver {
             let url = tracker.url.clone();
             match announce_detached(
                 &url,
-                crate::Announce {
+                self.allow_local_trackers,
+                crate::announce::AnnounceRequest {
                     info_hash: &hash,
                     peer_id: &peer_id,
                     port,
@@ -2221,7 +2222,8 @@ impl Driver {
         let peer_id = self.peer_id;
         announce_detached(
             url,
-            crate::Announce {
+            self.allow_local_trackers,
+            crate::announce::AnnounceRequest {
                 info_hash: &hash,
                 peer_id: &peer_id,
                 port,
@@ -2356,18 +2358,23 @@ impl Drop for Driver {
     }
 }
 
+/// Resolve and classify the tracker again, then announce over the
+/// application-owned HTTP transport to the admitted address. Errors carry the
+/// transport's reason so the Trackers tab can show it.
 async fn announce_detached(
     url: &str,
-    announce: crate::Announce<'_>,
+    allow_local: bool,
+    announce: crate::announce::AnnounceRequest<'_>,
 ) -> Result<rbit::AnnounceResponse> {
-    let tracker = rbit::HttpTracker::new(url).map_err(|_| DriverError("invalid tracker URL"))?;
-    timeout(
-        Duration::from_secs(10),
-        crate::announce_selected(&tracker, announce),
-    )
-    .await
-    .map_err(|_| DriverError("tracker announce deadline exceeded"))?
-    .map_err(|_| DriverError("tracker announce failed"))
+    let admitted = crate::discovery::admit_tracker(url, allow_local)
+        .await
+        .map_err(DriverError)?;
+    let address = admitted
+        .connect_address()
+        .ok_or(DriverError("tracker host did not resolve"))?;
+    crate::announce::announce(&admitted.tracker, address, &announce)
+        .await
+        .map_err(DriverError)
 }
 
 fn pipeline_for(preference: PeerPreference) -> usize {

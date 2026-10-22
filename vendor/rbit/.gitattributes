@@ -1,0 +1,26 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Rust sources
+*.rs text eol=lf
+
+# Cargo files
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
+
+# Documentation
+*.md text eol=lf
+
+# Configuration
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+
+# Deny large binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary

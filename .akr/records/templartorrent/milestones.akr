@@ -107,6 +107,51 @@ record templartorrent.milestone.native-app-wiring/1 : milestone {
     }
 }
 
+record templartorrent.milestone.native-source-gate/1 : milestone {
+    title "Close the strict native-source audit for the default build"
+    state completed
+    scope [
+        path "Cargo.toml",
+        path "docs/DEPENDENCY-AUDIT.md",
+        path "integration/rbit-adapter/**",
+        path "vendor/rbit/**"
+    ]
+    intent """
+        Remove ring, rustls and reqwest from the workspace dependency graph by forking rbit 0.2.2 in-tree with reqwest optional, announce to HTTP trackers over an application-owned bounded transport, refuse https trackers with a visible reason, and document the remaining accepted boundary (OS bindings such as libc, wayland-sys, drm-sys, linux-raw-sys and pure-Rust build scripts).
+        """
+    note """
+        Opened 2026-10-22 after the owner chose the fork option for question ring-release-gate. HTTPS tracker support stays open as a separate, explicitly visible limitation.
+        """
+    acceptance {
+        check announce-transport {
+            statement """
+                Adapter tests show the application-owned announce building a correct GET with the passkey query preserved and binary fields percent-encoded, accepting 200 responses with content length or chunked encoding, refusing redirects, non-200, truncation and oversize, parsing compact and dictionary peers, refusing https with a visible reason, and the existing loopback tracker fixtures still discovering peers end to end.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter"
+            verified_by [ @templartorrent.evidence.announce-transport/1 ]
+        }
+        check gates {
+            statement """
+                Workspace tests, formatting, Clippy with warnings denied and the release build pass against the forked rbit.
+                """
+            method command
+            command "cargo test --workspace --all-targets && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release -p templartorrent"
+            verified_by [ @templartorrent.evidence.fork-gates/1 ]
+        }
+        check ring-absent {
+            statement """
+                cargo tree on the workspace graph finds no package named ring, rustls or reqwest, and the only -sys crates are OS bindings.
+                """
+            method command
+            command "cargo tree --workspace --offline -i ring"
+            verified_by [ @templartorrent.evidence.native-audit-after-fork/1 ]
+        }
+    }
+    after [ @templartorrent.milestone.picker-optimization ]
+    derived_from [ @templartorrent.decision.fork-rbit-for-native-gate ]
+}
+
 record templartorrent.milestone.performance-baselines/1 : milestone {
     title "Performance baselines recorded before any optimization"
     state completed

@@ -26,7 +26,13 @@ system paths with a fontconfig fallback (`--font` overrides it).
 
 The GUI preview pins all PixelKit crates to:
 `614c9c6e84ce3cd0bc6c81988f636b493b30a497`.
-The rbit adapter pins `rbit = "=0.2.2"`.
+The rbit adapter pins `rbit = "=0.2.2"`, resolved through `[patch.crates-io]`
+to the in-tree fork at `vendor/rbit`: identical source with `reqwest` behind an
+off-by-default `http-client` feature, so the default graph carries no
+rustls/ring. HTTP tracker announces use the application's own bounded
+transport (`integration/rbit-adapter/src/announce.rs`); `https://` trackers
+are refused with a visible reason until a reviewed pure-Rust TLS stack exists.
+See `vendor/rbit/TEMPLARTORRENT-FORK.md` and `docs/DEPENDENCY-AUDIT.md`.
 
 Dependency resolution, Cargo.lock generation and compilation were **not performed**
 in the authoring environment: `rustc` and `cargo` were unavailable, and container

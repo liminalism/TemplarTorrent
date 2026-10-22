@@ -2,8 +2,7 @@
 //! restart recheck. No internet endpoints, public discovery or generated progress.
 use bytes::Bytes;
 use rbit::{
-    HttpTracker, InfoHash, Message, Metainfo, PeerConnection, TorrentBuilder, TorrentVersion,
-    TrackerEvent,
+    InfoHash, Message, Metainfo, PeerConnection, TorrentBuilder, TorrentVersion, TrackerEvent,
 };
 use sha1::{Digest, Sha1};
 use std::{
@@ -27,7 +26,10 @@ use templartorrent_engine::{
     worker::{PieceReader, PieceVerifier},
 };
 use templartorrent_rbit_adapter::{
-    Announce, Source, announce_selected, parse_magnet, record_tracker_success, unpack_bitfield,
+    Source,
+    announce::{AnnounceRequest, announce},
+    discovery::parse_tracker_url,
+    parse_magnet, record_tracker_success, unpack_bitfield,
 };
 use templartorrent_storage::SharedStore;
 use tokio::{
@@ -404,7 +406,8 @@ async fn tracker_to_multiblock_transfer_then_seed_from_disk() {
         let listener = listen().await;
         let addr = listener.local_addr().unwrap();
         let tracker_listener = listen().await;
-        let tracker_url = format!("http://{}/announce", tracker_listener.local_addr().unwrap());
+        let tracker_addr = tracker_listener.local_addr().unwrap();
+        let tracker_url = format!("http://{tracker_addr}/announce");
         let fixture_hash = fixture
             .hash
             .iter()
@@ -422,10 +425,11 @@ async fn tracker_to_multiblock_transfer_then_seed_from_disk() {
         let tracker_task = tokio::spawn(tracker(tracker_listener, addr));
         let mut clock = TrackerClock::new();
         assert!(clock.begin(0, false));
-        let tracker = HttpTracker::new(&magnet.trackers[0]).unwrap();
-        let response = announce_selected(
+        let tracker = parse_tracker_url(&magnet.trackers[0]).unwrap();
+        let response = announce(
             &tracker,
-            Announce {
+            tracker_addr,
+            &AnnounceRequest {
                 info_hash: &hash,
                 peer_id: &LEECH,
                 port: 6881,

@@ -2,14 +2,15 @@
 //! Networking requires explicit calls and permitted sources; this is not yet a
 //! release-ready full session client. See driver module for remaining gates.
 #![forbid(unsafe_code)]
-mod discovery;
+pub mod announce;
+pub mod discovery;
 pub mod driver;
 pub mod metadata;
 mod preflight;
 pub mod torrent;
 use rbit::{
-    AnnounceResponse, Block, BlockRequest, ExtensionHandshake, HttpTracker, MagnetLink, Message,
-    Metainfo, PeerConnection, PeerError, TrackerEvent,
+    AnnounceResponse, Block, BlockRequest, ExtensionHandshake, MagnetLink, Message, Metainfo,
+    PeerConnection, PeerError,
 };
 use templartorrent_core::{
     model::clean_label,
@@ -129,34 +130,6 @@ pub fn client_name(handshake: Option<&ExtensionHandshake>) -> String {
         .map(|s| clean_label(s, 80))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Unknown".into())
-}
-pub struct Announce<'a> {
-    pub info_hash: &'a [u8; 20],
-    pub peer_id: &'a [u8; 20],
-    pub port: u16,
-    pub uploaded: u64,
-    pub downloaded: u64,
-    pub left: u64,
-    pub event: TrackerEvent,
-}
-/// The session must already have acquired TrackerClock::begin and the global announce
-/// permit, validated tracker provenance/privacy and bounded response allocation in the
-/// transport. Do not use a bare HTTP call as the production tracker policy.
-pub async fn announce_selected(
-    tracker: &HttpTracker,
-    request: Announce<'_>,
-) -> Result<AnnounceResponse, Error> {
-    Ok(tracker
-        .announce(
-            request.info_hash,
-            request.peer_id,
-            request.port,
-            request.uploaded,
-            request.downloaded,
-            request.left,
-            request.event,
-        )
-        .await?)
 }
 pub fn record_tracker_success(
     clock: &mut TrackerClock,

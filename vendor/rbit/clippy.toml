@@ -1,0 +1,26 @@
+# Clippy configuration
+# See: https://doc.rust-lang.org/clippy/lint_configuration.html
+
+# Cognitive complexity threshold for functions
+cognitive-complexity-threshold = 30
+
+# Maximum lines in a function body
+too-many-lines-threshold = 150
+
+# Maximum number of function arguments
+too-many-arguments-threshold = 8
+
+# Type complexity threshold
+type-complexity-threshold = 300
+
+# Maximum documentation length for trivial functions
+trivial-copy-size-limit = 16
+
+# MSRV for lint suggestions
+msrv = "1.85"
+
+# Allow certain patterns common in network protocol code
+allow-unwrap-in-tests = true
+
+# Large error types are acceptable for detailed error reporting
+large-error-threshold = 256

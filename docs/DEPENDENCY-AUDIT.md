@@ -48,6 +48,29 @@ https://docs.rs/crate/rbit/0.2.2/source/Cargo.lock
 https://docs.rs/ring/latest/ring/
 https://docs.rs/rustls-rustcrypto/latest/rustls_rustcrypto/
 
+## Status 2026-10-22: rbit forked in-tree, ring removed from the graph
+
+The owner chose the fork direction. `vendor/rbit` is the published rbit 0.2.2
+source with `reqwest` made optional behind an off-by-default `http-client`
+feature (see `vendor/rbit/TEMPLARTORRENT-FORK.md`); the workspace applies it
+through `[patch.crates-io]`. The adapter announces to HTTP trackers through its
+own bounded plain-HTTP transport (`integration/rbit-adapter/src/announce.rs`):
+one connection to the already-classified address, no redirects, 64 KiB cap,
+`Connection: close`, bencode parsed into rbit's `AnnounceResponse`.
+
+Consequences, stated rather than hidden:
+
+- `cargo tree -i ring`, `-i rustls` and `-i reqwest` on the workspace graph now
+  report nothing. Raw output is kept with each handoff under `perf-results/`.
+- `https://` trackers are refused with a visible reason. This is the explicit
+  limitation the paragraph above warned against removing silently; restoring
+  HTTPS requires choosing and reviewing a pure-Rust TLS stack, which remains
+  open. rbit's WebSeed and UPnP modules are unavailable without the feature and
+  were never used.
+- Remaining non-Rust boundary: OS bindings (`libc`, Wayland/X11 shell crates
+  used by PixelKit) and build scripts of pure-Rust crates. Review the package
+  list in the audit log for `-sys` crates each time the lockfile changes.
+
 ## PixelKit Windows integration gate
 
 The reviewed README supports Linux/macOS clipboard transport and reports other

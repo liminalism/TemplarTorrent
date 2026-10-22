@@ -20,8 +20,9 @@ default-members = [
     "crates/templartorrent-storage",
     "integration/templartorrent",
 ]
-# Fixture preview stays its own workspace.
-exclude = ["integration/pixelkit-preview"]
+# Fixture preview stays its own workspace. The rbit fork is a path dependency
+# applied through [patch.crates-io], not a member.
+exclude = ["integration/pixelkit-preview", "vendor/rbit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -39,3 +40,9 @@ strip = "debuginfo"
 inherits = "release"
 debug = 1
 strip = "none"
+
+# In-tree fork of rbit 0.2.2 (MIT OR Apache-2.0, https://github.com/jspwrd/rbit):
+# identical source except that reqwest is optional (feature `http-client`),
+# so the default graph carries no rustls/ring. See vendor/rbit/TEMPLARTORRENT-FORK.md.
+[patch.crates-io]
+rbit = { path = "vendor/rbit" }

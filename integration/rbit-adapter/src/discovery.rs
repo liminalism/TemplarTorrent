@@ -4,7 +4,7 @@
 //! stay intact for announce and are stripped from any label.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
@@ -191,6 +191,20 @@ pub async fn resolve_tracker(parsed: &ParsedTracker) -> Result<Vec<IpAddr>, &'st
 pub struct AdmittedTracker {
     pub tracker: ParsedTracker,
     pub local: bool,
+    /// Resolved and classified addresses; announces connect to one of these
+    /// rather than resolving the host again.
+    pub addresses: Vec<IpAddr>,
+}
+
+impl AdmittedTracker {
+    /// The address an announce connects to: the first IPv4, else the first.
+    pub fn connect_address(&self) -> Option<SocketAddr> {
+        self.addresses
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or(self.addresses.first())
+            .map(|ip| SocketAddr::new(*ip, self.tracker.port))
+    }
 }
 
 pub async fn admit_tracker(url: &str, allow_local: bool) -> Result<AdmittedTracker, &'static str> {
@@ -200,6 +214,7 @@ pub async fn admit_tracker(url: &str, allow_local: bool) -> Result<AdmittedTrack
     Ok(AdmittedTracker {
         local: addresses.iter().any(|ip| is_restricted_ip(*ip)),
         tracker: parsed,
+        addresses,
     })
 }
 
