@@ -89,6 +89,43 @@ record templartorrent.work.file-storage/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.https-rustls/1 : work {
+    title "HTTPS tracker announces through rustls 0.23.46"
+    state completed
+    scope [
+        path "Cargo.lock",
+        path "Cargo.toml",
+        path "README.md",
+        path "docs/DEPENDENCY-AUDIT.md",
+        path "integration/rbit-adapter/**"
+    ]
+    intent """
+        Replace the visible HTTPS refusal with a rustls 0.23.46 client on the existing bounded announce transport. Pin that release, enable only std, tls12 and aws_lc_rs, verify server certificates against the webpki roots, keep redirects refused and the 64 KiB cap, and prove a localhost handshake accepts a matching certificate and rejects a name mismatch. ring and reqwest stay out of the graph.
+        """
+    note """
+        aws-lc-sys is the native code rustls 0.23.46 uses for cryptography. It is recorded as an accepted boundary, not as a pure-Rust stack. Brotli stays disabled.
+        """
+    acceptance {
+        check localhost-tls {
+            statement """
+                A localhost HTTPS announce completes against a certificate whose name matches the tracker host, and a certificate for a different name fails the handshake before any announce body is parsed.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --offline --lib -- announce::"
+            verified_by [ @templartorrent.evidence.https-rustls/1 ]
+        }
+        check native-boundary {
+            statement """
+                cargo tree on the workspace shows rustls 0.23.46 and aws-lc-sys, and shows no ring and no reqwest.
+                """
+            method command
+            command "cargo tree --workspace --offline -i rustls"
+            verified_by [ @templartorrent.evidence.https-rustls-audit/1 ]
+        }
+    }
+    depends_on [ @templartorrent.decision.fork-rbit-for-native-gate ]
+}
+
 record templartorrent.work.multi-lease-pipelining/1 : work {
     title "Lease several small pieces per peer so the request pipeline fills across pieces"
     state completed

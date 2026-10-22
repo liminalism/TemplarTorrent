@@ -205,6 +205,30 @@ record templartorrent.evidence.fork-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.https-rustls/1 : evidence {
+    title "Localhost HTTPS announce checks the certificate name"
+    state verified
+    result pass
+    method command
+    observed_at git:3bb7995e5291fe34eae6f636c6a6687b7a149fd0
+    command "cargo test -p templartorrent-rbit-adapter --offline -- --test-threads=8"
+    summary """
+        Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, commit 3bb7995. cargo test -p templartorrent-rbit-adapter --offline passed 21 lib tests, 26 driver tests, 11 localhost tests and 3 multiblock tests. https_announce_checks_the_certificate_name completes a localhost announce against a CA-issued certificate for localhost and rejects a certificate issued for other.example with tracker TLS handshake failed. cargo test -p templartorrent --offline --lib passed 29 tests. Preview tests and the release binary were not run.
+        """
+}
+
+record templartorrent.evidence.https-rustls-audit/1 : evidence {
+    title "rustls 0.23.46 and aws-lc-sys are in the graph; ring and reqwest are not built"
+    state verified
+    result pass
+    method command
+    observed_at git:3bb7995e5291fe34eae6f636c6a6687b7a149fd0
+    command "cargo tree --workspace --offline -i rustls"
+    summary """
+        Same tree. cargo tree --workspace --offline -i rustls shows rustls 0.23.46 under the adapter and the application, via tokio-rustls 0.26.6. cargo tree -i aws-lc-sys shows aws-lc-sys 0.46.0 under aws-lc-rs 1.18.2, rustls and rustls-webpki. cargo tree -i ring prints nothing. cargo tree -i reqwest reports that the package did not match. Cargo.lock still names ring as an unused optional dependency of rustls-webpki. cargo clippy -p templartorrent-rbit-adapter --all-targets --offline -- -D warnings finished with no diagnostics. Brotli is not a feature.
+        """
+}
+
 record templartorrent.evidence.live-commands/1 : evidence {
     title "Live commands dispatch with reliable acks"
     state verified

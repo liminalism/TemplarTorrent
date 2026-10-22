@@ -351,7 +351,7 @@ record templartorrent.observation.complete-piece-status/9 : observation {
 
 record templartorrent.observation.complete-piece-status/10 : observation {
     title "Linux client with a durability-gated resume bitmap; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-22, Linux x86_64 Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, committed on master at f1d59c5. A schema-versioned resume bitmap (templartorrent-resume 1) sits beside the job record. A set bit is adopted without hashing only when the record carries a durability barrier and every file that piece spans still matches the device, inode, size and mtime captured after sync_all. A changed file is hashed. A missing, barrier-less or malformed bitmap trusts nothing and leaves a visible note. The bitmap is written on command save, at most every 10 seconds when verified bytes change, and on worker shutdown before jobs are dropped. 169 workspace tests passed on that commit. Formatting and Clippy with denied warnings were clean on storage, engine, the rbit adapter and the application. Preview tests and the release binary were not re-run. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; no RTT or reliability scoring, only rates; https trackers stay refused until a reviewed pure-Rust TLS stack is chosen; webseed and UPnP unavailable; no headful interaction or clipboard paste in evidence; window close persists through the worker shutdown flush, with no headful close path in evidence; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows optional and untested.
         """
@@ -361,6 +361,28 @@ record templartorrent.observation.complete-piece-status/10 : observation {
     supersedes [ @templartorrent.observation.complete-piece-status/9 ]
     verified_by [
         @templartorrent.evidence.announce-transport,
+        @templartorrent.evidence.multi-lease-before-after,
+        @templartorrent.evidence.native-audit-after-fork,
+        @templartorrent.evidence.rate-ranking,
+        @templartorrent.evidence.resume-bitmap,
+        @templartorrent.evidence.resume-bitmap-gates
+    ]
+}
+
+record templartorrent.observation.complete-piece-status/11 : observation {
+    title "Linux client with rustls 0.23.46 HTTPS announces and a resume bitmap; remaining boundaries"
+    state verified
+    statement """
+        2026-10-22, Linux x86_64 Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, committed on master at 3bb7995. HTTPS tracker announces use rustls 0.23.46 with default features off and aws_lc_rs enabled, the cryptography provider that release turns on by default. Certificates are checked against the webpki public roots and the name in the tracker URL. ring is not compiled. aws-lc-sys is C, built with cmake, and is an accepted native boundary for tracker TLS. Brotli is not enabled. The resume bitmap from f1d59c5 is unchanged: a set bit is adopted without hashing only when the durability barrier is set and every file that piece spans still matches device, inode, size and mtime captured after sync_all. On this commit the adapter suite passed (21 lib, 26 driver, 11 localhost, 3 multiblock) and the application lib tests passed (29). Clippy with denied warnings was clean for the adapter, all targets. Preview tests, the rest of the workspace suite and the release binary were not re-run. Remaining boundaries: pieces written after the last checkpoint are rechecked and there is no per-block journal; file identity is not a content hash, so an in-place edit that restores inode, size and mtime is not detected; no RTT or reliability scoring, only rates; webseed and UPnP unavailable; no headful interaction or clipboard paste in evidence; window close persists through the worker shutdown flush, with no headful close path in evidence; download order inside one file follows the seeded tie-break; the rbit fork must be re-applied on any upstream upgrade; Windows optional and untested.
+        """
+    observed_at git:3bb7995e5291fe34eae6f636c6a6687b7a149fd0
+    method command
+    watches [ "crates/**", "integration/**", "vendor/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/10 ]
+    verified_by [
+        @templartorrent.evidence.announce-transport,
+        @templartorrent.evidence.https-rustls,
+        @templartorrent.evidence.https-rustls-audit,
         @templartorrent.evidence.multi-lease-before-after,
         @templartorrent.evidence.native-audit-after-fork,
         @templartorrent.evidence.rate-ranking,
