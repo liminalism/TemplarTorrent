@@ -19,6 +19,10 @@ pub struct PeerTransport {
 
 impl PeerTransport {
     pub fn new(stream: TcpStream) -> Self {
+        // Peer messages are small and pipelined. With Nagle on, a Request
+        // waits for the ACK of the one before it, which the remote delays
+        // by up to 40 ms on Linux. Failure leaves the default; not fatal.
+        let _ = stream.set_nodelay(true);
         Self {
             stream,
             read_buf: BytesMut::with_capacity(32 * 1024),

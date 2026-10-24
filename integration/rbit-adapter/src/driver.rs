@@ -1793,9 +1793,11 @@ impl Driver {
     }
 
     /// Pieces the engine has verified, plus file identity taken after a
-    /// full sync. The barrier is set because verification runs only after
-    /// `write_piece` has synced the bytes, and [`SharedStore::durable_identity`]
-    /// syncs inode fields before the stamps in this record.
+    /// full sync. The barrier is set because the verified set is read first
+    /// and every piece in it was already written; [`SharedStore::durable_identity`]
+    /// then syncs those bytes and the inode fields before the stamps in this
+    /// record. Keep that order: a set read after the sync could name a piece
+    /// that is still only in the page cache.
     pub fn export_resume(&self, id: TorrentId) -> Result<ResumeRecord> {
         let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
         let words = self

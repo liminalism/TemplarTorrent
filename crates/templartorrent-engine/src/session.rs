@@ -169,7 +169,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Only synced, hash-verified pieces are advertised to upload peers.
+    /// Only written, hash-verified pieces are advertised to upload peers.
     pub fn verified_pieces(&self, id: TorrentId) -> Result<Vec<u64>, EngineError> {
         let job = self
             .jobs

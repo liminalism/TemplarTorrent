@@ -44,5 +44,11 @@ Panic fixes, 2026-10-24, each found by a target in `fuzz/` and pinned by
   and its siblings wrap. The transport always passed exact frames; direct
   callers did not have to.
 
+Performance, 2026-10-24: `src/peer/transport.rs` sets `TCP_NODELAY` on
+every peer stream. Without it a pipelined Request waited for the delayed ACK
+of the previous one (about 40 ms on Linux); the 32 MiB loopback scenario went
+from about 5.3 s to under 0.1 s. Evidence in
+perf-results/2026-10-24-write-path/.
+
 Nothing else is modified. Upgrading rbit means re-applying exactly these
 hunks, or checking that upstream fixed the same inputs.

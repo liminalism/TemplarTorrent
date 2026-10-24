@@ -358,10 +358,11 @@ impl FileStore {
         Ok(stamps)
     }
 
-    /// [`FileStore::file_identity`] after `sync_all` on every handle. Piece
-    /// writes already `sync_data` the bytes; this also pushes mtime, which
-    /// the resume stamp records, so a crash cannot keep the bitmap and lose
-    /// the identity it names.
+    /// [`FileStore::file_identity`] after `sync_all` on every handle. This is
+    /// the only data barrier: piece writes leave bytes in the page cache, and
+    /// `sync_all` makes every piece written so far durable together with the
+    /// mtime the resume stamp records, so a crash cannot keep the bitmap and
+    /// lose either the bytes or the identity it names.
     pub fn durable_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {
         let job = self.jobs.get(&id.0).ok_or(StorageError::UnknownJob(id))?;
         for file in &job.files {
@@ -449,11 +450,11 @@ impl PieceSink for FileStore {
             file.handle
                 .seek(SeekFrom::Start(offset - file.offset))
                 .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            // No per-piece sync: durability is batched at the resume
+            // checkpoint (`durable_identity`), and a piece written after the
+            // last checkpoint is rechecked by hash on restart.
             file.handle
                 .write_all(&remaining[..writable])
-                .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
-            file.handle
-                .sync_data()
                 .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
             remaining = &remaining[writable..];
             offset += writable as u64;
