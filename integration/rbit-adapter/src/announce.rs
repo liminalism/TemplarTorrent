@@ -264,6 +264,10 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, &'static str> {
         if size == 0 {
             return Ok(out);
         }
+        // Checked before `size + 2`, which a 16-digit size would overflow.
+        if size > MAX_RESPONSE_BYTES {
+            return Err("tracker response exceeds 64 KiB");
+        }
         if body.len() < size + 2 {
             return Err("tracker chunk is truncated");
         }

@@ -634,7 +634,12 @@ fn parse_info_v1(value: &Value) -> Result<Info, MetainfoError> {
     let piece_length = dict
         .get(b"piece length".as_slice())
         .and_then(|v| v.as_integer())
-        .ok_or(MetainfoError::MissingField("piece length"))? as u64;
+        .ok_or(MetainfoError::MissingField("piece length"))?;
+    let piece_length = length_field(piece_length, "piece length")?;
+    // Every per-file piece count divides by this.
+    if piece_length == 0 {
+        return Err(MetainfoError::InvalidField("piece length"));
+    }
 
     let pieces_bytes = dict
         .get(b"pieces".as_slice())
@@ -663,7 +668,7 @@ fn parse_info_v1(value: &Value) -> Result<Info, MetainfoError> {
     let (files, total_length) = if let Some(length) =
         dict.get(b"length".as_slice()).and_then(|v| v.as_integer())
     {
-        let length = length as u64;
+        let length = length_field(length, "length")?;
         let file = File {
             path: PathBuf::from(&name),
             length,
@@ -684,7 +689,8 @@ fn parse_info_v1(value: &Value) -> Result<Info, MetainfoError> {
             let length = file_dict
                 .get(b"length".as_slice())
                 .and_then(|v| v.as_integer())
-                .ok_or(MetainfoError::MissingField("file length"))? as u64;
+                .ok_or(MetainfoError::MissingField("file length"))?;
+            let length = length_field(length, "file length")?;
 
             let path_list = file_dict
                 .get(b"path".as_slice())
@@ -713,7 +719,7 @@ fn parse_info_v1(value: &Value) -> Result<Info, MetainfoError> {
                 attr,
             });
 
-            offset += length;
+            offset = add_length(offset, length)?;
         }
 
         let total = offset;
@@ -785,6 +791,19 @@ fn parse_piece_layers(dict: &BTreeMap<Bytes, Value>) -> Result<PieceLayers, Meta
 ///
 /// - Must be a power of 2
 /// - Must be at least 16 KiB (16384 bytes)
+/// Bencode integers are signed. A negative length is refused, not cast to a
+/// huge u64.
+pub(super) fn length_field(value: i64, field: &'static str) -> Result<u64, MetainfoError> {
+    u64::try_from(value).map_err(|_| MetainfoError::InvalidField(field))
+}
+
+/// Sum of file lengths or offsets; a sum past u64 is a malformed torrent.
+fn add_length(total: u64, length: u64) -> Result<u64, MetainfoError> {
+    total
+        .checked_add(length)
+        .ok_or(MetainfoError::InvalidField("total length overflows"))
+}
+
 fn validate_piece_length(piece_length: u64) -> Result<(), MetainfoError> {
     const MIN_PIECE_LENGTH: u64 = 16384; // 16 KiB
 
@@ -827,7 +846,8 @@ fn parse_info_v2(value: &Value, piece_layers: PieceLayers) -> Result<Info, Metai
     let piece_length = dict
         .get(b"piece length".as_slice())
         .and_then(|v| v.as_integer())
-        .ok_or(MetainfoError::MissingField("piece length"))? as u64;
+        .ok_or(MetainfoError::MissingField("piece length"))?;
+    let piece_length = length_field(piece_length, "piece length")?;
 
     // Validate piece length per BEP-52
     validate_piece_length(piece_length)?;
@@ -913,13 +933,16 @@ fn parse_info_v2(value: &Value, piece_layers: PieceLayers) -> Result<Info, Metai
             attr: flat_file.attr,
         });
 
-        total_length += flat_file.length;
+        total_length = add_length(total_length, flat_file.length)?;
 
         // In v2, files are piece-aligned
         // Next file starts at the next piece boundary
         if flat_file.length > 0 {
             let pieces_for_file = flat_file.length.div_ceil(piece_length);
-            offset += pieces_for_file * piece_length;
+            let span = pieces_for_file
+                .checked_mul(piece_length)
+                .ok_or(MetainfoError::InvalidField("total length overflows"))?;
+            offset = add_length(offset, span)?;
         }
     }
 
@@ -950,7 +973,8 @@ fn parse_info_hybrid(value: &Value, piece_layers: PieceLayers) -> Result<Info, M
     let piece_length = dict
         .get(b"piece length".as_slice())
         .and_then(|v| v.as_integer())
-        .ok_or(MetainfoError::MissingField("piece length"))? as u64;
+        .ok_or(MetainfoError::MissingField("piece length"))?;
+    let piece_length = length_field(piece_length, "piece length")?;
 
     // Validate piece length per BEP-52 (applies to hybrid too)
     validate_piece_length(piece_length)?;
@@ -1014,8 +1038,8 @@ fn parse_info_hybrid(value: &Value, piece_layers: PieceLayers) -> Result<Info, M
             attr: flat_file.attr,
         });
 
-        total_length += flat_file.length;
-        offset += flat_file.length; // v1-style contiguous offset
+        total_length = add_length(total_length, flat_file.length)?;
+        offset = add_length(offset, flat_file.length)?; // v1-style contiguous offset
     }
 
     // Validate hybrid torrent consistency per BEP-52:

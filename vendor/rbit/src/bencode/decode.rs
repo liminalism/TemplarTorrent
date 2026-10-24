@@ -116,12 +116,14 @@ fn decode_bytes(data: &[u8], pos: &mut usize) -> Result<Value, BencodeError> {
 
     *pos += 1;
 
-    if *pos + len > data.len() {
-        return Err(BencodeError::UnexpectedEof);
-    }
+    // A length near usize::MAX must not wrap past the end of the input.
+    let end = pos
+        .checked_add(len)
+        .filter(|&end| end <= data.len())
+        .ok_or(BencodeError::UnexpectedEof)?;
 
-    let bytes = Bytes::copy_from_slice(&data[*pos..*pos + len]);
-    *pos += len;
+    let bytes = Bytes::copy_from_slice(&data[*pos..end]);
+    *pos = end;
 
     Ok(Value::Bytes(bytes))
 }
@@ -147,9 +149,11 @@ fn decode_dict(data: &[u8], pos: &mut usize, depth: usize) -> Result<Value, Benc
     let mut dict = BTreeMap::new();
 
     while *pos < data.len() && data[*pos] != b'e' {
+        // Read before decoding: a non-string key can end at the input's end.
+        let key_start = data[*pos];
         let key = match decode_value(data, pos, depth + 1)? {
             Value::Bytes(b) => b,
-            _ => return Err(BencodeError::UnexpectedChar(data[*pos] as char)),
+            _ => return Err(BencodeError::UnexpectedChar(key_start as char)),
         };
 
         let value = decode_value(data, pos, depth + 1)?;

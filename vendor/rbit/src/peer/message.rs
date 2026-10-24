@@ -495,6 +495,9 @@ impl Message {
         if data.remaining() < length {
             return Err(PeerError::InvalidMessage("incomplete message".into()));
         }
+        // Bytes after the frame are not part of this message. Without this the
+        // per-message length checks below see them and `length - 9` can wrap.
+        data.truncate(length);
 
         let id = MessageId::try_from(data.get_u8())?;
 

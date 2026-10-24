@@ -75,8 +75,10 @@ impl ExtensionHandshake {
         if let Some(m) = dict.get(b"m".as_slice()).and_then(|v| v.as_dict()) {
             for (key, val) in m {
                 if let (Ok(name), Some(id)) = (std::str::from_utf8(key), val.as_integer()) {
-                    if id > 0 {
-                        hs.extensions.insert(name.to_string(), id as u8);
+                    // An id past 255 is skipped, not truncated onto another
+                    // extension (256 would alias the handshake id 0).
+                    if let Ok(id @ 1..) = u8::try_from(id) {
+                        hs.extensions.insert(name.to_string(), id);
                     }
                 }
             }

@@ -1,0 +1,10 @@
+templartorrent-settings 1
+download_jobs 2
+seed_jobs 3
+upload_peer_slots 4
+connections_total 80
+connections_per_job 40
+download_kb_s 0
+upload_kb_s 512
+payload_budget_bytes 50331648
+allow_local_trackers 1

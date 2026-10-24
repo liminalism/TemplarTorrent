@@ -1,0 +1,80 @@
+# Bounded parser fuzzing (DESIGN.md section 10). Its own workspace so
+# libfuzzer-sys, which builds libFuzzer from C++, never enters the shipping
+# graph that the native-source audit covers. Needs nightly:
+#   cargo +nightly fuzz run <target> -- -max_total_time=<seconds>
+[package]
+name = "templartorrent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.4", features = ["derive"] }
+bytes = "1"
+rbit = "=0.2.2"
+templartorrent-rbit-adapter = { path = "../integration/rbit-adapter" }
+templartorrent = { path = "../integration/templartorrent" }
+templartorrent-core = { path = "../crates/templartorrent-core" }
+templartorrent-engine = { path = "../crates/templartorrent-engine" }
+
+[workspace]
+members = ["."]
+
+[patch.crates-io]
+rbit = { path = "../vendor/rbit" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "tracker_response"
+path = "fuzz_targets/tracker_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metainfo"
+path = "fuzz_targets/metainfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "magnet_and_tracker_url"
+path = "fuzz_targets/magnet_and_tracker_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_wire"
+path = "fuzz_targets/peer_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bencode"
+path = "fuzz_targets/bencode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "persist_records"
+path = "fuzz_targets/persist_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine_session"
+path = "fuzz_targets/engine_session.rs"
+test = false
+doc = false
+bench = false

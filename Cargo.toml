@@ -22,7 +22,7 @@ default-members = [
 ]
 # Fixture preview stays its own workspace. The rbit fork is a path dependency
 # applied through [patch.crates-io], not a member.
-exclude = ["integration/pixelkit-preview", "vendor/rbit"]
+exclude = ["integration/pixelkit-preview", "vendor/rbit", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"

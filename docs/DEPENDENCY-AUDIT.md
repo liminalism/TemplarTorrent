@@ -98,3 +98,11 @@ features; no lockfile has been fabricated here. Pin all PixelKit crates to one
 revision. Record licenses and attribution for rbit, PixelKit and transitive crates.
 Production fonts, GeoIP data and flag graphics need independently reviewed
 redistribution rights and notices; none are included in this handoff.
+
+## Fuzzing workspace, 2026-10-24
+
+`fuzz/` is its own Cargo workspace, excluded from the root workspace. It
+depends on `libfuzzer-sys`, which compiles LLVM's libFuzzer from C++ with a
+nightly toolchain. That code is test tooling: no shipped package depends on
+the fuzz crate, so the release graph and its `cargo tree -i ring` audit do
+not change. Do not move a fuzz target into a root-workspace crate.

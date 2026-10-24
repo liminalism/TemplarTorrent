@@ -643,6 +643,10 @@ fn unhex(text: &str) -> Result<Vec<u8>, String> {
     if !text.len().is_multiple_of(2) {
         return Err("hex length is odd".into());
     }
+    // Two-byte slices below would split a multibyte char.
+    if !text.is_ascii() {
+        return Err("invalid hex".into());
+    }
     (0..text.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| "invalid hex".to_string()))
@@ -965,5 +969,17 @@ mod tests {
         assert_eq!(store.load_resume(&hash).unwrap().unwrap(), resume);
         store.remove_job(&hash).unwrap();
         assert!(store.load_resume(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn hex_fields_with_multibyte_chars_are_refused() {
+        // Found by fuzz/persist_records: four bytes, even length, but slicing
+        // at byte 2 splits the char.
+        let hex = "2\u{45e}f";
+        assert_eq!(hex.len(), 4);
+        let record = format!("{RECORD_HEADER}\ndestination {hex}\n");
+        assert!(decode_record(&record, [7; 20], Vec::new()).is_err());
+        let resume = format!("{RESUME_HEADER}\npieces 9\nbits {hex}\n");
+        assert!(decode_resume(&resume).is_err());
     }
 }

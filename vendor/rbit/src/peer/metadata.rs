@@ -137,23 +137,34 @@ impl MetadataMessage {
             .as_dict()
             .ok_or_else(|| PeerError::Extension("expected dict".into()))?;
 
-        let msg_type_byte =
-            dict.get(b"msg_type".as_slice())
-                .and_then(|v| v.as_integer())
-                .ok_or_else(|| PeerError::Extension("missing msg_type".into()))? as u8;
-
-        let msg_type = MetadataMessageType::from_byte(msg_type_byte)
+        // Out-of-range integers are refused rather than truncated: msg_type
+        // 257 must not read as Data, nor piece 2^32 as piece 0.
+        let msg_type_byte = dict
+            .get(b"msg_type".as_slice())
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| PeerError::Extension("missing msg_type".into()))?;
+        let msg_type = u8::try_from(msg_type_byte)
+            .ok()
+            .and_then(MetadataMessageType::from_byte)
             .ok_or_else(|| PeerError::Extension("invalid msg_type".into()))?;
 
+        let piece = dict
+            .get(b"piece".as_slice())
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| PeerError::Extension("missing piece".into()))?;
         let piece =
-            dict.get(b"piece".as_slice())
-                .and_then(|v| v.as_integer())
-                .ok_or_else(|| PeerError::Extension("missing piece".into()))? as u32;
+            u32::try_from(piece).map_err(|_| PeerError::Extension("invalid piece".into()))?;
 
-        let total_size = dict
+        let total_size = match dict
             .get(b"total_size".as_slice())
             .and_then(|v| v.as_integer())
-            .map(|v| v as u32);
+        {
+            Some(size) => Some(
+                u32::try_from(size)
+                    .map_err(|_| PeerError::Extension("invalid total_size".into()))?,
+            ),
+            None => None,
+        };
 
         // Extract data for Data messages
         let data = if msg_type == MetadataMessageType::Data && dict_end < payload.len() {
@@ -212,8 +223,8 @@ fn find_dict_end(payload: &[u8]) -> Result<usize, PeerError> {
                 let len: usize = len_str
                     .parse()
                     .map_err(|_| PeerError::Extension("invalid string length".into()))?;
-                i += 1; // skip ':'
-                i += len; // skip string data
+                // skip ':' and the string data; a huge length must not wrap
+                i = i.saturating_add(1).saturating_add(len);
             }
             _ => {
                 return Err(PeerError::Extension("invalid bencode".into()));

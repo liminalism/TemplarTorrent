@@ -100,7 +100,8 @@ fn parse_file_tree_node(value: &Value) -> Result<FileTree, MetainfoError> {
         let length = file_dict
             .get(b"length".as_slice())
             .and_then(|v| v.as_integer())
-            .ok_or(MetainfoError::MissingField("length"))? as u64;
+            .ok_or(MetainfoError::MissingField("length"))?;
+        let length = super::torrent::length_field(length, "length")?;
 
         let pieces_root = file_dict
             .get(b"pieces root".as_slice())

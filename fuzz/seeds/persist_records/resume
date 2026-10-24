@@ -1,0 +1,5 @@
+templartorrent-resume 1
+pieces 10
+barrier 1
+bits ff03
+file 0 1 2 3 4 5
