@@ -135,6 +135,28 @@ record templartorrent.papercut.resuming-from-the-ledger-the-inherited/1 : paperc
     created_at 2026-10-22
 }
 
+record templartorrent.papercut.running-the-rbit-fork-s-own-cargo-test-lib/1 : papercut {
+    title "Running the rbit fork's own `cargo test --lib` without features fails…"
+    state verified
+    statement """
+        Running the rbit fork's own `cargo test --lib` without features fails to compile ("cannot find type HttpTracker") because a test module still refers to it unconditionally after the fork made http-client optional; `--features http-client` builds and passes 160 tests. Running it in-tree also needs a copy outside vendor/rbit, or it writes a crate-local Cargo.lock that the fork notes say was removed.
+        """
+    observed_at git:a86c4fc56874e2f511dd38623afd5810cad7056c
+    author "claude"
+    created_at 2026-10-24
+}
+
+record templartorrent.papercut.running-the-workspace-tests-with-tmpdir-on-a/1 : papercut {
+    title "Running the workspace tests with TMPDIR on a real disk (to exercise…"
+    state verified
+    statement """
+        Running the workspace tests with TMPDIR on a real disk (to exercise storage on btrfs instead of tmpfs /tmp) fails ui::tests::paste_magnet_from_the_system_clipboard and window_close_saves_layout_and_resume with "path must be shorter than SUN_LEN": the activation listener's Unix socket lives under temp_dir(), so a TMPDIR under the repository is too long. Those two tests need a short socket directory independent of TMPDIR.
+        """
+    observed_at git:a86c4fc56874e2f511dd38623afd5810cad7056c
+    author "claude"
+    created_at 2026-10-24
+}
+
 record templartorrent.papercut.session-set-wanted-only-re-evaluated-job/1 : papercut {
     title "Session::set_wanted only re-evaluated job completion when a piece…"
     state verified

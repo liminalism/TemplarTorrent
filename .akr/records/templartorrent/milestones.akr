@@ -65,6 +65,48 @@ record templartorrent.milestone.local-v1-transfer/1 : milestone {
     }
 }
 
+record templartorrent.milestone.loopback-throughput/1 : milestone {
+    title "Remove the two measured transfer stalls: per-piece fdatasync and Nagle on peer streams"
+    state completed
+    scope [
+        path "crates/templartorrent-storage/src/lib.rs",
+        path "integration/rbit-adapter/src/driver.rs",
+        path "vendor/rbit/src/peer/transport.rs"
+    ]
+    intent """
+        AGENTS.md step 5: optimize from evidence. The 32 MiB loopback scenario ran at about 6 MB/s on tmpfs and 1.5 to 2.2 MB/s on a real btrfs disk. Two causes, each measured alone: FileStore synced every 16 KiB piece although the resume checkpoint's sync_all is the only barrier the bitmap needs (DESIGN.md: persist batched changes, sync before marking resume bits durable), and no peer stream set TCP_NODELAY, so each pipelined Request waited for a delayed ACK. Fix both without weakening the resume guarantee and record before/after with attribution.
+        """
+    note """
+        Fixture seeders share rbit's transport, so they also gained nodelay; a client-only variant was measured separately.
+        """
+    acceptance {
+        check before-after {
+            statement """
+                Three release runs each of the 2048-piece and 4-piece loopback scenarios before and after, on tmpfs and on btrfs, with each change also measured alone
+                """
+            method command
+            command "perf-results/2026-10-24-write-path/large-scenario.sh <log>, with TMPDIR on btrfs for the disk runs"
+            verified_by [ @templartorrent.evidence.write-path-before-after/1 ]
+        }
+        check gates {
+            statement """
+                Formatting, all-target Clippy with warnings denied and the release build pass; ring is still not built
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release && cargo tree --workspace -i ring"
+            verified_by [ @templartorrent.evidence.fuzz-and-throughput-gates/1 ]
+        }
+        check resume-safety {
+            statement """
+                Resume, forced-crash restart, storage and deletion tests pass on tmpfs and with TMPDIR on btrfs; the resume checkpoint still reads the verified set before sync_all
+                """
+            method command
+            command "cargo test --workspace --all-targets --no-fail-fast (twice on tmpfs, once with TMPDIR on btrfs)"
+            verified_by [ @templartorrent.evidence.write-path-safety-tests/1 ]
+        }
+    }
+}
+
 record templartorrent.milestone.native-app-wiring/1 : milestone {
     title "File-backed transfers and live UI wiring"
     state completed
@@ -150,6 +192,54 @@ record templartorrent.milestone.native-source-gate/1 : milestone {
     }
     after [ @templartorrent.milestone.picker-optimization ]
     derived_from [ @templartorrent.decision.fork-rbit-for-native-gate ]
+}
+
+record templartorrent.milestone.parser-fuzzing/1 : milestone {
+    title "Bounded parser and engine fuzzing with every found crash fixed and pinned"
+    state completed
+    scope [
+        path "fuzz/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/src/persist.rs",
+        path "vendor/rbit/src/**"
+    ]
+    intent """
+        DESIGN.md section 10 requires bounded parser fuzzing. Add libFuzzer targets, in their own workspace outside the shipping graph, for every parser that remote or on-disk bytes reach (tracker HTTP and announce body, metainfo and the BEP-9 info envelope, magnet and tracker URL, peer wire and extension messages, bencode, persisted session records) plus a stateful engine-session target under adversarial peer behaviour. Fix every crash at its source, including in the rbit fork, and pin each with a stable-toolchain regression test that fails before the fix.
+        """
+    acceptance {
+        check bounded-run-clean {
+            statement """
+                fuzz/run.sh replays every saved regression input and then runs every target for 600 s with no crash, leak or timeout
+                """
+            method command
+            command "fuzz/run.sh 600"
+            verified_by [ @templartorrent.evidence.fuzz-bounded-run/1 ]
+        }
+        check crashes-pinned {
+            statement """
+                Each crash the fuzzers found has a stable-toolchain regression test that fails with the fix reverted and passes with it
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test parser_regressions && cargo test -p templartorrent --lib hex_fields"
+            verified_by [ @templartorrent.evidence.fuzz-regressions-pinned/1 ]
+        }
+        check gates {
+            statement """
+                Formatting, all-target Clippy with warnings denied, the workspace tests and the release build pass with the fixes
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets && cargo build --release"
+            verified_by [ @templartorrent.evidence.fuzz-and-throughput-gates/1 ]
+        }
+        check targets-build {
+            statement """
+                cargo +nightly fuzz build builds all seven targets, and libfuzzer-sys is absent from the root workspace graph
+                """
+            method command
+            command "cargo +nightly fuzz build && cargo tree --workspace -i libfuzzer-sys"
+            verified_by [ @templartorrent.evidence.fuzz-targets-build/1 ]
+        }
+    }
 }
 
 record templartorrent.milestone.performance-baselines/1 : milestone {

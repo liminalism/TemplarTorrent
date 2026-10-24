@@ -217,6 +217,58 @@ record templartorrent.evidence.fork-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.fuzz-and-throughput-gates/1 : evidence {
+    title "With every change in the tree, the root workspace passed formatting and all-target Clippy with warnings denied, the release build produced target/release/templartorrent, and cargo tree -i ring printed nothing. The fuzz workspace passed rustfmt, and nightly Clippy with warnings denied before the final metainfo-fix batch."
+    state verified
+    result pass
+    method command
+    observed_at git:2461a870f26e9ed2c7d6945837b694aeea31b10b
+    command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --release && cargo tree --workspace -i ring; cargo +nightly clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings"
+    artifact "perf-results/2026-10-24-write-path/clippy.log"
+    summary """
+        With every change in the tree, the root workspace passed formatting and all-target Clippy with warnings denied, the release build produced target/release/templartorrent, and cargo tree -i ring printed nothing. The fuzz workspace passed rustfmt, and nightly Clippy with warnings denied before the final metainfo-fix batch.
+        """
+}
+
+record templartorrent.evidence.fuzz-bounded-run/1 : evidence {
+    title "All 8 saved regression inputs replayed without a crash, then seven targets ran 600 s each in parallel with dictionaries, -rss_limit_mb=2048 and -timeout=10: tracker_response 3.49M runs, metainfo 6.53M, magnet_and_tracker_url 2.30M, peer_wire 5.02M, bencode 5.10M, persist_records 23.28M, engine_session 0.79M; exit 0, no artifacts. Of the 2161 inputs in the engine corpus from an earlier 120 s run, 191 verified at least one piece and 15 completed every piece. An earlier 600 s run found the negative-length metainfo crash that is now fixed."
+    state verified
+    result pass
+    method command
+    observed_at git:2461a870f26e9ed2c7d6945837b694aeea31b10b
+    command "OUT=../.agent/scratch/fuzz fuzz/run.sh 600"
+    artifact "perf-results/2026-10-24-fuzzing/run-600s-final.log"
+    summary """
+        All 8 saved regression inputs replayed without a crash, then seven targets ran 600 s each in parallel with dictionaries, -rss_limit_mb=2048 and -timeout=10: tracker_response 3.49M runs, metainfo 6.53M, magnet_and_tracker_url 2.30M, peer_wire 5.02M, bencode 5.10M, persist_records 23.28M, engine_session 0.79M; exit 0, no artifacts. Of the 2161 inputs in the engine corpus from an earlier 120 s run, 191 verified at least one piece and 15 completed every piece. An earlier 600 s run found the negative-length metainfo crash that is now fixed.
+        """
+}
+
+record templartorrent.evidence.fuzz-regressions-pinned/1 : evidence {
+    title "Rust 1.99.0: 9 adapter parser regression tests and 1 persist test passed. During the session each fix was reverted with git stash or a scripted reverse patch and the matching tests failed: 5 of 6 for the first batch, the magnet test after moving its multibyte char to an odd offset, the persist hex test, and 5 tests for the metainfo and metadata batch. rbit's own lib suite (160 tests, --features http-client, run in a copy outside vendor/) passed with every fix."
+    state verified
+    result pass
+    method command
+    observed_at git:2461a870f26e9ed2c7d6945837b694aeea31b10b
+    command "cargo test -p templartorrent-rbit-adapter --test parser_regressions && cargo test -p templartorrent --lib hex_fields"
+    artifact "perf-results/2026-10-24-fuzzing/regression-tests.log"
+    summary """
+        Rust 1.99.0: 9 adapter parser regression tests and 1 persist test passed. During the session each fix was reverted with git stash or a scripted reverse patch and the matching tests failed: 5 of 6 for the first batch, the magnet test after moving its multibyte char to an odd offset, the persist hex test, and 5 tests for the metainfo and metadata batch. rbit's own lib suite (160 tests, --features http-client, run in a copy outside vendor/) passed with every fix.
+        """
+}
+
+record templartorrent.evidence.fuzz-targets-build/1 : evidence {
+    title "Ubuntu 26.04.1, i7-13700H, rustc 1.101.0-nightly 2026-10-04 with cargo-fuzz 0.13.2: all seven fuzz targets built with ASan and sancov. On the root workspace, cargo tree -i libfuzzer-sys exited 101 with did not match any packages, and cargo tree -i ring printed nothing, so the shipping graph does not contain libFuzzer and still does not build ring."
+    state verified
+    result pass
+    method command
+    observed_at git:2461a870f26e9ed2c7d6945837b694aeea31b10b
+    command "cd fuzz && cargo +nightly fuzz build; cargo tree --workspace -i libfuzzer-sys"
+    artifact "perf-results/2026-10-24-fuzzing/native-audit.log"
+    summary """
+        Ubuntu 26.04.1, i7-13700H, rustc 1.101.0-nightly 2026-10-04 with cargo-fuzz 0.13.2: all seven fuzz targets built with ASan and sancov. On the root workspace, cargo tree -i libfuzzer-sys exited 101 with did not match any packages, and cargo tree -i ring printed nothing, so the shipping graph does not contain libFuzzer and still does not build ring.
+        """
+}
+
 record templartorrent.evidence.https-rustls/1 : evidence {
     title "Localhost HTTPS announce checks the certificate name"
     state verified
@@ -943,5 +995,31 @@ record templartorrent.evidence.window-close-gates/1 : evidence {
     command "cargo clippy -p templartorrent --all-targets --offline -- -D warnings"
     summary """
         Ubuntu 26.04.1, Linux 7.0.0-31-generic, rustc 1.99.0, commit 66c3fea. cargo clippy -p templartorrent --all-targets --offline -- -D warnings exited 0. Preview tests, the rest of the workspace suite and the release binary were not run.
+        """
+}
+
+record templartorrent.evidence.write-path-before-after/1 : evidence {
+    title "Release, i7-13700H, three runs each. 2048-piece 32 MiB scenario elapsed: baseline 5.27/5.27/3.59 s on tmpfs and 22.36/15.82/14.94 s on btrfs; per-piece sync_data removed only: 4.6 to 5.4 s on btrfs, unchanged on tmpfs; TCP_NODELAY only (sync kept), btrfs: 13.16 to 13.43 s; client-side nodelay only, tmpfs: 63 to 67 ms; both changes: 58 to 64 ms on tmpfs, 72 to 83 ms on btrfs. The 4-piece magnet scenario went from about 123 ms magnet-to-first-verified to 0.56 to 0.71 ms. Payload reservation peak 1081344 B and sampled RSS about 40 MB, unchanged. Loopback only; fixture seeders share the rbit transport."
+    state verified
+    result pass
+    method command
+    observed_at git:2461a870f26e9ed2c7d6945837b694aeea31b10b
+    command "perf-results/2026-10-24-write-path/large-scenario.sh <log>, with TMPDIR on btrfs for the disk runs"
+    artifact "perf-results/2026-10-24-write-path/handoff.json"
+    summary """
+        Release, i7-13700H, three runs each. 2048-piece 32 MiB scenario elapsed: baseline 5.27/5.27/3.59 s on tmpfs and 22.36/15.82/14.94 s on btrfs; per-piece sync_data removed only: 4.6 to 5.4 s on btrfs, unchanged on tmpfs; TCP_NODELAY only (sync kept), btrfs: 13.16 to 13.43 s; client-side nodelay only, tmpfs: 63 to 67 ms; both changes: 58 to 64 ms on tmpfs, 72 to 83 ms on btrfs. The 4-piece magnet scenario went from about 123 ms magnet-to-first-verified to 0.56 to 0.71 ms. Payload reservation peak 1081344 B and sampled RSS about 40 MB, unchanged. Loopback only; fixture seeders share the rbit transport.
+        """
+}
+
+record templartorrent.evidence.write-path-safety-tests/1 : evidence {
+    title "On tmpfs, 184 workspace tests passed twice: test-workspace.log and test-workspace-repeat.log. With TMPDIR on btrfs, 182 passed, including the resume bitmap, the shutdown resume barrier, restore, storage and deletion tests. The other 2 (ui paste_magnet_from_the_system_clipboard and window_close_saves_layout_and_resume) failed with 'path must be shorter than SUN_LEN' from the activation socket under the long TMPDIR, and passed on tmpfs. Kill-style crash tests only; no power-loss test."
+    state verified
+    result pass
+    method command
+    observed_at git:2461a870f26e9ed2c7d6945837b694aeea31b10b
+    command "cargo test --workspace --all-targets (twice on tmpfs); TMPDIR=<repo>/.agent/scratch/t cargo test --workspace --all-targets --no-fail-fast"
+    artifact "perf-results/2026-10-24-write-path/test-workspace-btrfs.log"
+    summary """
+        On tmpfs, 184 workspace tests passed twice: test-workspace.log and test-workspace-repeat.log. With TMPDIR on btrfs, 182 passed, including the resume bitmap, the shutdown resume barrier, restore, storage and deletion tests. The other 2 (ui paste_magnet_from_the_system_clipboard and window_close_saves_layout_and_resume) failed with 'path must be shorter than SUN_LEN' from the activation socket under the long TMPDIR, and passed on tmpfs. Kill-style crash tests only; no power-loss test.
         """
 }
