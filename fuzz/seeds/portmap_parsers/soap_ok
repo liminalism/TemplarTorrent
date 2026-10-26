@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+Content-Type: text/xml
+Content-Length: 296
+
+<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1"><NewExternalIPAddress>198.51.100.4</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>

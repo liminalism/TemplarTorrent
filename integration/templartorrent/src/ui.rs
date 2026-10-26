@@ -213,6 +213,7 @@ struct RemoveDialog {
 struct SettingsDialog {
     allow_local: bool,
     encryption: PeerEncryption,
+    port_mapping: bool,
     port: TextFieldState,
     bound_port: u16,
     error: String,
@@ -752,6 +753,7 @@ impl Desktop {
         self.dialog = Dialog::Settings(Box::new(SettingsDialog {
             allow_local: view.allow_local_trackers,
             encryption: view.encryption,
+            port_mapping: view.port_mapping,
             port: TextFieldState::with_text(bound_port.to_string()),
             bound_port,
             error: String::new(),
@@ -2114,7 +2116,7 @@ impl Desktop {
         body: &TextStyle,
         small: &TextStyle,
     ) {
-        let inner = centered_panel(ui, s, width, height, 640, 460);
+        let inner = centered_panel(ui, s, width, height, 640, 520);
         let Dialog::Settings(dialog) = &mut self.dialog else {
             return;
         };
@@ -2169,20 +2171,23 @@ impl Desktop {
             true,
             false,
         );
+        let mut port_mapping = dialog.port_mapping;
+        if ui.checkbox(
+            Rect::new(inner.x, inner.y + s.px(270), inner.w, s.px(28)),
+            &mut port_mapping,
+            "Map the listen port on my router (UPnP / NAT-PMP)",
+        ) {
+            dialog.port_mapping = port_mapping;
+        }
         ui.label_styled(
-            Rect::new(inner.x, inner.y + s.px(270), inner.w, s.px(40)),
-            &format!(
-                "{}. DHT: {}. No UPnP or NAT-PMP: forward this port on your router to accept incoming peers.",
-                listen_text(&view.listen),
-                view.dht_nodes
-                    .map_or("off".to_string(), |nodes| format!("{nodes} nodes")),
-            ),
+            Rect::new(inner.x, inner.y + s.px(302), inner.w, s.px(56)),
+            &settings_reachability(view),
             *small,
             MUTED,
             Align::Left,
         );
         let cycle = ui.button(
-            Rect::new(inner.x, inner.y + s.px(318), s.px(300), s.px(28)),
+            Rect::new(inner.x, inner.y + s.px(366), s.px(300), s.px(28)),
             match dialog.encryption {
                 PeerEncryption::PreferEncrypted => "Encryption: prefer encrypted",
                 PeerEncryption::RequireEncrypted => "Encryption: require encrypted",
@@ -2198,7 +2203,7 @@ impl Desktop {
         }
         if !dialog.error.is_empty() {
             ui.label_styled(
-                Rect::new(inner.x, inner.y + s.px(354), inner.w, s.px(20)),
+                Rect::new(inner.x, inner.y + s.px(402), inner.w, s.px(20)),
                 &dialog.error,
                 *small,
                 INK,
@@ -2220,6 +2225,7 @@ impl Desktop {
         );
         let allow = dialog.allow_local;
         let encryption = dialog.encryption;
+        let port_mapping = dialog.port_mapping;
         let port_text = dialog.port.text().trim().to_string();
         let bound_port = dialog.bound_port;
         if reload {
@@ -2247,6 +2253,11 @@ impl Desktop {
                     && self
                         .client
                         .try_request(Request::SetListenPort(port))
+                        .is_err())
+                || (port_mapping != view.port_mapping
+                    && self
+                        .client
+                        .try_request(Request::SetPortMapping(port_mapping))
                         .is_err())
             {
                 self.status = "command queue is full".into();
@@ -2288,6 +2299,22 @@ fn current_file(files: &[FileRow]) -> &str {
         .min_by_key(|file| file.rank)
         .map(|file| file.path.as_str())
         .unwrap_or("—")
+}
+
+/// Listener, DHT and router-mapping state under the mapping checkbox. The
+/// mapping status is the driver's own; it never carries the external address.
+fn settings_reachability(view: &SessionView) -> String {
+    let mapping = if view.port_mapping {
+        format!("Router port mapping: {}.", view.port_mapping_status)
+    } else {
+        "Router port mapping is off; nothing is sent to the router. Forward this port on your router to accept incoming peers.".to_string()
+    };
+    format!(
+        "{}. DHT: {}. {mapping}",
+        listen_text(&view.listen),
+        view.dht_nodes
+            .map_or("off".to_string(), |nodes| format!("{nodes} nodes")),
+    )
 }
 
 fn listen_text(state: &ListenState) -> String {
@@ -2798,5 +2825,24 @@ mod tests {
         }
         app.on_exit();
         clipboard.restore().expect("clipboard restored");
+    }
+
+    #[test]
+    fn settings_line_shows_the_live_port_mapping_state() {
+        let mut view = crate::worker::SessionView::idle(Limits::default(), "t.txt".into());
+        view.listen = crate::worker::ListenState::Bound("0.0.0.0:51234".parse().unwrap());
+        let off = super::settings_reachability(&view);
+        assert!(off.contains("Router port mapping is off"), "{off}");
+        assert!(off.contains("Forward this port"), "{off}");
+        assert!(!off.contains("No UPnP"), "{off}");
+        view.port_mapping = true;
+        view.port_mapping_status = "mapped by NAT-PMP as external port 51234 (TCP and UDP)".into();
+        let on = super::settings_reachability(&view);
+        assert!(
+            on.ends_with(
+                "Router port mapping: mapped by NAT-PMP as external port 51234 (TCP and UDP)."
+            ),
+            "{on}"
+        );
     }
 }

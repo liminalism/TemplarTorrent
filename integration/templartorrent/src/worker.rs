@@ -118,10 +118,14 @@ pub struct SessionView {
     /// DHT routing-table size; `None` when the DHT is off or failed.
     pub dht_nodes: Option<usize>,
     pub encryption: PeerEncryption,
+    /// The saved router port-mapping consent.
+    pub port_mapping: bool,
+    /// What the router mapping is doing now, without the external address.
+    pub port_mapping_status: String,
 }
 
 impl SessionView {
-    fn idle(limits: Limits, public_tracker_path: String) -> Self {
+    pub(crate) fn idle(limits: Limits, public_tracker_path: String) -> Self {
         Self {
             snapshot: Snapshot::default(),
             limits,
@@ -142,6 +146,8 @@ impl SessionView {
             note: None,
             dht_nodes: None,
             encryption: PeerEncryption::default(),
+            port_mapping: false,
+            port_mapping_status: "off".into(),
         }
     }
 }
@@ -168,6 +174,8 @@ struct Visible {
     note: Option<String>,
     dht_nodes: Option<usize>,
     encryption: PeerEncryption,
+    port_mapping: bool,
+    port_mapping_status: String,
 }
 
 pub fn same_visible(left: &SessionView, right: &SessionView) -> bool {
@@ -238,6 +246,8 @@ fn visible(view: &SessionView) -> Visible {
         note: view.note.clone(),
         dht_nodes: view.dht_nodes,
         encryption: view.encryption,
+        port_mapping: view.port_mapping,
+        port_mapping_status: view.port_mapping_status.clone(),
     }
 }
 
@@ -274,6 +284,8 @@ pub enum Request {
     SetListenPort(u16),
     /// Apply and save the MSE/PE policy for new connections.
     SetEncryption(PeerEncryption),
+    /// Save the router port-mapping consent and start or remove the mapping.
+    SetPortMapping(bool),
     ReloadTrackers,
 }
 
@@ -393,6 +405,7 @@ struct Memory {
     /// Saved peer listen port; 0 until a port is chosen.
     listen_port: u16,
     encryption: PeerEncryption,
+    port_mapping: bool,
     /// `.torrent` files the Add dialog read, keyed by the magnet it was shown.
     /// Adding that magnet uses these bytes, so no metadata is fetched.
     torrent_files: std::collections::VecDeque<(String, Vec<u8>)>,
@@ -442,6 +455,7 @@ async fn run_session(
         resume_verified: 0,
         listen_port: 0,
         encryption: PeerEncryption::default(),
+        port_mapping: false,
         torrent_files: std::collections::VecDeque::new(),
     };
     let saved_port = memory
@@ -479,6 +493,7 @@ async fn run_session(
     };
     let mut last = publish(&mut engine, &mut memory, &shared);
     restore_session(&mut engine, &mut memory).await;
+    apply_port_mapping(&mut engine, &mut memory).await;
     // Keep the first launch's port, so a router forward stays valid.
     if memory.listen_port != 0
         && memory.listen_port != saved_port
@@ -551,6 +566,7 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
             driver.set_allow_local_trackers(settings.allow_local_trackers);
             memory.encryption = settings.encryption;
             driver.set_peer_encryption(settings.encryption);
+            memory.port_mapping = settings.port_mapping;
             if driver.set_limits(settings.limits).await.is_err() {
                 notes.push("saved limits were rejected".to_string());
             }
@@ -600,6 +616,19 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
     }
     if !notes.is_empty() {
         memory.note = Some(notes.join(". "));
+    }
+}
+
+/// Start or remove the router mapping to match the saved consent. Needs a
+/// bound listener; the driver refuses a listener the router cannot reach.
+async fn apply_port_mapping(engine: &mut Engine, memory: &mut Memory) {
+    let Engine::Live { driver, .. } = engine else {
+        return;
+    };
+    if !memory.port_mapping {
+        driver.disable_port_mapping().await;
+    } else if let Err(error) = driver.enable_port_mapping() {
+        memory.note = Some(format!("Port mapping unavailable: {}", error.0));
     }
 }
 
@@ -660,6 +689,7 @@ fn save_settings(driver: &Driver, memory: &Memory) -> Result<(), String> {
         allow_local_trackers: memory.allow_local,
         listen_port: memory.listen_port,
         encryption: memory.encryption,
+        port_mapping: memory.port_mapping,
     })
 }
 
@@ -752,6 +782,8 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
             note: Some((*reason).to_string()),
             dht_nodes: None,
             encryption: memory.encryption,
+            port_mapping: memory.port_mapping,
+            port_mapping_status: "off".into(),
         },
         Engine::Live {
             driver,
@@ -797,6 +829,8 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
                 note: memory.note.clone(),
                 dht_nodes: driver.dht_nodes(),
                 encryption: memory.encryption,
+                port_mapping: memory.port_mapping,
+                port_mapping_status: driver.port_mapping_status().describe(),
             }
         }
     }
@@ -1008,6 +1042,16 @@ async fn dispatch(
                 if let Err(error) = save_settings(driver, memory) {
                     memory.note = Some(format!("session not saved: {error}"));
                 }
+            }
+            false
+        }
+        Request::SetPortMapping(on) => {
+            memory.port_mapping = on;
+            apply_port_mapping(engine, memory).await;
+            if let Engine::Live { driver, .. } = engine
+                && let Err(error) = save_settings(driver, memory)
+            {
+                memory.note = Some(format!("session not saved: {error}"));
             }
             false
         }
@@ -1249,6 +1293,7 @@ mod tests {
             resume_verified: 0,
             listen_port: 0,
             encryption: PeerEncryption::default(),
+            port_mapping: false,
             torrent_files: std::collections::VecDeque::new(),
         };
         let shared = Shared {
@@ -1388,6 +1433,7 @@ mod tests {
                 allow_local_trackers: true,
                 listen_port: 0,
                 encryption: PeerEncryption::default(),
+                port_mapping: false,
             })
             .unwrap();
         store
@@ -1625,6 +1671,71 @@ mod tests {
         let ack = handle.wait_ack(1, Duration::from_secs(5)).unwrap();
         assert!(ack.accepted, "{}", ack.message);
         assert!(!resume_path.exists(), "removal deletes the bitmap");
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The consent is saved and reapplied on the next launch. A loopback
+    /// listener cannot be reached through the router, so the driver refuses
+    /// it before sending anything (or finds no gateway at all).
+    #[test]
+    fn port_mapping_consent_is_saved_and_applied_on_launch() {
+        let base = std::env::temp_dir().join(format!(
+            "templartorrent-worker-portmap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = SessionStore::new(base.join("session"));
+        let start_worker = || {
+            WorkerHandle::start(WorkerConfig {
+                session_dir: Some(base.join("session")),
+                ..config()
+            })
+            .unwrap()
+        };
+        let wait = |handle: &WorkerHandle, done: &dyn Fn(&SessionView) -> bool| {
+            let start = Instant::now();
+            loop {
+                let view = handle.view();
+                if done(&view) {
+                    return view;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "{:?} {:?}",
+                    view.port_mapping,
+                    view.port_mapping_status
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let refused = |view: &SessionView| {
+            view.port_mapping && view.port_mapping_status.starts_with("not mapped: ")
+        };
+        let mut handle = start_worker();
+        let view = wait(&handle, &|view| {
+            matches!(view.listen, ListenState::Bound(_))
+        });
+        assert!(!view.port_mapping, "off by default");
+        assert_eq!(view.port_mapping_status, "off");
+        handle.try_request(Request::SetPortMapping(true)).unwrap();
+        let view = wait(&handle, &refused);
+        assert!(
+            view.port_mapping_status.contains("listener is not bound")
+                || view.port_mapping_status.contains("no IPv4"),
+            "{}",
+            view.port_mapping_status
+        );
+        assert!(store.load_settings().unwrap().unwrap().port_mapping);
+        handle.shutdown();
+
+        let mut handle = start_worker();
+        wait(&handle, &refused);
+        handle.try_request(Request::SetPortMapping(false)).unwrap();
+        wait(&handle, &|view| {
+            !view.port_mapping && view.port_mapping_status == "off"
+        });
+        assert!(!store.load_settings().unwrap().unwrap().port_mapping);
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&base);
     }

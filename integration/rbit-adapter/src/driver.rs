@@ -392,6 +392,9 @@ pub struct Driver {
     limits: Limits,
     pending_failures: HashMap<PeerId, &'static str>,
     listener: Option<Listener>,
+    /// Router port mapping for the listen port; only after explicit opt-in.
+    port_map: Option<crate::portmap::PortMapper>,
+    port_map_config: crate::portmap::Config,
     upload_ownership: Arc<UploadOwnership>,
     allow_local_trackers: bool,
     public_trackers: Vec<String>,
@@ -465,6 +468,8 @@ impl Driver {
             limits,
             pending_failures: HashMap::new(),
             listener: None,
+            port_map: None,
+            port_map_config: crate::portmap::Config::default(),
             upload_ownership: Arc::default(),
             allow_local_trackers: false,
             public_trackers: Vec::new(),
@@ -691,6 +696,42 @@ impl Driver {
 
     pub fn listening_address(&self) -> Option<SocketAddr> {
         self.listener.as_ref().map(|l| l.address)
+    }
+
+    /// Where port-mapping requests go. Tests point it at loopback fixtures;
+    /// takes effect at the next [`Driver::enable_port_mapping`].
+    pub fn set_port_mapping_config(&mut self, config: crate::portmap::Config) {
+        self.port_map_config = config;
+    }
+
+    /// Explicit opt-in: keep the listen port mapped on the IPv4 default
+    /// gateway, TCP and UDP (the DHT shares the port), NAT-PMP first, then
+    /// UPnP IGD. Runs in the background; see [`Driver::port_mapping_status`].
+    pub fn enable_port_mapping(&mut self) -> Result<()> {
+        let address = self
+            .listening_address()
+            .ok_or(DriverError("no listener to map"))?;
+        if self.port_map.is_none() {
+            self.port_map = Some(crate::portmap::PortMapper::start(
+                self.port_map_config.clone(),
+                address,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove the mapping from the router, waiting at most
+    /// [`crate::portmap::STOP_BOUND`].
+    pub async fn disable_port_mapping(&mut self) {
+        if let Some(mapper) = self.port_map.take() {
+            mapper.stop(crate::portmap::STOP_BOUND).await;
+        }
+    }
+
+    pub fn port_mapping_status(&self) -> crate::portmap::Status {
+        self.port_map
+            .as_ref()
+            .map_or(crate::portmap::Status::Off, |mapper| mapper.status())
     }
 
     fn seed_admitted(&self, id: TorrentId) -> bool {
@@ -1267,6 +1308,7 @@ impl Driver {
         Ok(())
     }
     pub async fn shutdown(&mut self) {
+        self.disable_port_mapping().await;
         if let Some(listener) = self.listener.take() {
             listener.task.abort();
             let _ = listener.task.await;

@@ -44,6 +44,9 @@ pub struct Settings {
     pub listen_port: u16,
     /// MSE/PE policy for new peer connections.
     pub encryption: PeerEncryption,
+    /// Map the listen port on the router (NAT-PMP, then UPnP). Off unless
+    /// the user ticked it: explicit consent, DESIGN.md section 9.
+    pub port_mapping: bool,
 }
 
 fn encryption_name(encryption: PeerEncryption) -> &'static str {
@@ -543,9 +546,10 @@ pub fn encode_settings(settings: &Settings) -> String {
         l.payload_budget_bytes,
         u8::from(settings.allow_local_trackers)
     ) + &format!(
-        "listen_port {}\npeer_encryption {}\n",
+        "listen_port {}\npeer_encryption {}\nport_mapping {}\n",
         settings.listen_port,
-        encryption_name(settings.encryption)
+        encryption_name(settings.encryption),
+        u8::from(settings.port_mapping)
     )
 }
 
@@ -558,6 +562,7 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
     let mut allow_local_trackers = false;
     let mut listen_port = 0u16;
     let mut encryption = PeerEncryption::default();
+    let mut port_mapping = false;
     for line in lines {
         if line.is_empty() {
             continue;
@@ -594,6 +599,7 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
                     _ => return Err("peer_encryption must be prefer, require or plaintext".into()),
                 }
             }
+            "port_mapping" => port_mapping = flag(value)?,
             other => return Err(format!("unknown field {other}")),
         }
     }
@@ -605,6 +611,7 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
         allow_local_trackers,
         listen_port,
         encryption,
+        port_mapping,
     })
 }
 
@@ -837,8 +844,10 @@ mod tests {
             allow_local_trackers: true,
             listen_port: 51234,
             encryption: PeerEncryption::RequireEncrypted,
+            port_mapping: true,
         };
         let decoded = decode_settings(&encode_settings(&settings)).unwrap();
+        assert!(decoded.port_mapping);
         assert_eq!(decoded.listen_port, 51234);
         assert_eq!(decoded.encryption, PeerEncryption::RequireEncrypted);
         assert_eq!(decoded.limits.download_jobs, 1);
@@ -853,6 +862,24 @@ mod tests {
             "payload_budget_bytes 0",
         );
         assert!(decode_settings(&zero).unwrap_err().contains("positive"));
+    }
+
+    #[test]
+    fn port_mapping_defaults_off_and_rejects_bad_flags() {
+        // Files written before the setting existed decode with it off.
+        let old = format!("{SETTINGS_HEADER}\nlisten_port 51234\npeer_encryption prefer\n");
+        assert!(!decode_settings(&old).unwrap().port_mapping);
+        let on = decode_settings(&format!("{SETTINGS_HEADER}\nport_mapping 1\n")).unwrap();
+        assert!(on.port_mapping);
+        assert!(decode_settings(&format!("{SETTINGS_HEADER}\nport_mapping yes\n")).is_err());
+        let off = Settings {
+            limits: Limits::default(),
+            allow_local_trackers: false,
+            listen_port: 0,
+            encryption: PeerEncryption::default(),
+            port_mapping: false,
+        };
+        assert!(encode_settings(&off).contains("port_mapping 0\n"));
     }
 
     #[test]
@@ -946,6 +973,7 @@ mod tests {
                 allow_local_trackers: true,
                 listen_port: 0,
                 encryption: PeerEncryption::default(),
+                port_mapping: false,
             })
             .unwrap();
         assert!(store.load_settings().unwrap().unwrap().allow_local_trackers);

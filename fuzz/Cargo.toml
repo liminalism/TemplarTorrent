@@ -100,3 +100,10 @@ path = "fuzz_targets/pex_and_dht.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "portmap_parsers"
+path = "fuzz_targets/portmap_parsers.rs"
+test = false
+doc = false
+bench = false

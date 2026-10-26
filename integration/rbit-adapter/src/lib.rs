@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod driver;
 pub mod metadata;
 pub mod pex;
+pub mod portmap;
 mod preflight;
 pub mod resume;
 pub mod torrent;
