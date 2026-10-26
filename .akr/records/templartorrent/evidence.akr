@@ -217,6 +217,19 @@ record templartorrent.evidence.fork-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.formats-hybrid-many-files/1 : evidence {
+    title "A hybrid torrent with a 45536-byte pad file between two real files downloaded and verified over loopback; both files matched, no .pad path was created, and verified_bytes equalled wanted_bytes at 50000. A 300-file v1 torrent added from its bytes transferred, and every file matched. Pure v2 bytes and a btmh-only magnet were refused with 'pure v2 ... not supported' before any destination existed. Two rbit hybrid bugs were fixed on the way: the parser's expected v1 piece count and the builder's padded last piece."
+    state verified
+    result pass
+    method command
+    observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
+    command "cargo test -p templartorrent-rbit-adapter --test driver driver_downloads_hybrid_with_pad_files_through_its_v1_view driver_transfers_a_torrent_with_three_hundred_files driver_rejects_pure_v2_before_any_storage_exists"
+    artifact "perf-results/2026-10-25-internet/test-workspace.log"
+    summary """
+        A hybrid torrent with a 45536-byte pad file between two real files downloaded and verified over loopback; both files matched, no .pad path was created, and verified_bytes equalled wanted_bytes at 50000. A 300-file v1 torrent added from its bytes transferred, and every file matched. Pure v2 bytes and a btmh-only magnet were refused with 'pure v2 ... not supported' before any destination existed. Two rbit hybrid bugs were fixed on the way: the parser's expected v1 piece count and the builder's padded last piece.
+        """
+}
+
 record templartorrent.evidence.fuzz-and-throughput-gates/1 : evidence {
     title "With every change in the tree, the root workspace passed formatting and all-target Clippy with warnings denied, the release build produced target/release/templartorrent, and cargo tree -i ring printed nothing. The fuzz workspace passed rustfmt, and nightly Clippy with warnings denied before the final metainfo-fix batch."
     state verified
@@ -290,6 +303,19 @@ record templartorrent.evidence.https-rustls-audit/1 : evidence {
     command "cargo tree --workspace --offline -i rustls"
     summary """
         Same tree. cargo tree --workspace --offline -i rustls shows rustls 0.23.46 under the adapter and the application, via tokio-rustls 0.26.6. cargo tree -i aws-lc-sys shows aws-lc-sys 0.46.0 under aws-lc-rs 1.18.2, rustls and rustls-webpki. cargo tree -i ring prints nothing. cargo tree -i reqwest reports that the package did not match. Cargo.lock still names ring as an unused optional dependency of rustls-webpki. cargo clippy -p templartorrent-rbit-adapter --all-targets --offline -- -D warnings finished with no diagnostics. Brotli is not a feature.
+        """
+}
+
+record templartorrent.evidence.internet-ubuntu-download/1 : evidence {
+    title "Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, release, IPv4-only Wi-Fi (no VPN, no IPv6 route), user-permitted torrent. The client added the .torrent from its own info dictionary and found peers through DHT and PEX; the Ubuntu tracker gave 1 peer over IPv4. First verified piece at 50.3 s; complete and seeding at 519 s, 6482409472 of 6482409472 bytes, average 12.5 MB/s, peak 19.6 MB/s, peak 47 peers, peak RSS 36.4 MB, 0 hash failures, 0 steps over 500 ms. An independent Python pass checked 24729 of 24729 piece SHA-1s with 0 mismatches; the ISO SHA-256 is 601e30fbf5d97759367c632e2c33630665039b7e2158fd068403da3ccf1bda1f. The log has counts and rates only. The code at d6709ad failed this add in 3.9 s (baseline.log)."
+    state verified
+    result pass
+    method command
+    observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
+    command "TT_INTERNET_TORRENT=~/Downloads/ubuntu-26.04.1-desktop-amd64.iso.torrent TT_INTERNET_DEST=.agent/scratch/smoke-run4 TT_INTERNET_SECONDS=1800 cargo test --release -q -p templartorrent-rbit-adapter --test internet_smoke -- --ignored --nocapture"
+    artifact "perf-results/2026-10-25-internet/handoff.json"
+    summary """
+        Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, release, IPv4-only Wi-Fi (no VPN, no IPv6 route), user-permitted torrent. The client added the .torrent from its own info dictionary and found peers through DHT and PEX; the Ubuntu tracker gave 1 peer over IPv4. First verified piece at 50.3 s; complete and seeding at 519 s, 6482409472 of 6482409472 bytes, average 12.5 MB/s, peak 19.6 MB/s, peak 47 peers, peak RSS 36.4 MB, 0 hash failures, 0 steps over 500 ms. An independent Python pass checked 24729 of 24729 piece SHA-1s with 0 mismatches; the ISO SHA-256 is 601e30fbf5d97759367c632e2c33630665039b7e2158fd068403da3ccf1bda1f. The log has counts and rates only. The code at d6709ad failed this add in 3.9 s (baseline.log).
         """
 }
 
@@ -383,6 +409,19 @@ record templartorrent.evidence.localhost-transfer/1 : evidence {
     command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost localhost_transfer"
     summary """
         Localhost v1 transfer completes over real rbit TCP: 4/4 pieces SHA1-verified against metainfo, final bytes equal 50KB owned fixture
+        """
+}
+
+record templartorrent.evidence.mse-tests-and-real-peers/1 : evidence {
+    title "8 MSE tests: RC4 and RFC 6229 vectors, DH and key-schedule known answers computed independently in Python, policy matrix, resync bounds, garbage input. Driver tests: an encrypted two-Driver transfer through a recording relay showing no plaintext protocol bytes, Prefer falling back to a plaintext fixture, Require refused, and incoming routing by SKEY with two jobs. A 180 s Internet run under PreferEncrypted had 35 of 38 connected real peers negotiate RC4 at about 13.5 MB/s. A 120 s mse_handshake fuzz run was clean."
+    state verified
+    result pass
+    method command
+    observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
+    command "cargo test -p templartorrent-rbit-adapter --test mse --test driver; short Internet run with PeerStatus.encrypted counted"
+    artifact "perf-results/2026-10-25-internet/run5-encryption.log"
+    summary """
+        8 MSE tests: RC4 and RFC 6229 vectors, DH and key-schedule known answers computed independently in Python, policy matrix, resync bounds, garbage input. Driver tests: an encrypted two-Driver transfer through a recording relay showing no plaintext protocol bytes, Prefer falling back to a plaintext fixture, Require refused, and incoming routing by SKEY with two jobs. A 180 s Internet run under PreferEncrypted had 35 of 38 connected real peers negotiate RC4 at about 13.5 MB/s. A 120 s mse_handshake fuzz run was clean.
         """
 }
 
@@ -564,6 +603,19 @@ record templartorrent.evidence.persistence-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.pex-loopback-and-dht-internet/1 : evidence {
+    title "Loopback: D downloaded from fixture F and seeded; L knew only D; D's ut_pex message put exactly F into L's pool as a PEX candidate, never D itself. The private-job gate is in code: no ut_pex in the extension handshake, no sending, and incoming PEX and DHT results are ignored for jobs failing public_discovery. It has no dedicated private-torrent test. Internet run 2: DHT 288 candidates and PEX 158. Run 4, with the rbit get_peers fix: peers from DHT about 45 s after start. A 120 s fuzz run of pex_and_dht (pex::parse_added and rbit DhtMessage::parse) was clean."
+    state verified
+    result pass
+    method command
+    observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
+    command "cargo test -p templartorrent-rbit-adapter --test driver driver_pex_shares_dialed_peers_between_public_jobs; Internet runs 2 and 4"
+    artifact "perf-results/2026-10-25-internet/run4.log"
+    summary """
+        Loopback: D downloaded from fixture F and seeded; L knew only D; D's ut_pex message put exactly F into L's pool as a PEX candidate, never D itself. The private-job gate is in code: no ut_pex in the extension handshake, no sending, and incoming PEX and DHT results are ignored for jobs failing public_discovery. It has no dedicated private-torrent test. Internet run 2: DHT 288 candidates and PEX 158. Run 4, with the rbit get_peers fix: peers from DHT about 45 s after start. A 120 s fuzz run of pex_and_dht (pex::parse_added and rbit DhtMessage::parse) was clean.
+        """
+}
+
 record templartorrent.evidence.picker-microbench/1 : evidence {
     title "Same host, release, three runs at each of 1k, 100k and 1M pieces, full-bitfield peer. Reference pick p50 ns: 1k 2750/2760/2677; 100k 137038/154712/170449; 1M 1356235/1331665/1357768. Indexed pick p50 ns: 1k 42/40/40; 100k 952/927/819; 1M 7894/8232/7900, so 65x, 150x to 200x and about 170x below the reference within the same runs; p95 within 10 percent of p50. Sparse-peer path (one piece in sixteen) 205 to 223 ns, 11784 to 13920 ns and 164393 to 175714 ns. Maintenance the reference never paid: rank rebuild 6.2 us, 430 to 463 us and 4.8 to 5.1 ms; a whole-bitfield availability sweep 10 us, 810 to 834 us and 8.2 to 8.5 ms. About 12 bytes per piece plus bucket vectors. The reference at 1M measured 1.35 ms here against 4.8 ms in the morning baseline, so only within-run ratios are claimed."
     state verified
@@ -624,6 +676,19 @@ record templartorrent.evidence.production-linux-client/1 : evidence {
     command "cargo test --manifest-path integration/templartorrent/Cargo.toml --offline -- --test-threads=1"
     summary """
         Same host and uncommitted tree. Production crate tests: 10 passed, 0 failed, including activation forwarding, worker limit/add/remove/preference acks, and the snapshot fingerprint. Clippy --all-targets -D warnings passed. cargo build produced integration/templartorrent/target/debug/templartorrent; --help exited 0 and an unknown flag exited 2. Adapter driver tests driver_pause_and_remove_join_network_tasks_and_retain_data and driver_tracker_discovery_reannounce_and_safe_delete passed. No display, clipboard paste, or Internet transfer ran.
+        """
+}
+
+record templartorrent.evidence.public-swarm-gates/1 : evidence {
+    title "On the committed tree e6350da's content: formatting clean in both workspaces, Clippy with warnings denied clean in both, 222 workspace tests passed, 0 failed, 1 ignored (the opt-in Internet test), release build ok, cargo tree -i ring printed nothing, and all 10 fuzz targets built. rbit's own lib suite, from a copy with --features http-client, passed 164 tests after the DHT and MSE changes."
+    state verified
+    result pass
+    method command
+    observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
+    command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast && cargo build --release && cargo tree --workspace -i ring; cd fuzz && cargo +nightly fuzz build && cargo +nightly clippy --all-targets -- -D warnings"
+    artifact "perf-results/2026-10-25-internet/test-workspace.log"
+    summary """
+        On the committed tree e6350da's content: formatting clean in both workspaces, Clippy with warnings denied clean in both, 222 workspace tests passed, 0 failed, 1 ignored (the opt-in Internet test), release build ok, cargo tree -i ring printed nothing, and all 10 fuzz targets built. rbit's own lib suite, from a copy with --features http-client, passed 164 tests after the DHT and MSE changes.
         """
 }
 
@@ -945,6 +1010,19 @@ record templartorrent.evidence.step4-protected-deletion/1 : evidence {
     artifact "perf-results/2026-10-22-step4-checks/storage-tests.log"
     summary """
         Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0, tree at cb822df plus uncommitted test additions: 11 storage tests passed including delete_refuses_hardlink_symlink_and_swapped_inode_without_removing_the_job, delete_removes_only_job_files_and_keeps_the_root, closing_job_releases_storage_without_deleting_files, symlinks_are_refused and hostile_paths_are_rejected; 22 adapter driver tests passed including driver_pause_and_remove_join_network_tasks_and_retain_data (hardlink refusal before job removal, data retained and directory renamable after remove without delete) and driver_tracker_discovery_reannounce_and_safe_delete. Linux openat/unlinkat path only; no Windows run.
+        """
+}
+
+record templartorrent.evidence.udp-family-announce-tests/1 : evidence {
+    title "Adapter lib tests passed, including the UDP tracker over loopback on IPv4 and ::1: success, error action, wrong transaction id, forged source port, wrong action, truncated reply, a dropped request then a retry, silence to the 15 s budget with 4 sends, expired and rejected connection ids, a 512-peer cap. Also per-family HTTP and UDP announces with merged peers, per-family error detail and a stalled family cut after the grace period. An earlier diagnostic against the real Ubuntu tracker returned 1 peer over IPv4 and 25 over IPv6."
+    state verified
+    result pass
+    method command
+    observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
+    command "cargo test -p templartorrent-rbit-adapter --lib"
+    artifact "perf-results/2026-10-25-internet/test-workspace.log"
+    summary """
+        Adapter lib tests passed, including the UDP tracker over loopback on IPv4 and ::1: success, error action, wrong transaction id, forged source port, wrong action, truncated reply, a dropped request then a retry, silence to the 15 s budget with 4 sends, expired and rejected connection ids, a 512-peer cap. Also per-family HTTP and UDP announces with merged peers, per-family error detail and a stalled family cut after the grace period. An earlier diagnostic against the real Ubuntu tracker returned 1 peer over IPv4 and 25 over IPv6.
         """
 }
 

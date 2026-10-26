@@ -330,6 +330,69 @@ record templartorrent.milestone.picker-optimization/1 : milestone {
     after [ @templartorrent.milestone.performance-baselines ]
 }
 
+record templartorrent.milestone.public-swarm-client/1 : milestone {
+    title "Public-swarm client: verified Ubuntu ISO download from the Internet with UDP trackers, dual-stack, DHT, PEX and MSE"
+    state completed
+    scope [
+        path "crates/**",
+        path "fuzz/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/**",
+        path "vendor/rbit/**"
+    ]
+    intent """
+        Close the gaps that kept the client from replacing Deluge or Transmission on public torrents: per-family (BEP 7) HTTP and UDP (BEP 15) announces, a fixed dual-stack listen port, .torrent files added from their own info dictionary instead of BEP-9, non-blocking peer connects, DHT (BEP 5), PEX (BEP 11), MSE/PE encryption with plaintext fallback, an own peer-ID prefix, more than 128 files, and hybrid torrents through the v1 path with BEP 47 pad files. Pure v2 stays refused with a visible reason. The user permitted an opt-in Internet smoke test with ubuntu-26.04.1-desktop-amd64.iso.torrent on 2026-10-25.
+        """
+    note """
+        Baseline on 2026-10-25: adding the Ubuntu .torrent failed in 3.9 s with 'no permitted peer supplied valid metadata'. Announces went over IPv4 only and the tracker returned 1 peer, against 25 (24 IPv6) over IPv6.
+        """
+    acceptance {
+        check dht-pex {
+            statement """
+                PEX added peers reach a public job's pool in a loopback two-driver test and are never offered or accepted for private jobs; DHT get_peers supplies candidates to a public job on the Internet run
+                """
+            method command
+            verified_by [ @templartorrent.evidence.pex-loopback-and-dht-internet/1 ]
+        }
+        check formats {
+            statement """
+                Torrents with more than 128 files and hybrid torrents with pad files download and verify in loopback tests; pure v2 is refused with a visible reason
+                """
+            method command
+            verified_by [ @templartorrent.evidence.formats-hybrid-many-files/1 ]
+        }
+        check gates {
+            statement """
+                Formatting, all-target Clippy with warnings denied, workspace tests, fuzz targets and the release build pass; ring is still not built
+                """
+            method command
+            verified_by [ @templartorrent.evidence.public-swarm-gates/1 ]
+        }
+        check internet-ubuntu {
+            statement """
+                The opt-in smoke test downloads the permitted Ubuntu 26.04.1 desktop ISO to completion from the public swarm, every piece hash-verified, with peers, rates and RSS recorded and no peer addresses or info hash in the log
+                """
+            method command
+            command "TT_INTERNET_TORRENT=~/Downloads/ubuntu-26.04.1-desktop-amd64.iso.torrent TT_INTERNET_DEST=<new dir> cargo test --release -p templartorrent-rbit-adapter --test internet_smoke -- --ignored --nocapture"
+            verified_by [ @templartorrent.evidence.internet-ubuntu-download/1 ]
+        }
+        check mse {
+            statement """
+                MSE/PE outgoing and incoming handshakes interoperate in loopback tests, with plaintext fallback and per-job routing of encrypted incoming connections, and negotiate with real peers
+                """
+            method command
+            verified_by [ @templartorrent.evidence.mse-tests-and-real-peers/1 ]
+        }
+        check udp-and-family-announce {
+            statement """
+                UDP tracker announces (BEP 15) and per-address-family announces pass loopback fixture tests including timeouts, connection-id expiry and malformed replies
+                """
+            method command
+            verified_by [ @templartorrent.evidence.udp-family-announce-tests/1 ]
+        }
+    }
+}
+
 record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
     title "Protected storage, crash/private-discovery tests, capability gates and peer preference"
     state completed
