@@ -69,6 +69,18 @@ record templartorrent.papercut.in-integration-rbit-adapter-tests-driver-rs-the/1
     created_at 2026-10-22
 }
 
+record templartorrent.papercut.knowledge-revise-accepted-an-observation-whose/1 : papercut {
+    title "knowledge.revise accepted an observation whose observed_at named a…"
+    state verified
+    statement """
+        knowledge.revise accepted an observation whose observed_at named a commit that does not exist, and wrote the revision; only the next `akr check` reported AKR-G011. knowledge.propose rejects the same input up front. revise should run the same commit-presence check before writing.
+        """
+    observed_at git:12637360df87a4a1edc2b12c067f803f52df957c
+    about "akr"
+    author "claude"
+    created_at 2026-10-26
+}
+
 record templartorrent.papercut.knowledge-start-and-knowledge-search-with/1 : papercut {
     title "`knowledge.start` and `knowledge.search` with planning kinds returned…"
     state verified

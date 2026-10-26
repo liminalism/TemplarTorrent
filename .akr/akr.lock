@@ -5,8 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    commit git:52f591b5ecd4047abb2093edda7e8b3a8057a464
-    source_graph "sha256:8540f507aa7d93bd52f66552409a184ec1bc1100b8ae6468c87d2ac0fe69c48c"
+    source_graph "sha256:8f4d9d6b6b5132e1eea9b73854020b7264b0c2ac152b73d08ee4632c7df1399a"
 }
 
 source ".akr/project.akr" {
@@ -20,23 +19,23 @@ source ".akr/records/templartorrent/decisions.akr" {
 }
 
 source ".akr/records/templartorrent/evidence.akr" {
-    hash "sha256:231bd06ead26bd59039c79781d3f86f53e4b0ffc398dca112e9b112840c41887"
-    records 88
+    hash "sha256:d134be394137ddc07afaa042599c7423e4b497c6436b77c38c5f0989a4ada67b"
+    records 92
 }
 
 source ".akr/records/templartorrent/milestones.akr" {
-    hash "sha256:4c4fddedaca045c0dca921bc4a632496e5474c1d625385c44efc7fb90785bb37"
-    records 10
+    hash "sha256:b1e0d30df936a72fc1497652975a82add1263e1411b29684499fecfa8e7c55e2"
+    records 11
 }
 
 source ".akr/records/templartorrent/observations.akr" {
-    hash "sha256:65b46d363e09d241992536c87bfee9479f3f4cc6d1e8d9752d3c753dc72a8933"
-    records 17
+    hash "sha256:40b96488afa3a00d1b32e85ca285469be11f4c8f5d23efbf44ad7eb2940568d1"
+    records 20
 }
 
 source ".akr/records/templartorrent/papercuts.akr" {
-    hash "sha256:5aff40ed8acc8a1fb413b2c8a450b2e72226bfaddc013d7b0ebea6414049d460"
-    records 22
+    hash "sha256:dde16b48165cbcb00f01a677afe19e00bc89fda78ce1c58849a6dbe9755ea3b3"
+    records 23
 }
 
 source ".akr/records/templartorrent/questions.akr" {
@@ -589,6 +588,54 @@ resolution @templartorrent.observation.complete-piece-status/15 {
     hash "sha256:477d5aa1798caa2134d31940049a598b0abb70217adf72f2499c4c6391d690cb"
 }
 
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.dht-announce/1
+    hash "sha256:fe569114df8c562eb51d2b31ce1556b71fbcaace4e8f77d420d006c8ff2d4d8e"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.formats-hybrid-many-files/1
+    hash "sha256:ac2605e453d81de75ef64555235a8bbadc220342f56e2eeda3334c3d5aa73ed6"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.internet-ubuntu-download/1
+    hash "sha256:07ec9259948f36cbd249a0ecdcfa30a2cc74cdceb28101a8df411c711243ba47"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.ipv6-loopback-path/1
+    hash "sha256:9ad784e6b8b0c3c6a256b3ec682952ec80e787ba08015ae7f6c812f791ed0af6"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.mse-tests-and-real-peers/1
+    hash "sha256:cab09b8fec56382fcec3407f5a6b5374bc2ae4251bbeabc0d1795bafb0a85618"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.port-mapping/1
+    hash "sha256:ff2a878584265c12153dae74849bddbfe6e0d018dd42e086bb2cbf3cded029ed"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.public-swarm-gates/1
+    hash "sha256:970fa24ffc6b3d90ded76584158fde895e66652941d3ed30e6a8c98e628d9a7e"
+}
+
+resolution @templartorrent.observation.complete-piece-status/16 {
+    slot verified_by
+    to @templartorrent.evidence.reachability-gates/1
+    hash "sha256:38b58b0c1c255f7677b7d379f1fcdc925a6dcb7db10a6df78997a6b0d4be0f97"
+}
+
 resolution @templartorrent.work.complete-piece-assembly/1 {
     slot part_of
     to @templartorrent.milestone.native-app-wiring/1
@@ -633,8 +680,8 @@ resolution @templartorrent.work.peer-preference/1 {
 
 resolution @templartorrent.work.peer-score/1 {
     slot derived_from
-    to @templartorrent.observation.complete-piece-status/15
-    hash "sha256:a46f0c44b60528f655aa7e9a4f74fcc9036f696fe65a3ebf9009803b0cc029cb"
+    to @templartorrent.observation.complete-piece-status/16
+    hash "sha256:7ac1f76219a7bbc26fe168c01e19936cfc926df59057f62df1671f76f3485f2b"
 }
 
 resolution @templartorrent.work.picker-buckets/1 {
@@ -657,8 +704,8 @@ resolution @templartorrent.work.rbit-driver/1 {
 
 resolution @templartorrent.work.resume-bitmap/1 {
     slot derived_from
-    to @templartorrent.observation.complete-piece-status/15
-    hash "sha256:a46f0c44b60528f655aa7e9a4f74fcc9036f696fe65a3ebf9009803b0cc029cb"
+    to @templartorrent.observation.complete-piece-status/16
+    hash "sha256:7ac1f76219a7bbc26fe168c01e19936cfc926df59057f62df1671f76f3485f2b"
 }
 
 resolution @templartorrent.work.resume-recheck/1 {
@@ -723,8 +770,8 @@ resolution @templartorrent.work.ui-dialogs/1 {
 
 resolution @templartorrent.work.window-close-and-paste/1 {
     slot derived_from
-    to @templartorrent.observation.complete-piece-status/15
-    hash "sha256:a46f0c44b60528f655aa7e9a4f74fcc9036f696fe65a3ebf9009803b0cc029cb"
+    to @templartorrent.observation.complete-piece-status/16
+    hash "sha256:7ac1f76219a7bbc26fe168c01e19936cfc926df59057f62df1671f76f3485f2b"
 }
 
 seal @templartorrent.evidence.announce-transport/1 {
@@ -770,6 +817,11 @@ seal @templartorrent.evidence.complete-piece-wire/1 {
 seal @templartorrent.evidence.corrupt-peer/1 {
     state verified
     hash "sha256:948004500693f514d0dab56f566c8e3a21bd2a13d40675bb8905332556694fa7"
+}
+
+seal @templartorrent.evidence.dht-announce/1 {
+    state verified
+    hash "sha256:fe569114df8c562eb51d2b31ce1556b71fbcaace4e8f77d420d006c8ff2d4d8e"
 }
 
 seal @templartorrent.evidence.driver-seeding-metrics/1 {
@@ -850,6 +902,11 @@ seal @templartorrent.evidence.https-rustls-audit/1 {
 seal @templartorrent.evidence.internet-ubuntu-download/1 {
     state verified
     hash "sha256:07ec9259948f36cbd249a0ecdcfa30a2cc74cdceb28101a8df411c711243ba47"
+}
+
+seal @templartorrent.evidence.ipv6-loopback-path/1 {
+    state verified
+    hash "sha256:9ad784e6b8b0c3c6a256b3ec682952ec80e787ba08015ae7f6c812f791ed0af6"
 }
 
 seal @templartorrent.evidence.live-commands/1 {
@@ -987,6 +1044,11 @@ seal @templartorrent.evidence.picker-scenario-and-gates/1 {
     hash "sha256:af80ae77cc0086b265f5a9e4a7763942a2ebefc8e284d87f185c061844a15ef9"
 }
 
+seal @templartorrent.evidence.port-mapping/1 {
+    state verified
+    hash "sha256:ff2a878584265c12153dae74849bddbfe6e0d018dd42e086bb2cbf3cded029ed"
+}
+
 seal @templartorrent.evidence.preview-live-commands/1 {
     state verified
     hash "sha256:80bce6c08c9b5b29c195533b8d4b29339183ffce681a16ccca805433d8a90730"
@@ -1025,6 +1087,11 @@ seal @templartorrent.evidence.rbit-driver-path/1 {
 seal @templartorrent.evidence.rbit-driver-regressions/1 {
     state verified
     hash "sha256:0b47c32db42f147f8b943ce128ff5e19355f005beccb5fc81222bd148b22086f"
+}
+
+seal @templartorrent.evidence.reachability-gates/1 {
+    state verified
+    hash "sha256:38b58b0c1c255f7677b7d379f1fcdc925a6dcb7db10a6df78997a6b0d4be0f97"
 }
 
 seal @templartorrent.evidence.resume-bitmap/1 {
@@ -1207,6 +1274,11 @@ seal @templartorrent.milestone.public-swarm-client/1 {
     hash "sha256:2c1a03658548c8fbbfbadd43a35f378fa7b8bb354817ceac3cb8f07a3bf3a4bd"
 }
 
+seal @templartorrent.milestone.reachability/1 {
+    state completed
+    hash "sha256:df12847c9e89d3cabc445d3cb572d444f53ccc82bfe436e212af8071cb2b0220"
+}
+
 seal @templartorrent.milestone.safety-and-peer-policy/1 {
     state completed
     hash "sha256:c12cba20929909c69e98cea361e63b8c57efd6d184ef4f5dfb223fcd571072c7"
@@ -1293,13 +1365,28 @@ seal @templartorrent.observation.complete-piece-status/14 {
 }
 
 seal @templartorrent.observation.complete-piece-status/15 {
+    state superseded
+    hash "sha256:3d2d87af2040e45eaed7b2a40af4267b9570f020fcddf1fb28f4c8b8c6be7ee9"
+}
+
+seal @templartorrent.observation.complete-piece-status/16 {
     state verified
-    hash "sha256:a46f0c44b60528f655aa7e9a4f74fcc9036f696fe65a3ebf9009803b0cc029cb"
+    hash "sha256:7ac1f76219a7bbc26fe168c01e19936cfc926df59057f62df1671f76f3485f2b"
 }
 
 seal @templartorrent.observation.internet-download-stall/1 {
+    state superseded
+    hash "sha256:f2c12ce6e3e39775ea714739e3ec658c863edda0b7efaea7b8c2bd3b335ed6ab"
+}
+
+seal @templartorrent.observation.internet-download-stall/2 {
+    state superseded
+    hash "sha256:c1d1d96c31f174bb31d96c97bb583212b7f25375a1a0ef63f0ef72d6bc2557fc"
+}
+
+seal @templartorrent.observation.internet-download-stall/3 {
     state verified
-    hash "sha256:29635bde37d4ca572878ac37ce4313c721c4ad112271945a6dc7059d13fa39c4"
+    hash "sha256:f84c697c59b9b8aed40ff4f3aefdb58a898353fe4f2af3935d7d19dff87f30df"
 }
 
 seal @templartorrent.papercut.a-multi-file-patch-for-allocation-telemetry/1 {
@@ -1330,6 +1417,11 @@ seal @templartorrent.papercut.committing-the-resume-bitmap-failed-with-author/1 
 seal @templartorrent.papercut.in-integration-rbit-adapter-tests-driver-rs-the/1 {
     state verified
     hash "sha256:f571eb0b554a0c2341d318361a5367ff20bd34b85ce343944a3db4d82e32ee71"
+}
+
+seal @templartorrent.papercut.knowledge-revise-accepted-an-observation-whose/1 {
+    state verified
+    hash "sha256:fb4cc73c031a618b16f09e20be627e9701fe4fc197d10065565f78b852e9fd3f"
 }
 
 seal @templartorrent.papercut.knowledge-start-and-knowledge-search-with/1 {

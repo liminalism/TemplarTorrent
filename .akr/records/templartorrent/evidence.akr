@@ -117,6 +117,19 @@ record templartorrent.evidence.corrupt-peer/1 : evidence {
         """
 }
 
+record templartorrent.evidence.dht-announce/1 : evidence {
+    title "Loopback: node B's get_peers_and_announce announced port 51413 for an info hash to A, and node C's get_peers through A returned 127.0.0.1:51413. Internet, hotel wired IPv4 behind NAT, Ubuntu ISO torrent for 240 s: the routing table reached 61 nodes and real nodes accepted 6 announce_peer queries. The download held 18.4 to 19.0 MB/s from 43 peers, 34 of them MSE-encrypted, and verified 2.32 GB before the time limit."
+    state verified
+    result pass
+    method command
+    observed_at git:1ba08ab254839e103de22fe72eddfe30d3efdc80
+    command "cargo test -p templartorrent-rbit-adapter --test dht; TT_INTERNET_TORRENT=... TT_INTERNET_SECONDS=240 cargo test --release -q -p templartorrent-rbit-adapter --test internet_smoke -- --ignored --nocapture"
+    artifact "perf-results/2026-10-26-wired/run1-announce.log"
+    summary """
+        Loopback: node B's get_peers_and_announce announced port 51413 for an info hash to A, and node C's get_peers through A returned 127.0.0.1:51413. Internet, hotel wired IPv4 behind NAT, Ubuntu ISO torrent for 240 s: the routing table reached 61 nodes and real nodes accepted 6 announce_peer queries. The download held 18.4 to 19.0 MB/s from 43 peers, 34 of them MSE-encrypted, and verified 2.32 GB before the time limit.
+        """
+}
+
 record templartorrent.evidence.driver-seeding-metrics/1 : evidence {
     title "One release Linux i7-13700H/Rust 1.99.0 sample: second Driver resolved metadata and downloaded 196681 bytes from the listening Driver in 340301891 ns including final comparison/shutdown. Traced upload ownership peaked at 81920 B; sampled shared upload reservation 98368 B; sampled process RSS 5246976 B including both Drivers/fixture/Tokio. Initial seed download excluded; not app startup or an optimization comparison."
     state verified
@@ -316,6 +329,19 @@ record templartorrent.evidence.internet-ubuntu-download/1 : evidence {
     artifact "perf-results/2026-10-25-internet/handoff.json"
     summary """
         Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, release, IPv4-only Wi-Fi (no VPN, no IPv6 route), user-permitted torrent. The client added the .torrent from its own info dictionary and found peers through DHT and PEX; the Ubuntu tracker gave 1 peer over IPv4. First verified piece at 50.3 s; complete and seeding at 519 s, 6482409472 of 6482409472 bytes, average 12.5 MB/s, peak 19.6 MB/s, peak 47 peers, peak RSS 36.4 MB, 0 hash failures, 0 steps over 500 ms. An independent Python pass checked 24729 of 24729 piece SHA-1s with 0 mismatches; the ISO SHA-256 is 601e30fbf5d97759367c632e2c33630665039b7e2158fd068403da3ccf1bda1f. The log has counts and rates only. The code at d6709ad failed this add in 3.9 s (baseline.log).
+        """
+}
+
+record templartorrent.evidence.ipv6-loopback-path/1 : evidence {
+    title "A Driver listening on [::] downloaded the fixture from a seeder bound to ::1 and verified the files. It then seeded through the same dual-stack socket to a leech dialling [::1] and to one dialling 127.0.0.1; both verified, and the seed uploaded at least twice the payload. The machine had no IPv6 route on the hotel network, so no IPv6 Internet transfer was run."
+    state verified
+    result pass
+    method command
+    observed_at git:1ba08ab254839e103de22fe72eddfe30d3efdc80
+    command "cargo test -p templartorrent-rbit-adapter --test driver driver_moves_payload_over_ipv6_and_a_dual_stack_listener"
+    artifact "perf-results/2026-10-25-internet/handoff.json"
+    summary """
+        A Driver listening on [::] downloaded the fixture from a seeder bound to ::1 and verified the files. It then seeded through the same dual-stack socket to a leech dialling [::1] and to one dialling 127.0.0.1; both verified, and the seed uploaded at least twice the payload. The machine had no IPv6 route on the hotel network, so no IPv6 Internet transfer was run.
         """
 }
 
@@ -655,6 +681,19 @@ record templartorrent.evidence.picker-scenario-and-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.port-mapping/1 : evidence {
+    title "17 portmap tests. NAT-PMP over loopback: success with deletes on stop, result code 2, ignored replies from a spoofed IP and from the wrong port, timeout after 3 tries, renewal at half a 2 s lifetime, Driver shutdown removing the mapping. UPnP: a miniupnpd-shaped WANIPConnection with deletes, WANPPPConnection only, error 725 falling back to lease 0, a LOCATION on 127.0.0.2 refused and never contacted, a description over 64 KiB refused. Persist, worker and UI tests: the setting defaults off, round-trips and is reapplied on relaunch. portmap_parsers fuzz: 773832 runs in 61 s, regression replayed, no crash. Read-only probe of the real hotel gateway 10.10.10.1: no NAT-PMP reply in 3.75 s, no SSDP answer in 3 s, no mapping requested. Not yet tested against a router that answers."
+    state verified
+    result pass
+    method command
+    observed_at git:1ba08ab254839e103de22fe72eddfe30d3efdc80
+    command "cargo test -p templartorrent-rbit-adapter --lib portmap; OUT=../.agent/scratch/fuzz fuzz/run.sh 60 portmap_parsers; TT_PORTMAP_PROBE=1 cargo test -p templartorrent-rbit-adapter --lib real_gateway_probe -- --ignored --nocapture"
+    artifact "perf-results/2026-10-26-wired/gateway-probe.log"
+    summary """
+        17 portmap tests. NAT-PMP over loopback: success with deletes on stop, result code 2, ignored replies from a spoofed IP and from the wrong port, timeout after 3 tries, renewal at half a 2 s lifetime, Driver shutdown removing the mapping. UPnP: a miniupnpd-shaped WANIPConnection with deletes, WANPPPConnection only, error 725 falling back to lease 0, a LOCATION on 127.0.0.2 refused and never contacted, a description over 64 KiB refused. Persist, worker and UI tests: the setting defaults off, round-trips and is reapplied on relaunch. portmap_parsers fuzz: 773832 runs in 61 s, regression replayed, no crash. Read-only probe of the real hotel gateway 10.10.10.1: no NAT-PMP reply in 3.75 s, no SSDP answer in 3 s, no mapping requested. Not yet tested against a router that answers.
+        """
+}
+
 record templartorrent.evidence.preview-live-commands/1 : evidence {
     title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0 (b940084d7 2026-09-28), uncommitted tree based on 72b01427. The preview live_commands filter passed 6 tests and filtered 4. LiveBridge still rejects data deletion, add, reannounce, and peer preference. No window was opened."
     state verified
@@ -754,6 +793,19 @@ record templartorrent.evidence.rbit-driver-regressions/1 : evidence {
     artifact "perf-results/2026-10-15-driver/handoff.json"
     summary """
         On Ubuntu 26.04.1 Linux x86_64/Rust 1.99.0, 69 root tests and 10 PixelKit headless tests passed, as did formatting and all-target Clippy with warnings denied in all three workspaces. Diagnostic example compiled via all-target checks. No native window or Windows execution. Native audit still lists ring 0.17.14 through rbit/reqwest/rustls.
+        """
+}
+
+record templartorrent.evidence.reachability-gates/1 : evidence {
+    title "On 1ba08ab: formatting clean, Clippy with warnings denied clean, 244 workspace tests passed, 0 failed, 2 ignored (the opt-in Internet and gateway probes), and cargo tree -i ring printed nothing. All 11 fuzz targets built. rbit's lib suite, from a copy with --features http-client, passed 164 tests after the announce change."
+    state verified
+    result pass
+    method command
+    observed_at git:1ba08ab254839e103de22fe72eddfe30d3efdc80
+    command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast && cargo tree --workspace -i ring; cd fuzz && cargo +nightly fuzz build"
+    artifact "perf-results/2026-10-26-wired/fuzz-portmap.log"
+    summary """
+        On 1ba08ab: formatting clean, Clippy with warnings denied clean, 244 workspace tests passed, 0 failed, 2 ignored (the opt-in Internet and gateway probes), and cargo tree -i ring printed nothing. All 11 fuzz targets built. rbit's lib suite, from a copy with --features http-client, passed 164 tests after the announce change.
         """
 }
 

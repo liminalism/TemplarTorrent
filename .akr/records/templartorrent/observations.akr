@@ -474,7 +474,7 @@ record templartorrent.observation.complete-piece-status/14 : observation {
 
 record templartorrent.observation.complete-piece-status/15 : observation {
     title "Linux client downloads a public 6.5 GB ISO from the Internet swarm; remaining boundaries"
-    state verified
+    state superseded
     statement """
         2026-10-26, Linux x86_64 Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, committed on master at e6350da. The opt-in Internet smoke test downloaded the user-permitted Ubuntu 26.04.1 desktop ISO in 519 s. That is 6482409472 bytes, every piece verified by the client and again independently, at a 19.6 MB/s peak from up to 47 peers, with RSS under 37 MB. The network was IPv4-only Wi-Fi, so peers came from DHT and PEX; the Ubuntu tracker gave 1 peer over IPv4. MSE negotiated RC4 with 35 of 38 real peers. In place now:
         - .torrent files added from their info dictionary; parallel magnet metadata.
@@ -510,9 +510,45 @@ record templartorrent.observation.complete-piece-status/15 : observation {
     ]
 }
 
+record templartorrent.observation.complete-piece-status/16 : observation {
+    title "Linux client downloads a public 6.5 GB ISO from the Internet swarm; remaining boundaries"
+    state verified
+    statement """
+        2026-10-26, Linux x86_64 Ubuntu 26.04.1, i7-13700H, rustc 1.99.0, master at 1ba08ab. The opt-in Internet smoke test downloaded the user-permitted Ubuntu 26.04.1 desktop ISO in 519 s, 6482409472 bytes, every piece verified twice. On the hotel's wired IPv4 link it held about 19 MB/s from 43 peers. Public torrents get:
+        - .torrent and magnet adds, the latter with metadata from up to four peers at once.
+        - Per-family HTTP(S) and UDP announces off the step loop, and a background-dialled 2048-candidate pool.
+        - DHT get_peers and announce_peer (real nodes accepted 6 announces in 4 minutes), plus PEX.
+        - MSE/PE (35 of 38 real peers encrypted).
+        - A fixed dual-stack listen port, an encryption setting, and opt-in NAT-PMP/UPnP IGD mapping limited to the default gateway.
+        - Up to 4096 files and hybrid torrents with BEP 47 pad files.
+        11 fuzz targets; 244 workspace tests pass.
+        Remaining boundaries:
+        - Port mapping is proven only against loopback fixtures; the hotel gateway answered neither NAT-PMP nor SSDP.
+        - No IPv6 Internet transfer: the IPv6 peer path is proven on ::1 only.
+        - No incoming peers observed, no uTP, no webseeds, no pure v2.
+        - The Wi-Fi stall in observation internet-download-stall is not attributed to the client.
+        - Pieces written after the last checkpoint are rechecked; file identity is not a content hash; the rbit fork must be re-applied on upgrade.
+        - Windows, and the GUI against the Internet, are untested.
+        """
+    observed_at git:1ba08ab254839e103de22fe72eddfe30d3efdc80
+    method command
+    watches [ "crates/**", "integration/**", "vendor/**", "fuzz/**" ]
+    supersedes [ @templartorrent.observation.complete-piece-status/15 ]
+    verified_by [
+        @templartorrent.evidence.dht-announce,
+        @templartorrent.evidence.formats-hybrid-many-files,
+        @templartorrent.evidence.internet-ubuntu-download,
+        @templartorrent.evidence.ipv6-loopback-path,
+        @templartorrent.evidence.mse-tests-and-real-peers,
+        @templartorrent.evidence.port-mapping,
+        @templartorrent.evidence.public-swarm-gates,
+        @templartorrent.evidence.reachability-gates
+    ]
+}
+
 record templartorrent.observation.internet-download-stall/1 : observation {
     title "One Internet run stalled with 25 unchoking peers; not reproduced"
-    state verified
+    state superseded
     scope [ path "crates/templartorrent-engine/**", path "integration/rbit-adapter/**" ]
     statement """
         2026-10-25, Internet run 2 of the Ubuntu ISO (perf-results/2026-10-25-internet/run2.log), IPv4 only, code before the rbit get_peers fix. Verified bytes rose from about 630 s to 33.7 MB at 701 s, then stayed there until the run was stopped at 821 s. 25 of 28 connected peers had us unchoked and the smoothed download rate decayed to 0. The harness did not yet print lease or payload state. Run 4 on the committed code completed 6.48 GB without a stall, and run 5 saw none in 180 s. The harness now prints leased pieces, requests in flight, peers we cannot request from, pickable pieces, payload reservations, hash failures and peer errors every 10 s, so a recurrence shows which bound held. Suspects not ruled out: MAX_ACTIVE_PIECES (64) filled by leases on peers that stopped answering for under LEASE_TIMEOUT (30 s) at a time; payload reservations near the 48 MiB budget (run 4 sat at 44 MB); requests a choking peer discarded, which PeerActor::on_choke does not clear.
@@ -520,4 +556,30 @@ record templartorrent.observation.internet-download-stall/1 : observation {
     observed_at git:e6350dab1f5090a8160cc69f3238475633da1e7a
     method observation
     watches [ "crates/templartorrent-engine/src/**", "integration/rbit-adapter/src/driver.rs" ]
+}
+
+record templartorrent.observation.internet-download-stall/2 : observation {
+    title "One Internet run stalled with 25 unchoking peers; not reproduced"
+    state superseded
+    scope [ path "crates/templartorrent-engine/**", path "integration/rbit-adapter/**" ]
+    statement """
+        2026-10-25, Internet run 2 of the Ubuntu ISO (perf-results/2026-10-25-internet/run2.log), IPv4 only over hotel Wi-Fi, code before the rbit get_peers fix. Verified bytes stayed at 33.7 MB from 701 s until the run was stopped at 821 s. 25 of 28 connected peers had us unchoked and the smoothed download rate decayed to 0. On 2026-10-26 the user attributed it to unstable hotel Wi-Fi; the machine is now on wired Ethernet. Run 4 completed 6.48 GB without a stall and run 5 saw none in 180 s. The harness prints lease, request, payload and peer-error state every 10 s, so a recurrence on a stable link would show which bound held. Not treated as a client defect unless it recurs on a stable connection.
+        """
+    observed_at git:1263736c5d4ad83fdf7a0b2b7ae62d6c2d6ae0e2
+    method observation
+    watches [ "crates/templartorrent-engine/src/**", "integration/rbit-adapter/src/driver.rs" ]
+    supersedes [ @templartorrent.observation.internet-download-stall/1 ]
+}
+
+record templartorrent.observation.internet-download-stall/3 : observation {
+    title "One Internet run stalled with 25 unchoking peers; not reproduced"
+    state verified
+    scope [ path "crates/templartorrent-engine/**", path "integration/rbit-adapter/**" ]
+    statement """
+        2026-10-25, Internet run 2 of the Ubuntu ISO (perf-results/2026-10-25-internet/run2.log), IPv4 only over hotel Wi-Fi, code before the rbit get_peers fix. Verified bytes stayed at 33.7 MB from 701 s until the run was stopped at 821 s. 25 of 28 connected peers had us unchoked and the smoothed download rate decayed to 0. On 2026-10-26 the user attributed it to unstable hotel Wi-Fi; the machine is now on wired Ethernet. Run 4 completed 6.48 GB without a stall and run 5 saw none in 180 s. The harness prints lease, request, payload and peer-error state every 10 s, so a recurrence on a stable link would show which bound held. Not treated as a client defect unless it recurs on a stable connection.
+        """
+    observed_at git:12637360df87a4a1edc2b12c067f803f52df957c
+    method observation
+    watches [ "crates/templartorrent-engine/src/**", "integration/rbit-adapter/src/driver.rs" ]
+    supersedes [ @templartorrent.observation.internet-download-stall/2 ]
 }

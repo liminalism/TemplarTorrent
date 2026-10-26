@@ -393,6 +393,53 @@ record templartorrent.milestone.public-swarm-client/1 : milestone {
     }
 }
 
+record templartorrent.milestone.reachability/1 : milestone {
+    title "Be findable and reachable: DHT announce_peer, opt-in router port mapping, IPv6 peer path"
+    state completed
+    scope [
+        path "fuzz/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/**",
+        path "vendor/rbit/src/dht/**"
+    ]
+    intent """
+        After the public-swarm milestone, close the three reachability gaps the user asked for on 2026-10-26: announce our listen port to the DHT; map it on the router with NAT-PMP or UPnP IGD, opt-in and restricted to the default gateway (DESIGN.md section 9); and exercise the IPv6 peer path, here over loopback because the hotel network has no IPv6.
+        """
+    note """
+        The user attributed the run-2 stall to hotel Wi-Fi; observation internet-download-stall was revised accordingly.
+        """
+    acceptance {
+        check dht-announce {
+            statement """
+                A loopback DHT node finds a port another node announced, and real DHT nodes accept the client's announces on the Internet run
+                """
+            method command
+            verified_by [ @templartorrent.evidence.dht-announce/1 ]
+        }
+        check gates {
+            statement """
+                Formatting, Clippy with warnings denied, workspace tests, fuzz build and the native audit pass
+                """
+            method command
+            verified_by [ @templartorrent.evidence.reachability-gates/1 ]
+        }
+        check ipv6-path {
+            statement """
+                Payload moves over ::1 outgoing and through a dual-stack [::] listener to IPv6 and IPv4 leeches
+                """
+            method command
+            verified_by [ @templartorrent.evidence.ipv6-loopback-path/1 ]
+        }
+        check port-mapping {
+            statement """
+                NAT-PMP and UPnP IGD mapping passes loopback fixture tests including spoofed replies, renewal, removal on shutdown and refused foreign LOCATIONs; the setting defaults to off; the parsers fuzz clean; a read-only probe of the real gateway creates no mapping
+                """
+            method command
+            verified_by [ @templartorrent.evidence.port-mapping/1 ]
+        }
+    }
+}
+
 record templartorrent.milestone.safety-and-peer-policy/1 : milestone {
     title "Protected storage, crash/private-discovery tests, capability gates and peer preference"
     state completed
