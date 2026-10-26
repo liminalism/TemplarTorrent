@@ -90,10 +90,11 @@ layout/policy demonstrator, not a connectivity test or production UI.
 
 | Area | Included code | Still to implement/validate |
 |---|---|---|
-| File order | Natural comparator, u32 ranks, piece overlap, promotion/invalidation, multi-piece lease pipelining per peer | Sequence-group detection, v2 map |
+| File order | Natural comparator, u32 ranks, piece overlap, promotion/invalidation, multi-piece lease pipelining per peer; up to 4096 files; hybrid torrents through their v1 view with BEP 47 pad files never written | Sequence-group detection, pure v2 (refused with a reason) |
 | Memory/rates | Atomic byte permits, decimal token bucket | Charge actual buffers, socket admission, actual I/O enforcement |
-| Trackers | Privacy gate, interval/backoff state | HTTP/UDP actors, discovery arbitration, feed validation/cache |
-| Engine | Real rbit type wrappers and bitfield conversion | Magnets-to-payload transfer loop, metadata exchange, hashing/storage |
+| Trackers | Privacy gate, interval/backoff state, HTTP(S) and UDP (BEP 15) announces once per address family, run off the step loop | Feed validation/cache |
+| Discovery | DHT (BEP 5) get_peers for public jobs, PEX (BEP 11) both directions, a 2048-candidate pool per job dialled in the background with backoff, MSE/PE encryption with plaintext fallback, a fixed dual-stack listen port | DHT announce_peer, UPnP/NAT-PMP, uTP, webseeds |
+| Engine | Magnet and .torrent transfers over rbit wires with BEP-9 metadata from up to four peers at once, hashing, file storage; a public Ubuntu ISO downloaded and verified (perf-results/2026-10-25-internet) | Power-loss test of the batched sync |
 | UI | Native PixelKit split panes and fixture inspector | Add/limits/remove dialogs, real commands/acks, file browser |
 | Peers | Typed state, local Prefer/Avoid/Block, per-peer smoothed rates, upload slots ranked by preference, attributed hash failures, rare-piece availability, rate and block round trip, with a rotating optimistic slot, MMDB country lookup | peer-ID client fallback, flag atlas |
 | Removal | Default-safe intent, Linux handle-relative no-follow deletion with inode identity and hardlink refusal, forced-kill restart recheck | Windows reparse-aware deletion, crash journal |

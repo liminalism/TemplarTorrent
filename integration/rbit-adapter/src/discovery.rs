@@ -2,6 +2,9 @@
 //! private only when the caller sets that allowance (tests and an explicit
 //! user opt-in). Automatically added public trackers never may. Query strings
 //! stay intact for announce and are stripped from any label.
+//!
+//! `http://`, `https://` and `udp://` (BEP 15) trackers are admitted. A UDP
+//! tracker has no default port; its path and query travel as BEP 41 URL data.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -11,9 +14,27 @@ use std::{
 pub const MAX_TRACKERS: usize = 12;
 const MAX_URL_LEN: usize = 2048;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerScheme {
+    Http,
+    Https,
+    Udp,
+}
+
+impl TrackerScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrackerScheme::Http => "http",
+            TrackerScheme::Https => "https",
+            TrackerScheme::Udp => "udp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTracker {
     pub url: String,
+    pub scheme: TrackerScheme,
     pub host: String,
     pub port: u16,
 }
@@ -26,12 +47,14 @@ pub fn parse_tracker_url(raw: &str) -> Result<ParsedTracker, &'static str> {
     if raw.contains([' ', '\n', '\r', '\t', '\0']) {
         return Err("tracker URL contains whitespace");
     }
-    let (https, rest) = if let Some(rest) = raw.strip_prefix("https://") {
-        (true, rest)
+    let (scheme, rest) = if let Some(rest) = raw.strip_prefix("https://") {
+        (TrackerScheme::Https, rest)
     } else if let Some(rest) = raw.strip_prefix("http://") {
-        (false, rest)
+        (TrackerScheme::Http, rest)
+    } else if let Some(rest) = raw.strip_prefix("udp://") {
+        (TrackerScheme::Udp, rest)
     } else {
-        return Err("tracker scheme must be http or https");
+        return Err("tracker scheme must be http, https or udp");
     };
     if rest.contains('@') {
         return Err("tracker URL userinfo is rejected");
@@ -43,19 +66,30 @@ pub fn parse_tracker_url(raw: &str) -> Result<ParsedTracker, &'static str> {
     if hostport.is_empty() {
         return Err("tracker host is missing");
     }
-    let (host, port) = split_host_port(hostport, if https { 443 } else { 80 })?;
+    let default_port = match scheme {
+        TrackerScheme::Https => 443,
+        TrackerScheme::Http => 80,
+        // BEP 15 defines no default port; 0 is refused below.
+        TrackerScheme::Udp => 0,
+    };
+    let (host, port) = split_host_port(hostport, default_port)?;
     if host.is_empty() {
         return Err("tracker host is missing");
     }
+    if port == 0 {
+        return Err("UDP tracker port is missing");
+    }
     let path = path.split('#').next().unwrap_or("");
-    let url = format!(
-        "{}://{hostport}{path}",
-        if https { "https" } else { "http" }
-    );
+    let url = format!("{}://{hostport}{path}", scheme.as_str());
     if url.len() > MAX_URL_LEN {
         return Err("tracker URL length is invalid");
     }
-    Ok(ParsedTracker { url, host, port })
+    Ok(ParsedTracker {
+        url,
+        scheme,
+        host,
+        port,
+    })
 }
 
 fn split_host_port(hostport: &str, default_port: u16) -> Result<(String, u16), &'static str> {
@@ -197,13 +231,18 @@ pub struct AdmittedTracker {
 }
 
 impl AdmittedTracker {
-    /// The address an announce connects to: the first IPv4, else the first.
-    pub fn connect_address(&self) -> Option<SocketAddr> {
-        self.addresses
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .or(self.addresses.first())
-            .map(|ip| SocketAddr::new(*ip, self.tracker.port))
+    /// The addresses an announce goes to: the first resolved IPv4 address and
+    /// the first resolved IPv6 address, at most one per family, IPv4 first.
+    /// IPv4-mapped IPv6 results count as IPv4. Every one of them passed
+    /// [`classify_addresses`] together with the rest of the resolution.
+    pub fn connect_addresses(&self) -> Vec<SocketAddr> {
+        let canonical = || self.addresses.iter().map(|ip| ip.to_canonical());
+        let v4 = canonical().find(IpAddr::is_ipv4);
+        let v6 = canonical().find(IpAddr::is_ipv6);
+        v4.into_iter()
+            .chain(v6)
+            .map(|ip| SocketAddr::new(ip, self.tracker.port))
+            .collect()
     }
 }
 
@@ -291,6 +330,87 @@ mod tests {
         assert_eq!(
             redact_tracker_url("http://tracker.example/announce?passkey=secret"),
             "http://tracker.example/announce?<redacted>"
+        );
+    }
+
+    #[test]
+    fn udp_trackers_parse_with_an_explicit_port_and_keep_url_data() {
+        let parsed =
+            parse_tracker_url("udp://tracker.example:6969/announce?passkey=abc#frag").unwrap();
+        assert_eq!(parsed.scheme, TrackerScheme::Udp);
+        assert_eq!(parsed.host, "tracker.example");
+        assert_eq!(parsed.port, 6969);
+        assert_eq!(
+            parsed.url,
+            "udp://tracker.example:6969/announce?passkey=abc"
+        );
+        let bare = parse_tracker_url("udp://tracker.example:1337").unwrap();
+        assert_eq!(
+            (bare.url.as_str(), bare.port),
+            ("udp://tracker.example:1337", 1337)
+        );
+        let v6 = parse_tracker_url("udp://[2001:db8::1]:6969/announce").unwrap();
+        assert_eq!((v6.host.as_str(), v6.port), ("2001:db8::1", 6969));
+        for (raw, reason) in [
+            ("udp://tracker.example/announce", "port is missing"),
+            ("udp://tracker.example:0/announce", "port is invalid"),
+            ("udp://[2001:db8::1]/announce", "port is missing"),
+            ("udp://user:pw@tracker.example:6969", "userinfo"),
+            ("udp:///announce", "host is missing"),
+            ("udp://tracker.example:99999", "port is invalid"),
+            ("udp:/tracker.example:6969", "scheme"),
+            ("wss://tracker.example/announce", "http, https or udp"),
+        ] {
+            let error = parse_tracker_url(raw).unwrap_err();
+            assert!(error.contains(reason), "{raw}: {error}");
+        }
+        assert!(parse_tracker_url("udp://:6969/announce").is_err());
+        let long = format!("udp://tracker.example:6969/{}", "a".repeat(MAX_URL_LEN));
+        assert!(parse_tracker_url(&long).unwrap_err().contains("length"));
+        let https = parse_tracker_url("https://tracker.example/a").unwrap();
+        assert_eq!((https.scheme, https.port), (TrackerScheme::Https, 443));
+        let http = parse_tracker_url("http://tracker.example/a").unwrap();
+        assert_eq!((http.scheme, http.port), (TrackerScheme::Http, 80));
+    }
+
+    #[test]
+    fn connect_addresses_pick_one_address_per_family() {
+        let tracker = parse_tracker_url("udp://tracker.example:6969").unwrap();
+        let admitted = |addresses: &[&str]| AdmittedTracker {
+            tracker: tracker.clone(),
+            local: false,
+            addresses: addresses.iter().map(|ip| ip.parse().unwrap()).collect(),
+        };
+        let both = admitted(&["2001:db8::1", "2001:db8::2", "1.1.1.1", "8.8.8.8"]);
+        assert_eq!(
+            both.connect_addresses(),
+            vec![
+                "1.1.1.1:6969".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::1]:6969".parse().unwrap()
+            ]
+        );
+        let mapped = admitted(&["::ffff:1.1.1.1"]);
+        assert_eq!(
+            mapped.connect_addresses(),
+            vec!["1.1.1.1:6969".parse::<SocketAddr>().unwrap()]
+        );
+        assert!(admitted(&[]).connect_addresses().is_empty());
+        assert_eq!(admitted(&["2001:db8::1"]).connect_addresses().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn localhost_admits_both_loopback_families_only_with_the_allowance() {
+        assert!(admit_tracker("udp://localhost:6969", false).await.is_err());
+        let admitted = admit_tracker("udp://localhost:6969/announce", true)
+            .await
+            .unwrap();
+        assert!(admitted.local);
+        assert_eq!(
+            admitted.connect_addresses(),
+            vec![
+                "127.0.0.1:6969".parse::<SocketAddr>().unwrap(),
+                "[::1]:6969".parse().unwrap()
+            ]
         );
     }
 

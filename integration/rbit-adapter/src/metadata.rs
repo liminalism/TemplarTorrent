@@ -17,6 +17,8 @@ pub const METADATA_BUDGET: usize = 32 * 1024 * 1024;
 pub const OUR_MD_ID: u8 = 3;
 const MAX_BUFFERED_MESSAGES: usize = 64;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
+/// Non-metadata messages tolerated during one acquisition, kept or dropped.
+const MAX_DROPPED_MESSAGES: usize = 1024;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 
 pub struct FetchedMetadata {
@@ -34,15 +36,29 @@ impl fmt::Debug for FetchedMetadata {
     }
 }
 
+/// Control messages a real peer may send before we have metadata. State the
+/// session needs later is kept; messages that mean nothing yet (other
+/// extensions, fast-extension hints, DHT port, requests we cannot serve) are
+/// dropped, at most [`MAX_DROPPED_MESSAGES`] of them. Anything else, such as
+/// an unsolicited Piece, fails the attempt.
 fn buffer(message: Message, buffered: &mut Vec<Message>, bytes: &mut usize) -> Result<(), String> {
     let size = match &message {
         Message::Bitfield(bits) => bits.len(),
         Message::Choke
         | Message::Unchoke
+        | Message::Interested
+        | Message::NotInterested
         | Message::Have { .. }
         | Message::HaveAll
         | Message::HaveNone
         | Message::KeepAlive => 16,
+        Message::Extended { .. }
+        | Message::Port(_)
+        | Message::AllowedFast { .. }
+        | Message::Suggest { .. }
+        | Message::Request { .. }
+        | Message::Cancel { .. }
+        | Message::Reject { .. } => return Ok(()),
         _ => return Err("unexpected message during metadata acquisition".into()),
     };
     if buffered.len() >= MAX_BUFFERED_MESSAGES || size > MAX_BUFFERED_BYTES.saturating_sub(*bytes) {
@@ -106,6 +122,7 @@ async fn fetch(
     .await?;
     let mut buffered = Vec::new();
     let mut buffered_bytes = 0;
+    let mut dropped = 0usize;
     let remote = loop {
         match receive(conn).await? {
             Message::Extended { id: 0, payload } => {
@@ -122,7 +139,13 @@ async fn fetch(
                 break ExtensionHandshake::decode(&payload)
                     .map_err(|_| "invalid extension handshake")?;
             }
-            other => buffer(other, &mut buffered, &mut buffered_bytes)?,
+            other => {
+                dropped += 1;
+                if dropped > MAX_DROPPED_MESSAGES {
+                    return Err("metadata control-message limit exceeded".into());
+                }
+                buffer(other, &mut buffered, &mut buffered_bytes)?;
+            }
         }
     };
     let remote_id = remote
@@ -193,10 +216,13 @@ async fn fetch(
                     raw_info[start..start + expected].copy_from_slice(&bytes);
                     break;
                 }
-                Message::Extended { .. } => {
-                    return Err("metadata on unexpected extension id".into());
+                other => {
+                    dropped += 1;
+                    if dropped > MAX_DROPPED_MESSAGES {
+                        return Err("metadata control-message limit exceeded".into());
+                    }
+                    buffer(other, &mut buffered, &mut buffered_bytes)?;
                 }
-                other => buffer(other, &mut buffered, &mut buffered_bytes)?,
             }
         }
     }

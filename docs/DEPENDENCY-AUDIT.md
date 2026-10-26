@@ -106,3 +106,17 @@ depends on `libfuzzer-sys`, which compiles LLVM's libFuzzer from C++ with a
 nightly toolchain. That code is test tooling: no shipped package depends on
 the fuzz crate, so the release graph and its `cargo tree -i ring` audit do
 not change. Do not move a fuzz target into a root-workspace crate.
+
+## Peer-wire encryption (MSE/PE), 2026-10-25
+
+`vendor/rbit/src/peer/mse.rs` adds one direct dependency to the fork:
+`num-bigint` 0.4.8 (MIT OR Apache-2.0, pure Rust, default `std` feature
+only), which pulls `num-integer` and `num-traits` (both pure Rust, already
+common in the ecosystem; `num-traits` was already in the lock). It supplies
+the 768-bit modular exponentiation for the MSE Diffie-Hellman exchange.
+RC4 is a few lines in `mse.rs` itself (no `rc4`/`cipher` crate), checked
+against RFC 6229 and the published vectors; SHA-1 is the existing `sha1`.
+No C, assembly or `-sys` crate enters the graph, and `cargo tree --workspace
+-i ring` still prints nothing. num-bigint is not constant-time; MSE is
+traffic obfuscation keyed by a public info hash, not confidentiality, so
+timing side channels on its ephemeral exponent are not a concern here.

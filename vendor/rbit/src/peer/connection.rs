@@ -9,8 +9,9 @@ use super::choking::ChokingState;
 use super::error::PeerError;
 use super::extension::ExtensionHandshake;
 use super::message::{validate_hash_request, Handshake, Message};
+use super::mse::MseStream;
 use super::peer_id::PeerId;
-use super::transport::PeerTransport;
+use super::transport::{set_peer_nodelay, BoxedPeerStream, PeerStream, PeerTransport};
 
 /// The connection state of a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +91,8 @@ pub struct PeerConnection {
     pub bytes_downloaded: u64,
     /// Total bytes uploaded to this peer.
     pub bytes_uploaded: u64,
-    transport: Option<PeerTransport>,
+    encrypted: bool,
+    transport: Option<PeerTransport<BoxedPeerStream>>,
 }
 
 impl PeerConnection {
@@ -111,7 +113,34 @@ impl PeerConnection {
         advertise_v2: bool,
     ) -> Result<Self, PeerError> {
         let stream = TcpStream::connect(addr).await?;
-        let mut transport = PeerTransport::new(stream);
+        set_peer_nodelay(&stream);
+        Self::outgoing(Box::new(stream), false, addr, info_hash, our_peer_id, advertise_v2).await
+    }
+
+    /// Runs the BitTorrent handshake as initiator over a stream that has
+    /// already completed (or skipped) MSE, for example one returned by
+    /// [`super::mse::initiate`]. `addr` is recorded, not dialled.
+    pub async fn connect_with_stream<S: PeerStream + 'static>(
+        stream: MseStream<S>,
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        advertise_v2: bool,
+    ) -> Result<Self, PeerError> {
+        let encrypted = stream.is_encrypted();
+        Self::outgoing(Box::new(stream), encrypted, addr, info_hash, our_peer_id, advertise_v2)
+            .await
+    }
+
+    async fn outgoing(
+        stream: BoxedPeerStream,
+        encrypted: bool,
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        advertise_v2: bool,
+    ) -> Result<Self, PeerError> {
+        let mut transport = PeerTransport::from_stream(stream);
 
         let handshake = if advertise_v2 {
             Handshake::new_v2(info_hash, our_peer_id)
@@ -126,6 +155,22 @@ impl PeerConnection {
             return Err(PeerError::InfoHashMismatch);
         }
 
+        Ok(Self::established(
+            addr,
+            &their_handshake,
+            advertise_v2,
+            encrypted,
+            transport,
+        ))
+    }
+
+    fn established(
+        addr: SocketAddr,
+        their_handshake: &Handshake,
+        advertise_v2: bool,
+        encrypted: bool,
+        transport: PeerTransport<BoxedPeerStream>,
+    ) -> Self {
         let supports_v2 = their_handshake.supports_v2();
         // Use v2 protocol if both sides support it
         let protocol_mode = if advertise_v2 && supports_v2 {
@@ -135,7 +180,7 @@ impl PeerConnection {
         };
 
         let now = Instant::now();
-        Ok(Self {
+        Self {
             addr,
             peer_id: PeerId::from_bytes(&their_handshake.peer_id),
             state: PeerState::Connected,
@@ -150,8 +195,9 @@ impl PeerConnection {
             last_message_at: now,
             bytes_downloaded: 0,
             bytes_uploaded: 0,
+            encrypted,
             transport: Some(transport),
-        })
+        }
     }
 
     /// Accepts a connection from a peer using the v1 protocol.
@@ -171,7 +217,34 @@ impl PeerConnection {
         advertise_v2: bool,
     ) -> Result<Self, PeerError> {
         let addr = stream.peer_addr()?;
-        let mut transport = PeerTransport::new(stream);
+        set_peer_nodelay(&stream);
+        Self::incoming(Box::new(stream), false, addr, info_hash, our_peer_id, advertise_v2).await
+    }
+
+    /// Runs the BitTorrent handshake as responder over a stream that has
+    /// already been through [`super::mse::accept`]. `addr` is the remote
+    /// address of the underlying connection.
+    pub async fn accept_with_stream<S: PeerStream + 'static>(
+        stream: MseStream<S>,
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        advertise_v2: bool,
+    ) -> Result<Self, PeerError> {
+        let encrypted = stream.is_encrypted();
+        Self::incoming(Box::new(stream), encrypted, addr, info_hash, our_peer_id, advertise_v2)
+            .await
+    }
+
+    async fn incoming(
+        stream: BoxedPeerStream,
+        encrypted: bool,
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+        our_peer_id: [u8; 20],
+        advertise_v2: bool,
+    ) -> Result<Self, PeerError> {
+        let mut transport = PeerTransport::from_stream(stream);
 
         let their_handshake = transport.receive_handshake().await?;
 
@@ -186,32 +259,18 @@ impl PeerConnection {
         };
         transport.send_handshake(&handshake).await?;
 
-        let supports_v2 = their_handshake.supports_v2();
-        // Use v2 protocol if both sides support it
-        let protocol_mode = if advertise_v2 && supports_v2 {
-            ProtocolMode::V2
-        } else {
-            ProtocolMode::V1
-        };
-
-        let now = Instant::now();
-        Ok(Self {
+        Ok(Self::established(
             addr,
-            peer_id: PeerId::from_bytes(&their_handshake.peer_id),
-            state: PeerState::Connected,
-            choking: ChokingState::default(),
-            bitfield: None,
-            extension_handshake: None,
-            supports_fast: their_handshake.supports_fast_extension(),
-            supports_extension: their_handshake.supports_extension_protocol(),
-            supports_v2,
-            protocol_mode,
-            connected_at: now,
-            last_message_at: now,
-            bytes_downloaded: 0,
-            bytes_uploaded: 0,
-            transport: Some(transport),
-        })
+            &their_handshake,
+            advertise_v2,
+            encrypted,
+            transport,
+        ))
+    }
+
+    /// Whether the payload stream is RC4-encrypted (MSE with RC4 selected).
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
     }
 
     pub async fn send(&mut self, message: Message) -> Result<(), PeerError> {

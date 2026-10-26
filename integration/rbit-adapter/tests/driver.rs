@@ -4,6 +4,7 @@ use bytes::Bytes;
 use rbit::{
     ExtensionHandshake, InfoHash, METADATA_PIECE_SIZE, Message, MetadataMessage, Metainfo,
     PeerConnection, TorrentBuilder, TorrentVersion,
+    peer::{EncryptionPolicy, mse},
 };
 use std::{
     path::{Path, PathBuf},
@@ -15,12 +16,15 @@ use std::{
 };
 use templartorrent_core::model::{JobState, Limits, PeerPreference, TorrentRow};
 use templartorrent_rbit_adapter::{
-    driver::{Driver, ExistingData, JobRecord, PeerOrigin, PeerSource, ResumeRecord, ResumeScan},
+    driver::{
+        Driver, ExistingData, JobRecord, PeerEncryption, PeerOrigin, PeerSource, ResumeRecord,
+        ResumeScan,
+    },
     metadata::OUR_MD_ID,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
@@ -136,6 +140,8 @@ struct Stats {
     requests: Mutex<Vec<(u32, u32)>>,
     metadata: AtomicUsize,
     active: AtomicUsize,
+    /// TCP connections accepted, including ones whose handshake failed.
+    accepted: AtomicUsize,
     corrupted: AtomicBool,
 }
 #[derive(Clone, Copy, Default)]
@@ -175,6 +181,7 @@ impl Server {
                 tokio::select! {
                     incoming = listener.accept() => {
                         let (stream, addr) = incoming.unwrap(); assert!(addr.ip().is_loopback());
+                        observed.accepted.fetch_add(1, Ordering::SeqCst);
                         let fixture = fixture.clone(); let stats = observed.clone();
                         clients.spawn(async move {
                             let Ok(mut conn) = PeerConnection::accept(stream, fixture.hash, [17; 20]).await else { return; };
@@ -218,11 +225,15 @@ impl Leech {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let observed = seen.clone();
         let task = tokio::spawn(async move {
-            let (stream, addr) = listener.accept().await.unwrap();
-            assert!(addr.ip().is_loopback());
-            let mut conn = PeerConnection::accept(stream, hash, [71; 20])
-                .await
-                .unwrap();
+            // A plaintext-only peer: the driver's default first attempt is
+            // MSE, which fails here, and then it redials in plaintext.
+            let mut conn = loop {
+                let (stream, addr) = listener.accept().await.unwrap();
+                assert!(addr.ip().is_loopback());
+                if let Ok(conn) = PeerConnection::accept(stream, hash, [71; 20]).await {
+                    break conn;
+                }
+            };
             conn.send(Message::Interested).await.unwrap();
             while let Ok(message) = conn.receive().await {
                 match message {
@@ -1231,7 +1242,14 @@ async fn driver_global_connection_caps_and_zero_job_slots_quiesce_actual_network
             })
             .await
             .unwrap();
-        assert_eq!(driver.connection_count(), 1);
+        // Resuming schedules the known candidates; the dialer connects both
+        // within the default per-job cap on the following steps, never
+        // inside set_limits.
+        assert_eq!(driver.connection_count(), 0);
+        while driver.connection_count() < 2 {
+            driver.step(Duration::from_millis(10)).await.unwrap();
+        }
+        assert_eq!(driver.connection_count(), 2);
         assert_eq!(driver.snapshot().jobs[0].state, JobState::Downloading);
         driver.pause(id).await.unwrap();
         driver.set_limits(Limits::default()).await.unwrap();
@@ -1304,12 +1322,14 @@ async fn driver_peer_drop_then_explicit_fallback_preserves_verified_progress() {
         .await;
         let b = Server::start(fixture.clone(), Fault::default()).await;
         let mut driver = driver();
+        // Only `a` is known, so the dialer has nothing to fall back to and
+        // the drop leaves the job idle until `b` is supplied explicitly.
         let id = driver
             .add_magnet(
                 &fixture.magnet(),
                 &root.job(),
                 ExistingData::Refuse,
-                &[a.source, b.source],
+                &[a.source],
                 false,
             )
             .await
@@ -1411,6 +1431,124 @@ async fn http_tracker(listener: TcpListener, peer: std::net::SocketAddr) {
             return;
         }
     }
+}
+
+/// A .torrent added from its own bytes: no BEP-9 fetch, the trackers come
+/// from the file's announce keys, and the dialer reaches the tracker's peer.
+#[tokio::test]
+async fn driver_add_torrent_announces_from_file_and_downloads_without_bep9() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(59, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker_addr = tracker_listener.local_addr().unwrap();
+        let tracker_task = tokio::spawn(http_tracker(tracker_listener, server.source.address));
+        let piece = PIECE;
+        let torrent = TorrentBuilder::new("owned-series")
+            .version(TorrentVersion::V1)
+            .piece_length(piece as u64)
+            .add_tracker(format!("http://{tracker_addr}/announce"))
+            .add_file("Episode02.bin", fixture.data[..piece].to_vec())
+            .add_file("Episode01.bin", fixture.data[piece..].to_vec())
+            .build()
+            .unwrap();
+        let mut driver = driver();
+        driver.set_allow_local_trackers(true);
+        driver.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let id = driver
+            .add_torrent(&torrent, &root.job(), ExistingData::Refuse)
+            .await
+            .unwrap();
+        assert_eq!(driver.tracker_status(id).unwrap().len(), 1);
+        // A listening driver keeps a finished job seeding.
+        while driver.snapshot().jobs[0].state != JobState::Seeding {
+            let report = driver.step(Duration::from_millis(10)).await.unwrap();
+            assert_eq!(report.hash_failures, 0);
+        }
+        fixture.assert_files(&root.job());
+        assert_eq!(
+            server.stats.metadata.load(Ordering::SeqCst),
+            0,
+            "the info dictionary came from the file, not from a peer"
+        );
+        assert_eq!(driver.candidate_counts(id).0, 1);
+        driver.shutdown().await;
+        server.close().await;
+        tracker_task.abort();
+    })
+    .await
+    .unwrap();
+}
+
+/// D downloads from fixture F and keeps seeding; L knows only D. D's ut_pex
+/// message names F, so F lands in L's pool as a PEX candidate. A private
+/// torrent offers no ut_pex at all.
+#[tokio::test]
+async fn driver_pex_shares_dialed_peers_between_public_jobs() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(71, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut d = Driver::with_peer_id(Limits::default(), [31; 20]).unwrap();
+        d.set_pex_interval_secs(0);
+        let d_address = d.listen("127.0.0.2:0".parse().unwrap()).await.unwrap();
+        let d_id = d
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                true,
+            )
+            .await
+            .unwrap();
+        while d.snapshot().jobs[0].state != JobState::Seeding {
+            d.step(Duration::from_millis(10)).await.unwrap();
+        }
+        let leech_root = Root::new();
+        let magnet = fixture.magnet();
+        let path = leech_root.job();
+        let leech = tokio::spawn(async move {
+            let mut l = Driver::with_peer_id(Limits::default(), [37; 20]).unwrap();
+            // A listening driver keeps its wires after finishing this small
+            // fixture, so D's PEX message still has a peer to reach.
+            l.listen("127.0.0.3:0".parse().unwrap()).await.unwrap();
+            // F is on loopback; PEX addresses that are not public need the
+            // local-address setting.
+            l.set_allow_local_trackers(true);
+            let source = PeerSource {
+                address: d_address,
+                origin: PeerOrigin::UserProvided,
+            };
+            let l_id = l
+                .add_magnet(&magnet, &path, ExistingData::Refuse, &[source], true)
+                .await
+                .unwrap();
+            while l.candidate_counts(l_id).2 == 0 {
+                l.step(Duration::from_millis(5)).await.unwrap();
+            }
+            let counts = l.candidate_counts(l_id);
+            l.shutdown().await;
+            counts
+        });
+        let start = Instant::now();
+        while !leech.is_finished() {
+            assert!(start.elapsed() < DEADLINE, "no PEX candidate arrived");
+            d.step(Duration::from_millis(5)).await.unwrap();
+        }
+        let counts = leech.await.unwrap();
+        assert_eq!(counts.2, 1, "exactly F from PEX, never D itself");
+        assert_eq!(
+            d.candidate_counts(d_id).0,
+            1,
+            "D knew F from its tracker source"
+        );
+        d.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1676,17 +1814,21 @@ async fn driver_peer_preference_orders_upload_slots() {
 }
 
 #[tokio::test]
-async fn driver_rejects_v2_and_hybrid_before_any_storage_exists() {
+async fn driver_rejects_pure_v2_before_any_storage_exists() {
     timeout(DEADLINE, async {
         let root = Root::new();
-        for version in [TorrentVersion::V2, TorrentVersion::Hybrid] {
-            let (_, bytes) = Fixture::torrent_bytes(61, false, version);
-            assert_eq!(
-                Driver::magnet_from_torrent_bytes(&bytes).unwrap_err().0,
-                "v2/hybrid torrents are not supported"
-            );
-        }
+        let (_, bytes) = Fixture::torrent_bytes(61, false, TorrentVersion::V2);
+        assert_eq!(
+            Driver::magnet_from_torrent_bytes(&bytes).unwrap_err().0,
+            "pure v2 torrents are not supported"
+        );
         let mut driver = driver();
+        assert!(
+            driver
+                .add_torrent(&bytes, &root.job(), ExistingData::Refuse)
+                .await
+                .is_err()
+        );
         let v2_magnet = format!("magnet:?xt=urn:btmh:1220{}", "ab".repeat(32));
         let unused = PeerSource {
             address: "127.0.0.1:1".parse().unwrap(),
@@ -1704,39 +1846,111 @@ async fn driver_rejects_v2_and_hybrid_before_any_storage_exists() {
                 .await
                 .unwrap_err()
                 .0,
-            "v2/hybrid magnets are not supported"
-        );
-        // A hybrid torrent carries a v1 info hash, so BEP-9 resolution succeeds
-        // and the gate must fire on the metadata itself.
-        let hybrid = Fixture::with_version(67, false, TorrentVersion::Hybrid);
-        assert!(hybrid.meta.is_hybrid());
-        let server = Server::start(hybrid.clone(), Fault::default()).await;
-        assert_eq!(
-            driver
-                .add_magnet(
-                    &hybrid.magnet(),
-                    &root.job(),
-                    ExistingData::Refuse,
-                    &[server.source],
-                    false
-                )
-                .await
-                .unwrap_err()
-                .0,
-            "v2/hybrid torrents are not supported by this driver"
-        );
-        assert!(
-            server.stats.metadata.load(Ordering::SeqCst) > 0,
-            "metadata was fetched and then rejected"
+            "pure v2 magnets are not supported"
         );
         assert!(
             !root.job().exists(),
             "no destination may exist after rejection"
         );
         assert!(driver.snapshot().jobs.is_empty());
-        assert_eq!(driver.connection_count(), 0);
         assert_eq!(driver.metadata_reserved_bytes(), 0);
-        assert_eq!(driver.payload_stats().reserved_bytes, 0);
+        driver.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// More files than the old 128-file gate: 300 small files across piece
+/// boundaries, transferred and verified over loopback.
+#[tokio::test]
+async fn driver_transfers_a_torrent_with_three_hundred_files() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let mut builder = TorrentBuilder::new("owned-series")
+            .version(TorrentVersion::V1)
+            .piece_length(16384);
+        let mut data = Vec::new();
+        let mut files = Vec::new();
+        for index in 0..300u32 {
+            let bytes: Vec<u8> = (0..(700 + index * 13))
+                .map(|i| (i.wrapping_mul(31) ^ index) as u8)
+                .collect();
+            data.extend_from_slice(&bytes);
+            let name = format!("Episode{index:03}.bin");
+            builder = builder.add_file(&name, bytes.clone());
+            files.push((name, bytes));
+        }
+        let torrent = builder.build().unwrap();
+        let meta = Metainfo::from_bytes(&torrent).unwrap();
+        let hash = *meta.info_hash.v1_hash().unwrap().as_bytes();
+        let fixture = Arc::new(Fixture { data, meta, hash });
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        driver
+            .add_torrent(&torrent, &root.job(), ExistingData::Refuse)
+            .await
+            .unwrap();
+        let id = driver.snapshot().jobs[0].id;
+        driver.connect_peer(id, server.source).await.unwrap();
+        assert_eq!(complete(&mut driver).await, 0);
+        for (name, bytes) in &files {
+            assert_eq!(
+                &std::fs::read(root.job().join("owned-series").join(name)).unwrap(),
+                bytes
+            );
+        }
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A hybrid torrent whose first file is not piece-aligned: the v1 view has a
+/// BEP 47 pad file between the two real files. The seeder serves the v1 byte
+/// stream, zeros included; the leech must verify every piece, write both
+/// real files and never create the pad file.
+#[tokio::test]
+async fn driver_downloads_hybrid_with_pad_files_through_its_v1_view() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let first: Vec<u8> = (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let second: Vec<u8> = (0..30_000u32).map(|i| (i * 13 % 241) as u8).collect();
+        let torrent = TorrentBuilder::new("owned-series")
+            .version(TorrentVersion::Hybrid)
+            .piece_length(PIECE as u64)
+            .add_file("Episode02.bin", first.clone())
+            .add_file("Episode01.bin", second.clone())
+            .build()
+            .unwrap();
+        let meta = Metainfo::from_bytes(&torrent).unwrap();
+        assert!(meta.is_hybrid());
+        let hash = *meta.info_hash.v1_hash().unwrap().as_bytes();
+        let pad = PIECE - first.len() % PIECE;
+        let mut data = first.clone();
+        data.extend(std::iter::repeat_n(0u8, pad));
+        data.extend_from_slice(&second);
+        let fixture = Arc::new(Fixture { data, meta, hash });
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(complete(&mut driver).await, 0);
+        let job = root.job().join("owned-series");
+        assert_eq!(std::fs::read(job.join("Episode02.bin")).unwrap(), first);
+        assert_eq!(std::fs::read(job.join("Episode01.bin")).unwrap(), second);
+        assert!(!job.join(".pad").exists(), "pad files are never created");
+        let row = &driver.snapshot().jobs[0];
+        assert_eq!(row.verified_bytes, row.wanted_bytes);
+        assert_eq!(row.wanted_bytes, (first.len() + second.len()) as u64);
         driver.shutdown().await;
         server.close().await;
     })
@@ -2272,6 +2486,298 @@ async fn driver_resume_bitmap_trusts_unchanged_files_only() {
         assert_eq!(scan.failed, 1);
         assert_ne!(row.state, JobState::Complete);
         assert_eq!(row.verified_bytes, fixture.data.len() as u64 - PIECE as u64);
+    })
+    .await
+    .unwrap();
+}
+
+/// Relays loopback connections to `target` and keeps every byte each
+/// direction carried, one buffer per direction per connection.
+struct Relay {
+    address: std::net::SocketAddr,
+    streams: Arc<Mutex<Vec<Vec<u8>>>>,
+    task: JoinHandle<()>,
+}
+impl Relay {
+    async fn start(target: std::net::SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let streams = Arc::new(Mutex::new(Vec::new()));
+        let record = streams.clone();
+        let task = tokio::spawn(async move {
+            let mut pipes = JoinSet::new();
+            while let Ok((inbound, _)) = listener.accept().await {
+                let Ok(outbound) = TcpStream::connect(target).await else {
+                    continue;
+                };
+                let (from_client, to_client) = inbound.into_split();
+                let (from_target, to_target) = outbound.into_split();
+                pipes.spawn(relay_pipe(from_client, to_target, record.clone()));
+                pipes.spawn(relay_pipe(from_target, to_client, record.clone()));
+            }
+        });
+        Self {
+            address,
+            streams,
+            task,
+        }
+    }
+    async fn close(self) -> Vec<Vec<u8>> {
+        self.task.abort();
+        let _ = self.task.await;
+        std::mem::take(&mut *self.streams.lock().unwrap())
+    }
+}
+async fn relay_pipe(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    streams: Arc<Mutex<Vec<Vec<u8>>>>,
+) {
+    let index = {
+        let mut streams = streams.lock().unwrap();
+        streams.push(Vec::new());
+        streams.len() - 1
+    };
+    let mut buf = vec![0u8; 16384];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        streams.lock().unwrap()[index].extend_from_slice(&buf[..n]);
+        if to.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown().await;
+}
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Two public Drivers that both require encryption: metadata and every
+/// piece cross a recording relay, which never sees the BitTorrent protocol
+/// string, the BEP-10 extension name or any run of the file's bytes.
+#[tokio::test]
+async fn driver_encrypted_transfer_between_two_drivers_hides_protocol_and_payload() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let target = Root::new();
+        let fixture = Fixture::new(41, false);
+        let (mut seed, _) = seed_fixture(&root, &fixture).await;
+        seed.set_peer_encryption(PeerEncryption::RequireEncrypted);
+        let addr = seed.listening_address().unwrap();
+        drive_client(&mut seed, async {
+            assert!(
+                PeerConnection::connect(addr, fixture.hash, [62; 20])
+                    .await
+                    .is_err(),
+                "a plaintext peer reached a seed that requires encryption"
+            );
+        })
+        .await;
+        let relay = Relay::start(addr).await;
+        let magnet = fixture.magnet();
+        let path = target.job();
+        let via = relay.address;
+        let client = tokio::spawn(async move {
+            let mut leech = driver();
+            leech.set_peer_encryption(PeerEncryption::RequireEncrypted);
+            assert_eq!(leech.peer_encryption(), PeerEncryption::RequireEncrypted);
+            let source = PeerSource {
+                address: via,
+                origin: PeerOrigin::UserProvided,
+            };
+            leech
+                .add_magnet(&magnet, &path, ExistingData::Refuse, &[source], true)
+                .await
+                .unwrap();
+            assert_eq!(complete(&mut leech).await, 0);
+            leech.shutdown().await;
+        });
+        while !client.is_finished() {
+            seed.step(Duration::from_millis(5)).await.unwrap();
+        }
+        client.await.unwrap();
+        for _ in 0..4 {
+            seed.step(Duration::ZERO).await.unwrap();
+        }
+        fixture.assert_files(&target.job());
+        assert_eq!(
+            seed.snapshot().jobs[0].total_payload_uploaded,
+            fixture.data.len() as u64
+        );
+        seed.shutdown().await;
+        let streams = relay.close().await;
+        let carried: usize = streams.iter().map(Vec::len).sum();
+        assert!(
+            carried > fixture.data.len(),
+            "relay carried {carried} bytes"
+        );
+        let step = fixture.data.len() / 8;
+        for stream in &streams {
+            assert!(!contains(stream, b"BitTorrent protocol"));
+            assert!(!contains(stream, b"ut_metadata"));
+            for offset in (0..fixture.data.len() - 32).step_by(step) {
+                assert!(!contains(stream, &fixture.data[offset..offset + 32]));
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// The default setting dials MSE first. A plaintext-only peer drops that
+/// connection, and the Driver redials once in plaintext; PlaintextOnly dials
+/// once. Both complete the verified transfer.
+#[tokio::test]
+async fn driver_prefer_encrypted_falls_back_once_to_a_plaintext_only_peer() {
+    timeout(DEADLINE, async {
+        assert_eq!(driver().peer_encryption(), PeerEncryption::PreferEncrypted);
+        for (encryption, dials) in [
+            (PeerEncryption::PreferEncrypted, 2),
+            (PeerEncryption::PlaintextOnly, 1),
+        ] {
+            let root = Root::new();
+            let fixture = Fixture::new(43, false);
+            let server = Server::start(fixture.clone(), Fault::default()).await;
+            let mut driver = driver();
+            driver.set_peer_encryption(encryption);
+            driver
+                .add_magnet(
+                    &fixture.magnet(),
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[server.source],
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(complete(&mut driver).await, 0);
+            fixture.assert_files(&root.job());
+            assert_eq!(server.stats.accepted.load(Ordering::SeqCst), dials);
+            assert_eq!(server.stats.metadata.load(Ordering::SeqCst), 1);
+            driver.shutdown().await;
+            server.close().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_require_encrypted_is_refused_by_a_plaintext_only_peer() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(47, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let mut driver = driver();
+        driver.set_peer_encryption(PeerEncryption::RequireEncrypted);
+        let error = driver
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, "no permitted peer supplied valid metadata");
+        // One MSE attempt, no plaintext redial, no BitTorrent handshake.
+        assert_eq!(server.stats.accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(server.stats.active.load(Ordering::SeqCst), 0);
+        assert_eq!(server.stats.metadata.load(Ordering::SeqCst), 0);
+        assert!(!root.job().exists());
+        assert!(driver.snapshot().jobs.is_empty());
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+async fn encrypted_upload_peer(addr: std::net::SocketAddr, hash: [u8; 20]) -> PeerConnection {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let stream = mse::initiate(tcp, hash, EncryptionPolicy::RequireRc4)
+        .await
+        .unwrap();
+    let mut conn = PeerConnection::connect_with_stream(stream, addr, hash, [61; 20], false)
+        .await
+        .unwrap();
+    assert!(conn.is_encrypted());
+    conn.send(Message::Interested).await.unwrap();
+    loop {
+        if matches!(conn.receive().await.unwrap(), Message::Unchoke) {
+            return conn;
+        }
+    }
+}
+
+/// One listener, two seeding jobs: an MSE initiator is routed by its SKEY to
+/// the matching job and served that job's bytes. Silent sockets, noise and
+/// an unknown SKEY hold or fail their own probes without blocking others.
+#[tokio::test]
+async fn driver_routes_encrypted_incoming_to_the_job_its_skey_names() {
+    timeout(DEADLINE, async {
+        let root_a = Root::new();
+        let root_b = Root::new();
+        let a = Fixture::new(3, false);
+        let b = Fixture::new(11, false);
+        let server_a = Server::start(a.clone(), Fault::default()).await;
+        let server_b = Server::start(b.clone(), Fault::default()).await;
+        let mut seed = driver();
+        for (fixture, root, server) in [(&a, &root_a, &server_a), (&b, &root_b, &server_b)] {
+            seed.add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        complete(&mut seed).await;
+        server_a.close().await;
+        server_b.close().await;
+        let addr = seed.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        let mut noise = TcpStream::connect(addr).await.unwrap();
+        noise.write_all(&[0x42; 700]).await.unwrap();
+        held.push(noise);
+        drive_client(&mut seed, async {
+            for fixture in [&b, &a] {
+                let mut conn = encrypted_upload_peer(addr, fixture.hash).await;
+                conn.send(Message::Request {
+                    index: 3,
+                    begin: 0,
+                    length: 73,
+                })
+                .await
+                .unwrap();
+                loop {
+                    if let Message::Piece { data, .. } = conn.receive().await.unwrap() {
+                        assert_eq!(&data[..], &fixture.data[3 * PIECE..]);
+                        break;
+                    }
+                }
+            }
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            assert!(
+                mse::initiate(tcp, [0x71; 20], EncryptionPolicy::RequireRc4)
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+        drop(held);
+        seed.shutdown().await;
+        assert_eq!(seed.payload_stats().reserved_bytes, 0);
     })
     .await
     .unwrap();

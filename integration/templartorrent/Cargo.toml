@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 templartorrent-core = { path = "../../crates/templartorrent-core" }
+templartorrent-storage = { path = "../../crates/templartorrent-storage" }
 templartorrent-rbit-adapter = { path = "../rbit-adapter" }
 pixelkit-raster = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
 pixelkit-shell = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }

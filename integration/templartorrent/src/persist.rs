@@ -14,6 +14,7 @@ use std::{
 };
 
 use templartorrent_core::model::{Limits, PeerPreference};
+use templartorrent_rbit_adapter::driver::PeerEncryption;
 use templartorrent_rbit_adapter::driver::{JobRecord, ResumeRecord};
 use templartorrent_rbit_adapter::resume::ResumeFile;
 use templartorrent_rbit_adapter::torrent::{MAX_DRIVER_FILES, MAX_DRIVER_PIECES};
@@ -22,19 +23,35 @@ pub const RECORD_HEADER: &str = "templartorrent-job 1";
 pub const RESUME_HEADER: &str = "templartorrent-resume 1";
 pub const SETTINGS_HEADER: &str = "templartorrent-settings 1";
 pub const UI_HEADER: &str = "templartorrent-ui 1";
-pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
+/// 4096 files: a wanted bitstring and an order list of up to five digits
+/// and a comma each, plus trackers and preferences.
+pub const MAX_RECORD_BYTES: u64 = 256 * 1024;
 pub const MAX_TORRENT_BYTES: u64 = 16 * 1024 * 1024;
-/// 262144 pieces encode to 64 KiB of hex, plus one line per file.
-pub const MAX_RESUME_BYTES: u64 = 128 * 1024;
+/// 262144 pieces encode to 64 KiB of hex, plus one line of at most about
+/// 100 bytes per file for 4096 files.
+pub const MAX_RESUME_BYTES: u64 = 512 * 1024;
 const MAX_TRACKERS: usize = 12;
 const MAX_PREFERENCES: usize = 256;
-const MAX_FILES: usize = 128;
+const MAX_FILES: usize = MAX_DRIVER_FILES;
 const MAX_URL: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub limits: Limits,
     pub allow_local_trackers: bool,
+    /// Peer listen port, TCP on IPv4 and IPv6. 0 means not chosen yet; the
+    /// first launch picks one and saves it so port forwards keep working.
+    pub listen_port: u16,
+    /// MSE/PE policy for new peer connections.
+    pub encryption: PeerEncryption,
+}
+
+fn encryption_name(encryption: PeerEncryption) -> &'static str {
+    match encryption {
+        PeerEncryption::PreferEncrypted => "prefer",
+        PeerEncryption::RequireEncrypted => "require",
+        PeerEncryption::PlaintextOnly => "plaintext",
+    }
 }
 
 /// Window geometry in logical pixels and the inspector pane's share of the
@@ -525,6 +542,10 @@ pub fn encode_settings(settings: &Settings) -> String {
         l.upload_kb_s,
         l.payload_budget_bytes,
         u8::from(settings.allow_local_trackers)
+    ) + &format!(
+        "listen_port {}\npeer_encryption {}\n",
+        settings.listen_port,
+        encryption_name(settings.encryption)
     )
 }
 
@@ -535,6 +556,8 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
     }
     let mut limits = Limits::default();
     let mut allow_local_trackers = false;
+    let mut listen_port = 0u16;
+    let mut encryption = PeerEncryption::default();
     for line in lines {
         if line.is_empty() {
             continue;
@@ -558,6 +581,19 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
             "upload_kb_s" => limits.upload_kb_s = number()?,
             "payload_budget_bytes" => limits.payload_budget_bytes = count()?,
             "allow_local_trackers" => allow_local_trackers = flag(value)?,
+            "listen_port" => {
+                listen_port = value
+                    .parse()
+                    .map_err(|_| "listen_port must be 0..=65535".to_string())?
+            }
+            "peer_encryption" => {
+                encryption = match value {
+                    "prefer" => PeerEncryption::PreferEncrypted,
+                    "require" => PeerEncryption::RequireEncrypted,
+                    "plaintext" => PeerEncryption::PlaintextOnly,
+                    _ => return Err("peer_encryption must be prefer, require or plaintext".into()),
+                }
+            }
             other => return Err(format!("unknown field {other}")),
         }
     }
@@ -567,6 +603,8 @@ pub fn decode_settings(text: &str) -> Result<Settings, String> {
     Ok(Settings {
         limits,
         allow_local_trackers,
+        listen_port,
+        encryption,
     })
 }
 
@@ -797,8 +835,12 @@ mod tests {
                 ..Limits::default()
             },
             allow_local_trackers: true,
+            listen_port: 51234,
+            encryption: PeerEncryption::RequireEncrypted,
         };
         let decoded = decode_settings(&encode_settings(&settings)).unwrap();
+        assert_eq!(decoded.listen_port, 51234);
+        assert_eq!(decoded.encryption, PeerEncryption::RequireEncrypted);
         assert_eq!(decoded.limits.download_jobs, 1);
         assert_eq!(decoded.limits.upload_kb_s, 250);
         assert_eq!(decoded.limits.seed_jobs, Limits::default().seed_jobs);
@@ -902,6 +944,8 @@ mod tests {
             .save_settings(&Settings {
                 limits: Limits::default(),
                 allow_local_trackers: true,
+                listen_port: 0,
+                encryption: PeerEncryption::default(),
             })
             .unwrap();
         assert!(store.load_settings().unwrap().unwrap().allow_local_trackers);

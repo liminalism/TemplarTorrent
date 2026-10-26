@@ -3,7 +3,8 @@
 //! mean different things to the validation pass and the upstream parser.
 
 pub(crate) const MAX_DEPTH: usize = 64;
-pub(crate) const MAX_ITEMS: usize = 65_536;
+/// About 30 per file for 4096 files with deep paths, with headroom.
+pub(crate) const MAX_ITEMS: usize = 262_144;
 
 struct Scan<'a> {
     input: &'a [u8],

@@ -10,12 +10,14 @@ cd "$(dirname "$0")"
 SECONDS_PER_TARGET=${1:-60}
 shift || true
 OUT=${OUT:-../.agent/scratch/fuzz}
-ALL=(tracker_response metainfo magnet_and_tracker_url peer_wire bencode persist_records engine_session)
+ALL=(tracker_response metainfo magnet_and_tracker_url peer_wire bencode persist_records engine_session udp_tracker_response mse_handshake pex_and_dht)
 TARGETS=("${@:-${ALL[@]}}")
 declare -A DICT=(
     [tracker_response]=tracker_response [metainfo]=metainfo
     [magnet_and_tracker_url]=magnet [peer_wire]=peer_wire
     [bencode]=bencode [persist_records]=persist [engine_session]=
+    [udp_tracker_response]=
+    [mse_handshake]= [pex_and_dht]=bencode
 )
 
 cargo +nightly fuzz build

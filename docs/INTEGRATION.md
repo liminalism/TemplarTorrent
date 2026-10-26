@@ -50,7 +50,9 @@ connection and generation, including those received after cancellation.
 * Announce adapters return a real rbit response. The production transport still
   needs bounded response reading, timeout/redirect rules, provenance checks and
   clock/concurrency admission. Do not mistake a post-allocation length check for
-  a network memory bound. UDP uses the same policy but its own rbit transport.
+  a network memory bound. UDP (BEP 15) uses the same policy over the owned,
+  bounded client in `udp_announce.rs`, not rbit's UDP transport. Each announce
+  goes once per resolved address family (one IPv4, one IPv6) and merges peers.
 * Pure v2 is not v1 concatenation. Implement its piece map/Merkle proof rules with
   explicit fixtures before exposing support. Negotiation of v2 capabilities is not
   proof of correct v2 disk writes or selection.

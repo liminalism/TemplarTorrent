@@ -63,6 +63,11 @@ version = "6"
 [dependencies.futures]
 version = "0.3"
 
+# TemplarTorrent fork: 768-bit modular exponentiation for the MSE
+# Diffie-Hellman exchange (src/peer/mse.rs). Pure Rust.
+[dependencies.num-bigint]
+version = "0.4"
+
 [dependencies.parking_lot]
 version = "0.12"
 

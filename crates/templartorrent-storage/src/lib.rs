@@ -13,6 +13,11 @@
 //! (cheaply cloneable) for engine sessions, where the sink moves into the
 //! session before the job id exists to register paths against.
 //!
+//! BEP 47 pad files are mapped but never created: they have no handle,
+//! writes into them are dropped (the piece hash already covered their zero
+//! bytes), reads return zeros, and their identity stamp is a fixed
+//! placeholder so resume records keep one entry per torrent file.
+//!
 //! Deletion is Linux handle-relative: `openat`/`unlinkat` with
 //! `O_NOFOLLOW`, inode identity taken from the still-open handle, hardlink
 //! refusal, and no removal of the destination directory itself. Symlink
@@ -36,6 +41,51 @@ use templartorrent_core::{
 use templartorrent_engine::worker::{PieceReader, PieceSink, SinkError};
 
 mod deletion;
+
+/// Descriptors kept free for sockets, the display connection and reads.
+const FD_RESERVE: u64 = 512;
+
+/// Payload handles this process may hold across all jobs: the soft
+/// `RLIMIT_NOFILE` less [`FD_RESERVE`]. Each real torrent file keeps one
+/// handle open for the job's life (deletion and resume identity rely on it).
+pub fn handle_budget() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    #[allow(unsafe_code)]
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+    let soft = if ok { limit.rlim_cur } else { 1024 };
+    soft.saturating_sub(FD_RESERVE)
+}
+
+/// Raise the soft open-file limit to the hard limit, capped at 65,536, as
+/// Transmission and qBittorrent do. Returns the soft limit in effect after.
+pub fn raise_open_file_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read and write only the given struct.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return 1024;
+        }
+        let wanted = limit.rlim_max.min(65_536);
+        if wanted > limit.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: wanted,
+                rlim_max: limit.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                return wanted;
+            }
+        }
+        limit.rlim_cur
+    }
+}
 
 /// Same bound as the engine; actual admission also requires enough session
 /// budget for piece assembly and incoming copies.
@@ -144,7 +194,8 @@ pub struct FileStamp {
 
 struct StoredFile {
     path: PathBuf,
-    handle: File,
+    /// `None` for a BEP 47 pad file, which has no bytes on disk.
+    handle: Option<File>,
     length: u64,
     offset: u64,
 }
@@ -212,11 +263,44 @@ impl FileStore {
         files: &[(Vec<String>, u64)],
         piece_length: u64,
     ) -> Result<(), StorageError> {
+        self.add_job_with_pads(id, root, files, &[], piece_length)
+    }
+
+    /// [`FileStore::add_job`] where `pads[i]` marks file `i` as a BEP 47
+    /// pad file: it occupies its byte range but is never created or opened.
+    /// A shorter `pads` slice leaves the remaining files real.
+    pub fn add_job_with_pads(
+        &mut self,
+        id: TorrentId,
+        root: &Path,
+        files: &[(Vec<String>, u64)],
+        pads: &[bool],
+        piece_length: u64,
+    ) -> Result<(), StorageError> {
         if piece_length == 0 || piece_length > MAX_STORED_PIECE_LENGTH {
             return Err(StorageError::PieceTooLarge(piece_length));
         }
         if self.jobs.contains_key(&id.0) {
             return Err(StorageError::DuplicateJob(id));
+        }
+        let open: usize = self
+            .jobs
+            .values()
+            .map(|job| {
+                job.files
+                    .iter()
+                    .filter(|file| file.handle.is_some())
+                    .count()
+            })
+            .sum();
+        let wanted = (0..files.len())
+            .filter(|index| !pads.get(*index).copied().unwrap_or(false))
+            .count();
+        if (open + wanted) as u64 > handle_budget() {
+            return Err(StorageError::Io(format!(
+                "{wanted} files would exceed the open-file budget of {} (raise ulimit -n)",
+                handle_budget()
+            )));
         }
         match probe(root)? {
             Some(meta) if !meta.is_dir() => {
@@ -230,7 +314,22 @@ impl FileStore {
         }
         let mut stored = Vec::with_capacity(files.len());
         let mut total = 0u64;
-        for (components, length) in files {
+        for (index, (components, length)) in files.iter().enumerate() {
+            if pads.get(index).copied().unwrap_or(false) {
+                // Never created or opened, so its name is never used as a
+                // path; it is not validated as one either.
+                let offset = total;
+                total = total
+                    .checked_add(*length)
+                    .ok_or_else(|| StorageError::Io("total size overflows u64".into()))?;
+                stored.push(StoredFile {
+                    path: root.join(format!("pad-{index}")),
+                    handle: None,
+                    length: *length,
+                    offset,
+                });
+                continue;
+            }
             let relative = RelativeFile::new(components.clone()).map_err(StorageError::Path)?;
             let mut path = root.to_path_buf();
             let parts = relative.components();
@@ -284,7 +383,7 @@ impl FileStore {
                 .ok_or_else(|| StorageError::Io("total size overflows u64".into()))?;
             stored.push(StoredFile {
                 path,
-                handle,
+                handle: Some(handle),
                 length: *length,
                 offset,
             });
@@ -366,9 +465,11 @@ impl FileStore {
     pub fn durable_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {
         let job = self.jobs.get(&id.0).ok_or(StorageError::UnknownJob(id))?;
         for file in &job.files {
-            file.handle
-                .sync_all()
-                .map_err(|error| io_error(&file.path, error))?;
+            if let Some(handle) = &file.handle {
+                handle
+                    .sync_all()
+                    .map_err(|error| io_error(&file.path, error))?;
+            }
         }
         self.file_identity(id)
     }
@@ -383,8 +484,17 @@ impl FileStore {
 }
 
 fn stamp_handle(file: &StoredFile) -> Result<FileStamp, StorageError> {
-    let live = file
-        .handle
+    let Some(handle) = &file.handle else {
+        // A pad file has no inode; this placeholder matches only itself.
+        return Ok(FileStamp {
+            dev: 0,
+            ino: 0,
+            size: file.length,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+        });
+    };
+    let live = handle
         .metadata()
         .map_err(|error| io_error(&file.path, error))?;
     let on_path = match probe(&file.path)? {
@@ -447,13 +557,20 @@ impl PieceSink for FileStore {
                 return Err(SinkError::Io(format!("piece {piece}: unmappable offset")));
             }
             let writable = writable as usize;
-            file.handle
+            let Some(handle) = file.handle.as_mut() else {
+                // Pad bytes: the verified piece already proved they are the
+                // creator's zeros; nothing is stored.
+                remaining = &remaining[writable..];
+                offset += writable as u64;
+                continue;
+            };
+            handle
                 .seek(SeekFrom::Start(offset - file.offset))
                 .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
             // No per-piece sync: durability is batched at the resume
             // checkpoint (`durable_identity`), and a piece written after the
             // last checkpoint is rechecked by hash on restart.
-            file.handle
+            handle
                 .write_all(&remaining[..writable])
                 .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
             remaining = &remaining[writable..];
@@ -489,6 +606,12 @@ impl PieceReader for FileStore {
             let readable = (file.length - (offset - file.offset)).min(remaining as u64) as usize;
             if readable == 0 {
                 return Err(SinkError::Io(format!("piece {piece}: unmappable offset")));
+            }
+            if file.handle.is_none() {
+                // Pad file: `out` already holds zeros for this range.
+                remaining -= readable;
+                offset += readable as u64;
+                continue;
             }
             // A fresh handle per read keeps offsets independent of the write
             // path; a short file (partial download) reads as missing.
@@ -553,10 +676,21 @@ impl SharedStore {
         files: &[(Vec<String>, u64)],
         piece_length: u64,
     ) -> Result<(), StorageError> {
+        self.add_job_with_pads(id, root, files, &[], piece_length)
+    }
+
+    pub fn add_job_with_pads(
+        &self,
+        id: TorrentId,
+        root: &Path,
+        files: &[(Vec<String>, u64)],
+        pads: &[bool],
+        piece_length: u64,
+    ) -> Result<(), StorageError> {
         self.inner
             .lock()
             .map_err(|_| StorageError::Io("store lock poisoned".into()))?
-            .add_job(id, root, files, piece_length)
+            .add_job_with_pads(id, root, files, pads, piece_length)
     }
 
     pub fn file_identity(&self, id: TorrentId) -> Result<Vec<FileStamp>, StorageError> {

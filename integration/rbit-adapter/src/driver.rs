@@ -13,14 +13,17 @@ use crate::{
     unpack_bitfield,
 };
 use bytes::Bytes;
-use rbit::{ExtensionHandshake, Handshake, InfoHash, Message, MetadataMessage, PeerConnection};
+use rbit::{
+    ExtensionHandshake, Handshake, Message, MetadataMessage, PeerConnection,
+    peer::{EncryptionPolicy, MseStream, mse},
+};
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -39,13 +42,28 @@ use templartorrent_storage::SharedStore;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::timeout,
 };
 
 const EVENT_CAP: usize = 64;
 const WIRE_CAP: usize = 32;
+/// Sources a magnet's metadata resolution may try before the job exists.
 const CANDIDATE_CAP: usize = 32;
+/// Remembered peer candidates per job (DESIGN.md section 5: 2,048).
+const POOL_CAP: usize = 2048;
+/// Outgoing connection attempts in flight across all jobs.
+const HALF_OPEN_CAP: usize = 24;
+/// First retry delay after a failed or closed connection; doubles per
+/// consecutive failure up to [`RETRY_MAX_S`].
+const RETRY_BASE_S: u64 = 30;
+const RETRY_MAX_S: u64 = 1800;
+/// Seconds between DHT get_peers lookups for one downloading job.
+const DHT_INTERVAL_S: u64 = 300;
+/// Retry delay after a lookup that returned no peers.
+const DHT_EMPTY_RETRY_S: u64 = 30;
+/// Bound on one DHT lookup, including its iterative queries.
+const DHT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Distinct peer addresses with a non-default preference per job.
 const PREFERENCE_CAP: usize = 256;
 /// Request pipeline for an avoided peer; it stays usable for pieces nobody
@@ -72,6 +90,37 @@ impl fmt::Display for DriverError {
 impl std::error::Error for DriverError {}
 type Result<T> = std::result::Result<T, DriverError>;
 
+/// Message Stream Encryption (MSE/PE) on peer connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeerEncryption {
+    /// Outgoing: MSE offering RC4, redialled once in plaintext if the peer
+    /// does not complete MSE. Incoming: plaintext or MSE, RC4 when offered.
+    #[default]
+    PreferEncrypted,
+    /// RC4 only, both directions. Plaintext peers are refused.
+    RequireEncrypted,
+    /// No MSE: outgoing plaintext only, incoming MSE refused.
+    PlaintextOnly,
+}
+impl PeerEncryption {
+    fn policy(self) -> EncryptionPolicy {
+        match self {
+            Self::PreferEncrypted => EncryptionPolicy::PreferRc4,
+            Self::RequireEncrypted => EncryptionPolicy::RequireRc4,
+            Self::PlaintextOnly => EncryptionPolicy::PlaintextOnly,
+        }
+    }
+}
+/// What the listener's probe tasks read from the coordinator: the setting
+/// and the v1 info hashes of public jobs, which are the MSE SKEYs it serves.
+#[derive(Default)]
+struct IncomingKeys {
+    encryption: PeerEncryption,
+    hashes: Vec<[u8; 20]>,
+}
+/// Concurrent incoming handshake probes; sockets past this are dropped.
+const PROBE_CAP: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerOrigin {
     /// Stable identity of the original, permitted tracker that supplied this
@@ -80,6 +129,10 @@ pub enum PeerOrigin {
     /// Explicitly supplied by the user; requires public bootstrap opt-in while
     /// metadata is unknown. Never retained if metadata later proves private.
     UserProvided,
+    /// Found by a DHT get_peers lookup (BEP 5). Public jobs only.
+    Dht,
+    /// Named by a connected peer's ut_pex message (BEP 11). Public jobs only.
+    Pex,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +166,8 @@ pub struct PeerStatus {
     pub rtt_us: Option<u64>,
     /// Hash failures attributed to blocks this peer supplied.
     pub hash_failures: u32,
+    /// Whether the wire negotiated MSE/PE RC4.
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,10 +197,18 @@ struct Tracked {
     seeds: Option<u32>,
     peers: Option<u32>,
     last_error: Option<String>,
+    /// Whether this tracker has already accepted a `started` announce.
+    started: bool,
 }
 struct Job {
     torrent: ValidatedV1,
+    /// Candidate pool, at most [`POOL_CAP`]. Every entry already passed the
+    /// job's discovery policy when it was remembered.
     sources: Vec<PeerSource>,
+    /// Consecutive failures and the earliest next attempt, elapsed seconds.
+    retry: HashMap<SocketAddr, (u32, u64)>,
+    /// Elapsed second the next DHT lookup is due.
+    dht_due_s: u64,
     private_tracker: Option<u64>,
     destination: PathBuf,
     queued: bool,
@@ -233,6 +296,12 @@ struct Wire {
     rtt_us: Option<u64>,
     /// Attributed hash failures. They demote this peer and disconnect nobody.
     hash_failures: u32,
+    /// The peer's ut_pex id, when it offered one and the job is public.
+    pex_id: Option<u8>,
+    /// Addresses our last PEX message to this peer listed, and when.
+    pex_sent: Vec<SocketAddr>,
+    pex_at_s: u64,
+    encrypted: bool,
 }
 struct WireCommand {
     message: Message,
@@ -281,8 +350,13 @@ struct WireEvent {
     message: std::result::Result<Message, &'static str>,
     uploaded: u32,
 }
+enum IncomingStream {
+    Plain(TcpStream),
+    /// MSE completed; positioned at the peer's BitTorrent handshake.
+    Negotiated(Box<MseStream<TcpStream>>),
+}
 struct Incoming {
-    stream: TcpStream,
+    stream: IncomingStream,
     hash: [u8; 20],
     address: SocketAddr,
 }
@@ -310,6 +384,8 @@ pub struct Driver {
     event_sender: mpsc::Sender<WireEvent>,
     metadata_budget: ByteBudget,
     peer_id: [u8; 20],
+    encryption: PeerEncryption,
+    incoming_keys: Arc<Mutex<IncomingKeys>>,
     started: Instant,
     limits: Limits,
     pending_failures: HashMap<PeerId, &'static str>,
@@ -326,17 +402,50 @@ pub struct Driver {
     choke_order: Vec<PeerId>,
     choke_evaluated_s: Option<u64>,
     rate_sampled: Instant,
+    /// Outgoing connection attempts in flight, by job and address.
+    dialing: HashMap<(TorrentId, SocketAddr), JoinHandle<()>>,
+    dial_sender: mpsc::Sender<Dialed>,
+    dialed: mpsc::Receiver<Dialed>,
+    /// Tracker announces in flight, by job and tracker index.
+    announcing: HashMap<(TorrentId, usize), JoinHandle<()>>,
+    announce_sender: mpsc::Sender<Announced>,
+    announced: mpsc::Receiver<Announced>,
+    /// The session's DHT node, its run and bootstrap tasks, and lookups.
+    dht: Option<Arc<rbit::DhtServer>>,
+    dht_tasks: Vec<JoinHandle<()>>,
+    dht_lookups: HashMap<TorrentId, JoinHandle<()>>,
+    dht_sender: mpsc::Sender<(TorrentId, Vec<SocketAddr>)>,
+    dht_found: mpsc::Receiver<(TorrentId, Vec<SocketAddr>)>,
+    pex_interval_s: u64,
+}
+
+/// One finished outgoing connection attempt.
+struct Dialed {
+    torrent: TorrentId,
+    source: PeerSource,
+    result: std::result::Result<PeerConnection, &'static str>,
+}
+
+/// One finished tracker announce.
+struct Announced {
+    torrent: TorrentId,
+    index: usize,
+    url: String,
+    result: std::result::Result<rbit::AnnounceResponse, crate::announce::AnnounceFailure>,
 }
 
 impl Driver {
     pub fn new(limits: Limits) -> Result<Self> {
-        Self::with_peer_id(limits, *rbit::PeerId::generate().as_bytes())
+        Self::with_peer_id(limits, peer_id())
     }
     pub fn with_peer_id(limits: Limits, peer_id: [u8; 20]) -> Result<Self> {
         let store = SharedStore::new();
         let session = Session::new(limits.clone(), vec![Box::new(store.clone())], 8, 0)
             .map_err(|_| DriverError("invalid session limits"))?;
         let (event_sender, events) = mpsc::channel(EVENT_CAP);
+        let (dial_sender, dialed) = mpsc::channel(HALF_OPEN_CAP);
+        let (announce_sender, announced) = mpsc::channel(EVENT_CAP);
+        let (dht_sender, dht_found) = mpsc::channel(EVENT_CAP);
         Ok(Self {
             session,
             store,
@@ -346,6 +455,8 @@ impl Driver {
             event_sender,
             metadata_budget: ByteBudget::new(METADATA_BUDGET),
             peer_id,
+            encryption: PeerEncryption::default(),
+            incoming_keys: Arc::default(),
             started: Instant::now(),
             limits,
             pending_failures: HashMap::new(),
@@ -359,6 +470,18 @@ impl Driver {
             choke_order: Vec::new(),
             choke_evaluated_s: None,
             rate_sampled: Instant::now(),
+            dialing: HashMap::new(),
+            dial_sender,
+            dialed,
+            announcing: HashMap::new(),
+            announce_sender,
+            announced,
+            dht: None,
+            dht_tasks: Vec::new(),
+            dht_lookups: HashMap::new(),
+            dht_sender,
+            dht_found,
+            pex_interval_s: crate::pex::INTERVAL_S,
         })
     }
 
@@ -389,6 +512,11 @@ impl Driver {
     }
 
     /// Peer currently holding the optimistic slot, if any.
+    /// Seconds between PEX messages to one peer; tests shorten it.
+    pub fn set_pex_interval_secs(&mut self, seconds: u64) {
+        self.pex_interval_s = seconds;
+    }
+
     pub fn optimistic_peer(&self) -> Option<SocketAddr> {
         self.optimistic
             .and_then(|(peer, _)| self.wires.get(&peer))
@@ -466,12 +594,21 @@ impl Driver {
         self.elapsed_s()
     }
     pub fn set_file_wanted(&mut self, id: TorrentId, file: usize, wanted: bool) -> Result<()> {
-        if !self.jobs.0.contains_key(&id) {
-            return Err(DriverError("unknown job"));
+        let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
+        if wanted && job.torrent.is_pad(file) {
+            return Err(DriverError("pad files are never downloaded on their own"));
         }
         self.session
             .set_wanted(id, file, wanted)
             .map_err(|_| DriverError("file selection rejected"))
+    }
+    /// Whether file `index` of job `id` is a BEP 47 pad file. The client
+    /// hides these; they exist only to align real files to pieces.
+    pub fn is_pad_file(&self, id: TorrentId, index: usize) -> bool {
+        self.jobs
+            .0
+            .get(&id)
+            .is_some_and(|job| job.torrent.is_pad(index))
     }
     pub fn set_file_order(&mut self, id: TorrentId, order: Vec<usize>) -> Result<()> {
         if !self.jobs.0.contains_key(&id) {
@@ -492,8 +629,10 @@ impl Driver {
             .collect())
     }
 
-    /// Explicit opt-in listener. At most eight routed sockets plus one
-    /// five-second handshake probe wait outside the admitted connection pool.
+    /// Explicit opt-in listener. At most eight routed sockets plus sixteen
+    /// concurrent five-second handshake probes (plaintext detection and, for
+    /// MSE, the whole encryption handshake) wait outside the admitted
+    /// connection pool; sockets past that are dropped.
     /// Unknown hashes and all private incoming connections are dropped without
     /// logs. Private uploads require outbound connections to peers from the
     /// selected original tracker; an inbound address cannot prove provenance.
@@ -501,39 +640,40 @@ impl Driver {
         if self.listener.is_some() {
             return Err(DriverError("listener already bound"));
         }
-        let socket = TcpListener::bind(address)
+        // `[::]` is dual-stack on Linux by default; a host without IPv6
+        // falls back to IPv4 on the same port.
+        let socket = match TcpListener::bind(address).await {
+            Ok(socket) => socket,
+            Err(_) if address.ip().is_unspecified() && address.is_ipv6() => TcpListener::bind(
+                SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), address.port()),
+            )
             .await
-            .map_err(|_| DriverError("listener bind failed"))?;
+            .map_err(|_| DriverError("listener bind failed"))?,
+            Err(_) => return Err(DriverError("listener bind failed")),
+        };
         let address = socket
             .local_addr()
             .map_err(|_| DriverError("listener address unavailable"))?;
         let (sender, incoming) = mpsc::channel(8);
+        let keys = Arc::clone(&self.incoming_keys);
+        self.refresh_incoming_keys();
         let task = tokio::spawn(async move {
+            // Dropping the set with the listener task aborts every probe.
+            let mut probes = JoinSet::new();
             while let Ok((stream, address)) = socket.accept().await {
-                let probe = timeout(CONNECT_TIMEOUT, async {
-                    let mut bytes = [0; 68];
-                    loop {
-                        let n = stream.peek(&mut bytes).await.map_err(|_| ())?;
-                        if n == 0 {
-                            return Err(());
-                        }
-                        if n == bytes.len() {
-                            return Handshake::decode(&bytes).map_err(|_| ());
-                        }
-                        // peek preserves the handshake for rbit::accept. A
-                        // partial prefix remains readable; avoid a spin loop.
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                })
-                .await;
-                if let Ok(Ok(handshake)) = probe {
-                    // Queue full: the failed send drops the socket.
-                    let _ = sender.try_send(Incoming {
-                        stream,
-                        hash: handshake.info_hash,
-                        address,
-                    });
+                while probes.try_join_next().is_some() {}
+                if probes.len() >= PROBE_CAP {
+                    continue;
                 }
+                let sender = sender.clone();
+                let keys = Arc::clone(&keys);
+                probes.spawn(async move {
+                    let probe = timeout(CONNECT_TIMEOUT, route_incoming(stream, address, &keys));
+                    if let Ok(Some(incoming)) = probe.await {
+                        // Queue full: the failed send drops the socket.
+                        let _ = sender.try_send(incoming);
+                    }
+                });
             }
         });
         self.listener = Some(Listener {
@@ -552,18 +692,39 @@ impl Driver {
         self.session.upload_admitted(id)
     }
 
+    /// Publish the setting and public v1 hashes to the listener's probes.
+    fn refresh_incoming_keys(&self) {
+        let hashes = self
+            .jobs
+            .0
+            .values()
+            .filter(|job| job.private_tracker.is_none())
+            .map(|job| job.torrent.hash());
+        let Ok(mut keys) = self.incoming_keys.lock() else {
+            return;
+        };
+        keys.encryption = self.encryption;
+        if !keys.hashes.iter().copied().eq(hashes.clone()) {
+            keys.hashes = hashes.collect();
+        }
+    }
+
     async fn accept_incoming(&mut self) {
+        self.refresh_incoming_keys();
         let incoming = self
             .listener
             .as_mut()
             .and_then(|l| l.incoming.try_recv().ok());
-        let Some(incoming) = incoming else {
+        let Some(mut incoming) = incoming else {
             return;
         };
+        // A dual-stack listener reports IPv4 peers as ::ffff:a.b.c.d.
+        incoming.address = SocketAddr::new(
+            incoming.address.ip().to_canonical(),
+            incoming.address.port(),
+        );
         let id = self.jobs.0.iter().find_map(|(id, job)| {
-            (matches!(job.torrent.meta.info_hash, InfoHash::V1(h) if h == incoming.hash)
-                && job.private_tracker.is_none())
-            .then_some(*id)
+            (job.torrent.hash() == incoming.hash && job.private_tracker.is_none()).then_some(*id)
         });
         let Some(id) = id else {
             return;
@@ -584,12 +745,31 @@ impl Driver {
         {
             return;
         }
-        if let Ok(Ok(connection)) = timeout(
-            CONNECT_TIMEOUT,
-            PeerConnection::accept(incoming.stream, incoming.hash, self.peer_id),
-        )
-        .await
+        if self.encryption == PeerEncryption::RequireEncrypted
+            && matches!(incoming.stream, IncomingStream::Plain(_))
         {
+            return;
+        }
+        let peer_id = self.peer_id;
+        let accepted = timeout(CONNECT_TIMEOUT, async {
+            match incoming.stream {
+                IncomingStream::Plain(stream) => {
+                    PeerConnection::accept(stream, incoming.hash, peer_id).await
+                }
+                IncomingStream::Negotiated(stream) => {
+                    PeerConnection::accept_with_stream(
+                        *stream,
+                        incoming.address,
+                        incoming.hash,
+                        peer_id,
+                        false,
+                    )
+                    .await
+                }
+            }
+        })
+        .await;
+        if let Ok(Ok(connection)) = accepted {
             // No discovery authorization is inferred from incoming peers.
             let source = PeerSource {
                 address: incoming.address,
@@ -624,15 +804,10 @@ impl Driver {
             return Err(DriverError("magnet exceeds 16 KiB limit"));
         }
         let magnet = rbit::MagnetLink::parse(uri).map_err(|_| DriverError("invalid magnet"))?;
-        let InfoHash::V1(hash) = magnet.info_hash else {
-            return Err(DriverError("v2/hybrid magnets are not supported"));
+        let Some(hash) = magnet.info_hash.v1_hash().map(|hash| hash.0) else {
+            return Err(DriverError("pure v2 magnets are not supported"));
         };
-        if self
-            .jobs
-            .0
-            .values()
-            .any(|job| matches!(job.torrent.meta.info_hash, InfoHash::V1(h) if h == hash))
-        {
+        if self.jobs.0.values().any(|job| job.torrent.hash() == hash) {
             return Err(DriverError("torrent already exists"));
         }
         if sources.is_empty() || sources.len() > CANDIDATE_CAP {
@@ -666,25 +841,60 @@ impl Driver {
                 "strict bootstrap requires an original-tracker source",
             ));
         }
-        // Bounded fallback, including connect and metadata for all candidates.
-        let resolution = timeout(Duration::from_secs(30), async {
-            for source in &permitted {
-                let Ok(Ok(mut connection)) = timeout(
-                    CONNECT_TIMEOUT,
-                    PeerConnection::connect(source.address, hash, self.peer_id),
-                )
-                .await
-                else {
-                    continue;
-                };
-                let Ok(metadata) =
-                    fetch_metadata_budgeted(&mut connection, hash, &self.metadata_budget).await
-                else {
-                    continue;
-                };
-                return Ok((*source, connection, metadata));
+        // Up to METADATA_PARALLEL candidates at once; the first verified
+        // metadata wins. The attempts are polled here rather than spawned,
+        // so dropping this future drops every connection and permit at once.
+        const METADATA_PARALLEL: usize = 4;
+        type Attempt = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Option<(
+                            PeerSource,
+                            PeerConnection,
+                            crate::metadata::FetchedMetadata,
+                        )>,
+                    > + Send,
+            >,
+        >;
+        let peer_id = self.peer_id;
+        let encryption = self.encryption;
+        let budget = self.metadata_budget.clone();
+        let resolution = timeout(Duration::from_secs(60), async {
+            let mut queue = permitted.iter().copied();
+            let mut attempts: Vec<Attempt> = Vec::new();
+            loop {
+                while attempts.len() < METADATA_PARALLEL {
+                    let Some(source) = queue.next() else {
+                        break;
+                    };
+                    let budget = budget.clone();
+                    attempts.push(Box::pin(async move {
+                        let mut connection = dial_peer(source.address, hash, peer_id, encryption)
+                            .await
+                            .ok()?;
+                        let metadata = fetch_metadata_budgeted(&mut connection, hash, &budget)
+                            .await
+                            .ok()?;
+                        Some((source, connection, metadata))
+                    }));
+                }
+                if attempts.is_empty() {
+                    return Err(DriverError("no permitted peer supplied valid metadata"));
+                }
+                let finished = std::future::poll_fn(|cx| {
+                    for index in 0..attempts.len() {
+                        if let std::task::Poll::Ready(result) = attempts[index].as_mut().poll(cx) {
+                            drop(attempts.swap_remove(index));
+                            return std::task::Poll::Ready(result);
+                        }
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+                if let Some(found) = finished {
+                    return Ok(found);
+                }
             }
-            Err(DriverError("no permitted peer supplied valid metadata"))
         })
         .await
         .map_err(|_| DriverError("magnet resolution deadline exceeded"))??;
@@ -694,7 +904,7 @@ impl Driver {
         let private_tracker = if torrent.is_private() {
             match source.origin {
                 PeerOrigin::OriginalTracker(id) => Some(id),
-                PeerOrigin::UserProvided => {
+                PeerOrigin::UserProvided | PeerOrigin::Dht | PeerOrigin::Pex => {
                     return Err(DriverError(
                         "private metadata revoked public bootstrap; use its original tracker",
                     ));
@@ -725,7 +935,13 @@ impl Driver {
                     return Err(DriverError("destination already owned by another job"));
                 }
                 self.store
-                    .add_job(id, &root, &torrent.paths, torrent.piece_length())
+                    .add_job_with_pads(
+                        id,
+                        &root,
+                        &torrent.paths,
+                        &torrent.pads,
+                        torrent.piece_length(),
+                    )
                     .map_err(|_| DriverError("payload storage admission failed"))?;
                 self.session
                     .recheck(id, &self.store, &torrent)
@@ -745,6 +961,8 @@ impl Driver {
             Job {
                 torrent,
                 sources: permitted,
+                retry: HashMap::new(),
+                dht_due_s: 0,
                 private_tracker,
                 destination: root,
                 queued: false,
@@ -800,6 +1018,7 @@ impl Driver {
             .ok_or(DriverError("unknown job"))?
             .torrent
             .piece_count();
+        let encrypted = connection.is_encrypted();
         let (sender, receiver) = mpsc::channel(WIRE_CAP);
         let task = tokio::spawn(peer_actor(
             connection,
@@ -830,6 +1049,10 @@ impl Driver {
                 pending_rtt: Vec::new(),
                 rtt_us: None,
                 hash_failures: 0,
+                pex_id: None,
+                pex_sent: Vec::new(),
+                pex_at_s: 0,
+                encrypted,
             },
         );
         let pipeline = pipeline_for(self.peer_preference(id, source.address));
@@ -845,8 +1068,15 @@ impl Driver {
                     bits[p / 8] |= 0x80 >> (p % 8);
                 }
             }
-            let mut handshake =
-                ExtensionHandshake::with_extensions(&[("ut_metadata", crate::metadata::OUR_MD_ID)]);
+            // BEP 27: a private job never offers peer exchange.
+            let mut handshake = if public_discovery(&self.jobs.0[&id]) {
+                ExtensionHandshake::with_extensions(&[
+                    ("ut_metadata", crate::metadata::OUR_MD_ID),
+                    ("ut_pex", crate::pex::OUR_PEX_ID),
+                ])
+            } else {
+                ExtensionHandshake::with_extensions(&[("ut_metadata", crate::metadata::OUR_MD_ID)])
+            };
             handshake.metadata_size = Some(self.jobs.0[&id].torrent.meta.raw_info().len() as i64);
             self.queue(
                 peer,
@@ -869,6 +1099,16 @@ impl Driver {
         Ok(())
     }
 
+    /// Encryption for new peer connections, both directions. Existing
+    /// connections keep what they negotiated.
+    pub fn set_peer_encryption(&mut self, encryption: PeerEncryption) {
+        self.encryption = encryption;
+        self.refresh_incoming_keys();
+    }
+    pub fn peer_encryption(&self) -> PeerEncryption {
+        self.encryption
+    }
+
     pub async fn connect_peer(&mut self, id: TorrentId, source: PeerSource) -> Result<()> {
         let state = self
             .session
@@ -887,7 +1127,7 @@ impl Driver {
         if job.preferences.get(&source.address.ip()) == Some(&PeerPreference::Block) {
             return Err(DriverError("peer address is blocked"));
         }
-        if job.sources.len() >= CANDIDATE_CAP
+        if job.sources.len() >= POOL_CAP
             && !job
                 .sources
                 .iter()
@@ -920,16 +1160,10 @@ impl Driver {
         {
             return Err(DriverError("connection cap reached"));
         }
-        let InfoHash::V1(hash) = job.torrent.meta.info_hash else {
-            return Err(DriverError("unsupported torrent"));
-        };
-        let connection = timeout(
-            CONNECT_TIMEOUT,
-            PeerConnection::connect(source.address, hash, self.peer_id),
-        )
-        .await
-        .map_err(|_| DriverError("peer handshake deadline exceeded"))?
-        .map_err(|_| DriverError("peer connection failed"))?;
+        let hash = job.torrent.hash();
+        let connection = dial_peer(source.address, hash, self.peer_id, self.encryption)
+            .await
+            .map_err(DriverError)?;
         let job = self.jobs.0.get_mut(&id).unwrap();
         if !job
             .sources
@@ -985,27 +1219,21 @@ impl Driver {
             self.jobs.0.get_mut(&id).unwrap().queued = true;
             return Ok(());
         }
-        if sources.is_empty()
-            && self
-                .jobs
-                .0
-                .get(&id)
-                .is_some_and(|job| !job.trackers.is_empty())
-        {
-            // A restored job knows no peers yet; its trackers announce on
-            // their normal schedule and supply them.
-            return Ok(());
+        let has_trackers = self
+            .jobs
+            .0
+            .get(&id)
+            .is_some_and(|job| !job.trackers.is_empty());
+        if sources.is_empty() && !has_trackers {
+            return Err(DriverError("no permitted reconnect source is available"));
         }
-        timeout(Duration::from_secs(30), async {
-            for source in sources {
-                if self.connect_peer(id, source).await.is_ok() {
-                    return Ok(());
-                }
-            }
-            Err(DriverError("no permitted reconnect source is available"))
-        })
-        .await
-        .map_err(|_| DriverError("reconnect deadline exceeded"))?
+        // Known candidates are dialed again right away; trackers announce on
+        // their schedule and supply more. Neither waits here.
+        if let Some(job) = self.jobs.0.get_mut(&id) {
+            job.retry.clear();
+        }
+        self.fill_connections();
+        Ok(())
     }
     pub async fn remove(&mut self, id: TorrentId, delete_data: bool) -> Result<()> {
         if !self.jobs.0.contains_key(&id) {
@@ -1044,6 +1272,7 @@ impl Driver {
         }
     }
     async fn stop_wires(&mut self, id: TorrentId) {
+        self.abort_job_tasks(id);
         let peers: Vec<_> = self
             .wires
             .iter()
@@ -1104,6 +1333,7 @@ impl Driver {
             let _ = wire.task.await;
             self.purge_retired_events();
             self.session.disconnect(wire.torrent, peer).ok();
+            self.note_retry(wire.torrent, wire.source.address, true);
         }
         self.pending_failures.remove(&peer);
     }
@@ -1289,14 +1519,23 @@ impl Driver {
     }
 
     fn metadata_request(&mut self, peer: PeerId, extension: u8, payload: &[u8]) -> Result<()> {
-        use crate::{metadata::OUR_MD_ID, preflight};
+        use crate::{metadata::OUR_MD_ID, pex::OUR_PEX_ID, preflight};
+        if extension == OUR_PEX_ID {
+            self.receive_pex(peer, payload);
+            return Ok(());
+        }
         if extension != 0 && extension != OUR_MD_ID {
             return Ok(());
         }
         if payload.len() > 16384 {
             return Err(DriverError("extension control too large"));
         }
-        preflight::validate(payload).map_err(|_| DriverError("invalid extension control"))?;
+        // Canonical bencode matters for metainfo, not here: some clients
+        // send unsorted handshake keys. Such a message is ignored, and the
+        // peer stays connected without the extension it could not describe.
+        if preflight::validate(payload).is_err() {
+            return Ok(());
+        }
         if extension == 0 {
             if let Ok(handshake) = ExtensionHandshake::decode(payload) {
                 let name = crate::client_name(Some(&handshake));
@@ -1309,8 +1548,19 @@ impl Driver {
                 .and_then(preflight::integer)
                 .unwrap_or(0);
             let id = u8::try_from(id).map_err(|_| DriverError("invalid metadata extension id"))?;
+            let pex = preflight::field(payload, b"m")
+                .and_then(|m| preflight::field(m, b"ut_pex"))
+                .and_then(preflight::integer)
+                .and_then(|id| u8::try_from(id).ok())
+                .filter(|id| *id != 0);
+            let public = self
+                .wires
+                .get(&peer)
+                .and_then(|wire| self.jobs.0.get(&wire.torrent))
+                .is_some_and(public_discovery);
             if let Some(wire) = self.wires.get_mut(&peer) {
                 wire.metadata_id = (id != 0).then_some(id);
+                wire.pex_id = pex.filter(|_| public);
             }
         } else if extension == OUR_MD_ID {
             let wire = self.wires.get(&peer).ok_or(DriverError("unknown peer"))?;
@@ -1695,7 +1945,13 @@ impl Driver {
             self.event(event, &mut report).await;
             self.pump(&mut report).await?;
         }
-        self.refresh_due_tracker().await;
+        self.collect_announces();
+        self.refresh_due_trackers();
+        self.collect_dht();
+        self.refresh_dht();
+        self.send_pex();
+        self.collect_dials();
+        self.fill_connections();
         Ok(report)
     }
 
@@ -1728,6 +1984,7 @@ impl Driver {
                 up_bps: wire.up_bps,
                 rtt_us: wire.rtt_us,
                 hash_failures: wire.hash_failures,
+                encrypted: wire.encrypted,
             })
             .collect();
         rows.sort_by_key(|row| row.address);
@@ -1735,10 +1992,7 @@ impl Driver {
     }
 
     pub fn info_hash(&self, id: TorrentId) -> Option<[u8; 20]> {
-        match self.jobs.0.get(&id)?.torrent.meta.info_hash {
-            InfoHash::V1(hash) => Some(hash),
-            _ => None,
-        }
+        Some(self.jobs.0.get(&id)?.torrent.hash())
     }
 
     /// Snapshot one job for persistence. `paused` is the user's intent: a job
@@ -1761,9 +2015,7 @@ impl Driver {
             .file_order(id)
             .map_err(|_| DriverError("unknown job"))?;
         let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
-        let InfoHash::V1(info_hash) = job.torrent.meta.info_hash else {
-            return Err(DriverError("unsupported torrent"));
-        };
+        let info_hash = job.torrent.hash();
         let raw = job.torrent.meta.raw_info();
         let mut torrent = Vec::with_capacity(raw.len() + 8);
         torrent.extend_from_slice(b"d4:info");
@@ -1876,12 +2128,7 @@ impl Driver {
         if hash != record.info_hash {
             return Err(DriverError("stored torrent does not match its record"));
         }
-        if self
-            .jobs
-            .0
-            .values()
-            .any(|job| matches!(job.torrent.meta.info_hash, InfoHash::V1(h) if h == hash))
-        {
+        if self.jobs.0.values().any(|job| job.torrent.hash() == hash) {
             return Err(DriverError("torrent already exists"));
         }
         let id = self
@@ -1903,7 +2150,13 @@ impl Driver {
                     return Err(DriverError("destination already owned by another job"));
                 }
                 self.store
-                    .add_job(id, &root, &torrent.paths, torrent.piece_length())
+                    .add_job_with_pads(
+                        id,
+                        &root,
+                        &torrent.paths,
+                        &torrent.pads,
+                        torrent.piece_length(),
+                    )
                     .map_err(|_| DriverError("payload storage admission failed"))?;
                 let (trusted, note) = self.plan_resume(
                     id,
@@ -1978,6 +2231,7 @@ impl Driver {
                 seeds: None,
                 peers: None,
                 last_error: None,
+                started: false,
             });
         }
         // A private job without an original tracker can never admit a peer.
@@ -1998,6 +2252,8 @@ impl Driver {
             Job {
                 torrent,
                 sources: Vec::new(),
+                retry: HashMap::new(),
+                dht_due_s: 0,
                 private_tracker,
                 destination: root,
                 queued: false,
@@ -2214,8 +2470,8 @@ impl Driver {
             return Err(DriverError("magnet exceeds 16 KiB limit"));
         }
         let magnet = rbit::MagnetLink::parse(uri).map_err(|_| DriverError("invalid magnet"))?;
-        let rbit::InfoHash::V1(hash) = magnet.info_hash else {
-            return Err(DriverError("v2/hybrid magnets are not supported"));
+        let Some(hash) = magnet.info_hash.v1_hash().map(|hash| hash.0) else {
+            return Err(DriverError("pure v2 magnets are not supported"));
         };
         let port = self
             .listening_address()
@@ -2242,12 +2498,13 @@ impl Driver {
                 seeds: None,
                 peers: None,
                 last_error: None,
+                started: false,
             });
         }
         let mut discovered = Vec::new();
         let mut announced = Vec::new();
         let peer_id = self.peer_id;
-        for tracker in originals {
+        for mut tracker in originals {
             let url = tracker.url.clone();
             match announce_detached(
                 &url,
@@ -2273,7 +2530,10 @@ impl Driver {
                     );
                     announced.push((tracker, Some(response)));
                 }
-                Err(_) => announced.push((tracker, None)),
+                Err(failure) => {
+                    tracker.last_error = Some(failure.detail);
+                    announced.push((tracker, None));
+                }
             }
         }
         for source in sources {
@@ -2290,6 +2550,27 @@ impl Driver {
                 discovered.push(*source);
             }
         }
+        // Trackers gave nothing: a public magnet may still find peers in the
+        // DHT. Strict bootstrap never asks it.
+        if discovered.is_empty()
+            && public_bootstrap
+            && let Some(dht) = self.dht.clone()
+            && let Ok(Ok(peers)) = timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers(hash)).await
+        {
+            for address in peers {
+                if discovered.len() >= CANDIDATE_CAP {
+                    break;
+                }
+                if peer_allowed(address, false)
+                    && !discovered.iter().any(|known| known.address == address)
+                {
+                    discovered.push(PeerSource {
+                        address,
+                        origin: PeerOrigin::Dht,
+                    });
+                }
+            }
+        }
         if discovered.is_empty() {
             return Err(DriverError(
                 "no admissible tracker peers or explicit sources",
@@ -2300,6 +2581,7 @@ impl Driver {
             .await?;
         let private_id = self.jobs.0.get(&id).and_then(|job| job.private_tracker);
         let mut kept = Vec::new();
+        let mut to_ingest = Vec::new();
         for (mut tracker, response) in announced {
             if private_id.is_some_and(|active| tracker.origin_id != active) {
                 continue;
@@ -2319,16 +2601,163 @@ impl Driver {
                 );
                 tracker.seeds = response.complete;
                 tracker.peers = response.incomplete;
+                tracker.started = true;
+                to_ingest.push((response, tracker.origin_id, tracker.local));
             } else {
                 let _ = self.session.tracker_failure(id, index, now, 0);
-                tracker.last_error = Some("announce failed".into());
+                tracker
+                    .last_error
+                    .get_or_insert_with(|| "announce failed".into());
             }
             kept.push(tracker);
         }
         if let Some(job) = self.jobs.0.get_mut(&id) {
             job.trackers = kept;
         }
+        // Metadata resolution used at most CANDIDATE_CAP of these peers; the
+        // pool keeps the rest for the dialer.
+        for (response, origin_id, local) in to_ingest {
+            self.ingest_peers(id, &response, PeerOrigin::OriginalTracker(origin_id), local);
+        }
         self.augment_public(id).await;
+        Ok(id)
+    }
+
+    /// Add a job from `.torrent` bytes. The info dictionary is already in
+    /// hand, so nothing is fetched from peers: the job is admitted, its files
+    /// are prepared and rechecked, and its trackers announce from the next
+    /// [`Driver::step`]. Private torrents keep their original trackers only.
+    pub async fn add_torrent(
+        &mut self,
+        bytes: &[u8],
+        destination: &Path,
+        existing: ExistingData,
+    ) -> Result<TorrentId> {
+        let (torrent, hash) =
+            ValidatedV1::from_torrent_bytes(bytes, &self.metadata_budget).map_err(DriverError)?;
+        if self.jobs.0.values().any(|job| job.torrent.hash() == hash) {
+            return Err(DriverError("torrent already exists"));
+        }
+        if self.limits.download_jobs == 0 || self.limits.connections_per_job == 0 {
+            return Err(DriverError("no connection or download slot available"));
+        }
+        let id = self
+            .session
+            .add(JobSpec {
+                name: torrent.name().into(),
+                files: torrent.files(),
+                piece_length: torrent.piece_length(),
+                max_pieces: MAX_DRIVER_PIECES,
+            })
+            .map_err(|_| DriverError("torrent exceeds session admission limits"))?;
+        let admitted =
+            (|| {
+                let root = prepare_destination(destination, existing)?;
+                if self.jobs.0.values().any(|job| {
+                    job.destination.starts_with(&root) || root.starts_with(&job.destination)
+                }) {
+                    return Err(DriverError("destination already owned by another job"));
+                }
+                self.store
+                    .add_job_with_pads(
+                        id,
+                        &root,
+                        &torrent.paths,
+                        &torrent.pads,
+                        torrent.piece_length(),
+                    )
+                    .map_err(|_| DriverError("payload storage admission failed"))?;
+                self.session
+                    .recheck(id, &self.store, &torrent)
+                    .map_err(|_| DriverError("resume recheck failed"))?;
+                Ok(root)
+            })();
+        let root = match admitted {
+            Ok(root) => root,
+            Err(error) => {
+                let _ = self.session.remove(id, false);
+                let _ = self.store.close_job(id);
+                return Err(error);
+            }
+        };
+        let private = torrent.is_private();
+        let mut trackers: Vec<Tracked> = Vec::new();
+        // `torrent` was rebuilt from the info dictionary alone; the announce
+        // keys live in the original file.
+        let urls = rbit::Metainfo::from_bytes(bytes)
+            .map(|meta| meta.trackers())
+            .unwrap_or_default();
+        for url in urls.into_iter().take(crate::discovery::MAX_TRACKERS) {
+            let Ok(admitted) =
+                crate::discovery::admit_tracker(&url, self.allow_local_trackers).await
+            else {
+                continue;
+            };
+            if trackers
+                .iter()
+                .any(|known| known.url == admitted.tracker.url)
+            {
+                continue;
+            }
+            trackers.push(Tracked {
+                url: admitted.tracker.url,
+                origin: "original",
+                origin_id: trackers.len() as u64 + 1,
+                local: admitted.local,
+                seeds: None,
+                peers: None,
+                last_error: None,
+                started: false,
+            });
+        }
+        // A private job without an admissible tracker can never admit a peer.
+        let private_tracker = private.then(|| trackers.first().map_or(u64::MAX, |t| t.origin_id));
+        self.jobs.0.insert(
+            id,
+            Job {
+                torrent,
+                sources: Vec::new(),
+                retry: HashMap::new(),
+                dht_due_s: 0,
+                private_tracker,
+                destination: root,
+                queued: false,
+                last_error: None,
+                trackers: Vec::new(),
+                preferences: HashMap::new(),
+                bootstrap: !private,
+                resume_trusted: 0,
+                resume_checked: 0,
+                resume_failed: 0,
+                resume_note: None,
+            },
+        );
+        for tracker in trackers {
+            if self.session.add_tracker(id).is_err() {
+                break;
+            }
+            if let Some(job) = self.jobs.0.get_mut(&id) {
+                job.trackers.push(tracker);
+            }
+        }
+        self.augment_public(id).await;
+        // The download-slot cap still applies: queue rather than refuse.
+        let rows = self.snapshot();
+        let running = rows
+            .jobs
+            .iter()
+            .filter(|row| row.id != id && row.state == JobState::Downloading)
+            .count();
+        let downloading = rows
+            .jobs
+            .iter()
+            .any(|row| row.id == id && row.state == JobState::Downloading);
+        if downloading && running >= self.limits.download_jobs {
+            self.pause(id).await?;
+            if let Some(job) = self.jobs.0.get_mut(&id) {
+                job.queued = true;
+            }
+        }
         Ok(id)
     }
 
@@ -2338,8 +2767,8 @@ impl Driver {
         }
         let meta =
             rbit::Metainfo::from_bytes(bytes).map_err(|_| DriverError("invalid torrent file"))?;
-        let rbit::InfoHash::V1(hash) = meta.info_hash else {
-            return Err(DriverError("v2/hybrid torrents are not supported"));
+        let Some(hash) = meta.info_hash.v1_hash().map(|hash| hash.0) else {
+            return Err(DriverError("pure v2 torrents are not supported"));
         };
         let mut magnet = format!("magnet:?xt=urn:btih:{}", hex_encode(&hash));
         for tracker in meta
@@ -2356,6 +2785,8 @@ impl Driver {
         Ok(magnet)
     }
 
+    /// Start a manual announce. The result lands in [`Driver::tracker_status`]
+    /// once [`Driver::step`] collects it; this never waits on the network.
     pub async fn reannounce(&mut self, id: TorrentId, index: usize) -> Result<()> {
         if !self.jobs.0.contains_key(&id) {
             return Err(DriverError("unknown job"));
@@ -2368,132 +2799,574 @@ impl Driver {
         if !started {
             return Err(DriverError("reannounce is still inside its cooldown"));
         }
-        self.finish_announce(id, index, rbit::TrackerEvent::None)
-            .await
+        self.spawn_announce(id, index)
     }
 
-    async fn refresh_due_tracker(&mut self) {
+    /// Start every periodic announce that is due. Each runs in its own task.
+    fn refresh_due_trackers(&mut self) {
         let now = self.elapsed_s();
-        let mut choice = None;
-        let jobs: Vec<_> = self.jobs.0.keys().copied().collect();
-        for id in jobs {
-            let Some(job) = self.jobs.0.get(&id) else {
+        let mut due = Vec::new();
+        for (id, job) in &self.jobs.0 {
+            if job.queued {
                 continue;
-            };
+            }
             for index in 0..job.trackers.len() {
-                let Ok(schedule) = self.session.tracker_schedule(id, index) else {
+                if self.announcing.contains_key(&(*id, index)) {
+                    continue;
+                }
+                let Ok(schedule) = self.session.tracker_schedule(*id, index) else {
                     continue;
                 };
                 if !schedule.in_flight && now >= schedule.periodic_due_s {
-                    choice = Some((id, index));
-                    break;
+                    due.push((*id, index));
                 }
-            }
-            if choice.is_some() {
-                break;
             }
         }
-        let Some((id, index)) = choice else {
-            return;
-        };
-        let Ok(true) = self.session.begin_announce(id, index, now, false) else {
-            return;
-        };
-        let _ = self
-            .finish_announce(id, index, rbit::TrackerEvent::None)
-            .await;
-    }
-
-    async fn finish_announce(
-        &mut self,
-        id: TorrentId,
-        index: usize,
-        event: rbit::TrackerEvent,
-    ) -> Result<()> {
-        let Some(tracker) = self.jobs.0.get(&id).and_then(|job| job.trackers.get(index)) else {
-            let _ = self.session.tracker_failure(id, index, self.elapsed_s(), 0);
-            return Err(DriverError("unknown tracker"));
-        };
-        let url = tracker.url.clone();
-        let local = tracker.local;
-        let origin = if tracker.origin == "original" {
-            PeerOrigin::OriginalTracker(tracker.origin_id)
-        } else {
-            PeerOrigin::UserProvided
-        };
-        match self.announce_job(id, &url, event).await {
-            Ok(response) => {
-                let _ = self.session.tracker_success(
-                    id,
-                    index,
-                    self.elapsed_s(),
-                    response.interval,
-                    response.min_interval,
-                );
-                if let Some(tracker) = self
-                    .jobs
-                    .0
-                    .get_mut(&id)
-                    .and_then(|job| job.trackers.get_mut(index))
-                {
-                    tracker.seeds = response.complete;
-                    tracker.peers = response.incomplete;
-                    tracker.last_error = None;
-                }
-                self.ingest_peers(id, &response, origin, local).await;
-                Ok(())
+        for (id, index) in due {
+            let running = self.snapshot().jobs.iter().any(|row| {
+                row.id == id
+                    && matches!(
+                        row.state,
+                        JobState::Downloading | JobState::Seeding | JobState::Complete
+                    )
+            });
+            if !running {
+                continue;
             }
-            Err(error) => {
-                let _ = self.session.tracker_failure(id, index, self.elapsed_s(), 0);
-                if let Some(tracker) = self
-                    .jobs
-                    .0
-                    .get_mut(&id)
-                    .and_then(|job| job.trackers.get_mut(index))
-                {
-                    tracker.last_error = Some(error.0.to_string());
-                }
-                Err(error)
+            if let Ok(true) = self.session.begin_announce(id, index, now, false) {
+                let _ = self.spawn_announce(id, index);
             }
         }
     }
 
-    async fn announce_job(
-        &mut self,
-        id: TorrentId,
-        url: &str,
-        event: rbit::TrackerEvent,
-    ) -> Result<rbit::AnnounceResponse> {
+    fn spawn_announce(&mut self, id: TorrentId, index: usize) -> Result<()> {
         let port = self
             .listening_address()
             .map(|address| address.port())
-            .ok_or(DriverError("listening port is not configured"))?;
-        let hash = match self.jobs.0.get(&id).map(|job| job.torrent.meta.info_hash) {
-            Some(rbit::InfoHash::V1(hash)) => hash,
-            _ => return Err(DriverError("unknown job")),
-        };
+            .ok_or(DriverError("listening port is not configured"));
+        let hash = self
+            .jobs
+            .0
+            .get(&id)
+            .map(|job| job.torrent.hash())
+            .ok_or(DriverError("unknown job"));
         let row = self
             .snapshot()
             .jobs
             .iter()
             .find(|row| row.id == id)
             .cloned()
-            .ok_or(DriverError("unknown job"))?;
+            .ok_or(DriverError("unknown job"));
+        let Some(tracker) = self
+            .jobs
+            .0
+            .get_mut(&id)
+            .and_then(|job| job.trackers.get_mut(index))
+        else {
+            let _ = self.session.tracker_failure(id, index, self.elapsed_s(), 0);
+            return Err(DriverError("unknown tracker"));
+        };
+        let (port, hash, row) = match (port, hash, row) {
+            (Ok(port), Ok(hash), Ok(row)) => (port, hash, row),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                tracker.last_error = Some(error.0.to_string());
+                let _ = self.session.tracker_failure(id, index, self.elapsed_s(), 0);
+                return Err(error);
+            }
+        };
+        let event = if tracker.started {
+            rbit::TrackerEvent::None
+        } else {
+            rbit::TrackerEvent::Started
+        };
+        let url = tracker.url.clone();
+        let allow_local = self.allow_local_trackers;
         let peer_id = self.peer_id;
-        announce_detached(
-            url,
-            self.allow_local_trackers,
-            crate::announce::AnnounceRequest {
-                info_hash: &hash,
-                peer_id: &peer_id,
-                port,
-                uploaded: row.total_payload_uploaded,
-                downloaded: row.total_payload_downloaded,
-                left: row.wanted_bytes.saturating_sub(row.verified_bytes),
-                event,
-            },
-        )
-        .await
+        let sender = self.announce_sender.clone();
+        let task = tokio::spawn(async move {
+            let result = announce_detached(
+                &url,
+                allow_local,
+                crate::announce::AnnounceRequest {
+                    info_hash: &hash,
+                    peer_id: &peer_id,
+                    port,
+                    uploaded: row.total_payload_uploaded,
+                    downloaded: row.total_payload_downloaded,
+                    left: row.wanted_bytes.saturating_sub(row.verified_bytes),
+                    event,
+                },
+            )
+            .await;
+            let _ = sender
+                .send(Announced {
+                    torrent: id,
+                    index,
+                    url,
+                    result,
+                })
+                .await;
+        });
+        self.announcing.insert((id, index), task);
+        Ok(())
+    }
+
+    /// Apply finished announces. A result for a removed job, or for a
+    /// tracker slot that now holds another URL, is dropped.
+    fn collect_announces(&mut self) {
+        while let Ok(done) = self.announced.try_recv() {
+            self.announcing.remove(&(done.torrent, done.index));
+            let now = self.elapsed_s();
+            let Some(tracker) = self
+                .jobs
+                .0
+                .get_mut(&done.torrent)
+                .and_then(|job| job.trackers.get_mut(done.index))
+                .filter(|tracker| tracker.url == done.url)
+            else {
+                continue;
+            };
+            let local = tracker.local;
+            let origin = if tracker.origin == "original" {
+                PeerOrigin::OriginalTracker(tracker.origin_id)
+            } else {
+                PeerOrigin::UserProvided
+            };
+            match done.result {
+                Ok(response) => {
+                    tracker.seeds = response.complete;
+                    tracker.peers = response.incomplete;
+                    tracker.last_error = None;
+                    tracker.started = true;
+                    let _ = self.session.tracker_success(
+                        done.torrent,
+                        done.index,
+                        now,
+                        response.interval,
+                        response.min_interval,
+                    );
+                    self.ingest_peers(done.torrent, &response, origin, local);
+                }
+                Err(failure) => {
+                    tracker.last_error = Some(failure.detail);
+                    let _ = self
+                        .session
+                        .tracker_failure(done.torrent, done.index, now, 0);
+                }
+            }
+        }
+    }
+
+    fn abort_job_tasks(&mut self, id: TorrentId) {
+        if let Some(task) = self.dht_lookups.remove(&id) {
+            task.abort();
+        }
+        self.dialing.retain(|(torrent, _), task| {
+            let keep = *torrent != id;
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        let mut aborted = Vec::new();
+        self.announcing.retain(|(torrent, index), task| {
+            let keep = *torrent != id;
+            if !keep {
+                task.abort();
+                aborted.push(*index);
+            }
+            keep
+        });
+        // An aborted announce never reports; release its in-flight clock.
+        let now = self.elapsed_s();
+        for index in aborted {
+            let _ = self.session.tracker_failure(id, index, now, 0);
+        }
+    }
+
+    /// Whether `source` may be dialed for this job now.
+    fn dialable(&self, id: TorrentId, job: &Job, source: &PeerSource, now: u64) -> bool {
+        if job.preferences.get(&source.address.ip()) == Some(&PeerPreference::Block) {
+            return false;
+        }
+        if job
+            .private_tracker
+            .is_some_and(|tracker| source.origin != PeerOrigin::OriginalTracker(tracker))
+        {
+            return false;
+        }
+        if job
+            .retry
+            .get(&source.address)
+            .is_some_and(|(_, next)| *next > now)
+        {
+            return false;
+        }
+        !self.dialing.contains_key(&(id, source.address))
+            && !self
+                .wires
+                .values()
+                .any(|wire| wire.torrent == id && wire.source.address == source.address)
+    }
+
+    /// Dial remembered candidates for downloading jobs, within the global and
+    /// per-job connection caps and [`HALF_OPEN_CAP`]. Never waits.
+    fn fill_connections(&mut self) {
+        let now = self.elapsed_s();
+        let rows = self.snapshot();
+        let mut plan = Vec::new();
+        for row in rows.jobs.iter() {
+            if row.state != JobState::Downloading {
+                continue;
+            }
+            let Some(job) = self.jobs.0.get(&row.id) else {
+                continue;
+            };
+            let hash = job.torrent.hash();
+            let mut open = self.wires.values().filter(|w| w.torrent == row.id).count()
+                + self.dialing.keys().filter(|(t, _)| *t == row.id).count();
+            for source in &job.sources {
+                if open >= self.limits.connections_per_job
+                    || self.wires.len() + self.dialing.len() + plan.len()
+                        >= self.limits.connections_total
+                    || self.dialing.len() + plan.len() >= HALF_OPEN_CAP
+                {
+                    break;
+                }
+                if self.dialable(row.id, job, source, now)
+                    && !plan
+                        .iter()
+                        .any(|(t, s, _): &(TorrentId, PeerSource, [u8; 20])| {
+                            *t == row.id && s.address == source.address
+                        })
+                {
+                    plan.push((row.id, *source, hash));
+                    open += 1;
+                }
+            }
+        }
+        for (id, source, hash) in plan {
+            let peer_id = self.peer_id;
+            let encryption = self.encryption;
+            let sender = self.dial_sender.clone();
+            let task = tokio::spawn(async move {
+                let result = dial_peer(source.address, hash, peer_id, encryption).await;
+                let _ = sender
+                    .send(Dialed {
+                        torrent: id,
+                        source,
+                        result,
+                    })
+                    .await;
+            });
+            self.dialing.insert((id, source.address), task);
+        }
+    }
+
+    /// Push the next attempt at `address` out by the backoff schedule.
+    fn note_retry(&mut self, id: TorrentId, address: SocketAddr, failed: bool) {
+        let now = self.elapsed_s();
+        let Some(job) = self.jobs.0.get_mut(&id) else {
+            return;
+        };
+        let entry = job.retry.entry(address).or_insert((0, 0));
+        if failed {
+            entry.0 = entry.0.saturating_add(1);
+        }
+        let shift = entry.0.saturating_sub(1).min(16);
+        entry.1 = now.saturating_add((RETRY_BASE_S << shift).min(RETRY_MAX_S));
+        if job.retry.len() > POOL_CAP {
+            let known: std::collections::HashSet<_> =
+                job.sources.iter().map(|source| source.address).collect();
+            job.retry.retain(|address, _| known.contains(address));
+        }
+    }
+
+    /// Admit finished dials. The job, its caps and the peer's preference are
+    /// checked again: any of them may have changed while the dial ran.
+    fn collect_dials(&mut self) {
+        while let Ok(done) = self.dialed.try_recv() {
+            self.dialing.remove(&(done.torrent, done.source.address));
+            let connection = match done.result {
+                Ok(connection) => connection,
+                Err(_) => {
+                    self.note_retry(done.torrent, done.source.address, true);
+                    continue;
+                }
+            };
+            let admissible = self.jobs.0.get(&done.torrent).is_some_and(|job| {
+                job.preferences.get(&done.source.address.ip()) != Some(&PeerPreference::Block)
+            }) && self.snapshot().jobs.iter().any(|row| {
+                row.id == done.torrent
+                    && matches!(row.state, JobState::Downloading | JobState::Seeding)
+            }) && self.wires.len() < self.limits.connections_total
+                && self
+                    .wires
+                    .values()
+                    .filter(|wire| wire.torrent == done.torrent)
+                    .count()
+                    < self.limits.connections_per_job
+                && !self.wires.values().any(|wire| {
+                    wire.torrent == done.torrent && wire.source.address == done.source.address
+                });
+            if !admissible {
+                continue;
+            }
+            if let Some(job) = self.jobs.0.get_mut(&done.torrent) {
+                job.retry.remove(&done.source.address);
+            }
+            let _ = self.attach(done.torrent, done.source, connection, Vec::new());
+        }
+    }
+
+    /// Join the mainline DHT on UDP `port` (the TCP listen port by
+    /// convention; 0 picks one). Bootstrap runs in the background. Public
+    /// downloading jobs then look up peers every [`DHT_INTERVAL_S`]. Lookups
+    /// only: this node answers queries but does not announce_peer, so other
+    /// peers find us through trackers and PEX rather than the DHT.
+    pub async fn enable_dht(&mut self, port: u16) -> Result<u16> {
+        if let Some(dht) = &self.dht {
+            return Ok(dht.port());
+        }
+        let server = match rbit::DhtServer::bind(port).await {
+            Ok(server) => server,
+            Err(_) if port != 0 => rbit::DhtServer::bind(0)
+                .await
+                .map_err(|_| DriverError("DHT socket bind failed"))?,
+            Err(_) => return Err(DriverError("DHT socket bind failed")),
+        };
+        let server = Arc::new(server);
+        let run = Arc::clone(&server);
+        self.dht_tasks.push(tokio::spawn(async move {
+            let _ = run.run().await;
+        }));
+        let boot = Arc::clone(&server);
+        self.dht_tasks.push(tokio::spawn(async move {
+            // A cold node retries until its routing table has entries, then
+            // widens it with random-target lookups: get_peers starts from the
+            // closest known nodes, and a table of a dozen rarely reaches any.
+            for attempt in 0..6u32 {
+                let _ = timeout(Duration::from_secs(60), boot.bootstrap()).await;
+                if boot.routing_table().node_count() >= 8 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(10 << attempt.min(4))).await;
+            }
+            for _ in 0..30 {
+                if boot.routing_table().node_count() >= 100 {
+                    break;
+                }
+                let _ = timeout(
+                    Duration::from_secs(20),
+                    boot.find_node(rbit::NodeId::generate()),
+                )
+                .await;
+            }
+        }));
+        let port = server.port();
+        self.dht = Some(server);
+        Ok(port)
+    }
+
+    /// Engine diagnostics: (leased pieces, requests in flight, peers we
+    /// cannot request from, pickable pieces).
+    pub fn lease_stats(&self, id: TorrentId) -> Option<(usize, usize, usize, usize)> {
+        self.session.lease_stats(id)
+    }
+
+    /// Candidate pool size by origin: (tracker, DHT, PEX, user or incoming).
+    pub fn candidate_counts(&self, id: TorrentId) -> (usize, usize, usize, usize) {
+        let mut counts = (0, 0, 0, 0);
+        for source in self.jobs.0.get(&id).map_or(&[][..], |job| &job.sources) {
+            match source.origin {
+                PeerOrigin::OriginalTracker(_) => counts.0 += 1,
+                PeerOrigin::Dht => counts.1 += 1,
+                PeerOrigin::Pex => counts.2 += 1,
+                PeerOrigin::UserProvided => counts.3 += 1,
+            }
+        }
+        counts
+    }
+
+    /// Routing-table size, or `None` without a DHT node.
+    pub fn dht_nodes(&self) -> Option<usize> {
+        self.dht
+            .as_ref()
+            .map(|dht| dht.routing_table().node_count())
+    }
+
+    /// Start due lookups for downloading public jobs once the routing table
+    /// has nodes to ask.
+    fn refresh_dht(&mut self) {
+        let Some(dht) = &self.dht else {
+            return;
+        };
+        if dht.routing_table().node_count() == 0 {
+            return;
+        }
+        let now = self.elapsed_s();
+        let rows = self.snapshot();
+        let mut due = Vec::new();
+        for row in rows.jobs.iter() {
+            if row.state != JobState::Downloading || self.dht_lookups.contains_key(&row.id) {
+                continue;
+            }
+            if let Some(job) = self.jobs.0.get(&row.id)
+                && public_discovery(job)
+                && now >= job.dht_due_s
+            {
+                due.push((row.id, job.torrent.hash()));
+            }
+        }
+        for (id, hash) in due {
+            if let Some(job) = self.jobs.0.get_mut(&id) {
+                job.dht_due_s = now + DHT_INTERVAL_S;
+            }
+            let Some(dht) = self.dht.clone() else {
+                return;
+            };
+            let sender = self.dht_sender.clone();
+            let task = tokio::spawn(async move {
+                let peers = timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers(hash))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .unwrap_or_default();
+                let _ = sender.send((id, peers)).await;
+            });
+            self.dht_lookups.insert(id, task);
+        }
+    }
+
+    fn collect_dht(&mut self) {
+        while let Ok((id, peers)) = self.dht_found.try_recv() {
+            self.dht_lookups.remove(&id);
+            if !self.jobs.0.get(&id).is_some_and(public_discovery) {
+                continue;
+            }
+            // A cold routing table often finds nothing on the first try;
+            // ask again soon instead of after the full interval.
+            if peers.is_empty() {
+                let retry = self.elapsed_s() + DHT_EMPTY_RETRY_S;
+                if let Some(job) = self.jobs.0.get_mut(&id) {
+                    job.dht_due_s = job.dht_due_s.min(retry);
+                }
+            }
+            for address in peers.into_iter().take(POOL_CAP) {
+                if peer_allowed(address, self.allow_local_trackers)
+                    && self.peer_preference(id, address) != PeerPreference::Block
+                {
+                    self.remember_source(
+                        id,
+                        PeerSource {
+                            address,
+                            origin: PeerOrigin::Dht,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Remember the added peers of one ut_pex message from `peer`.
+    fn receive_pex(&mut self, peer: PeerId, payload: &[u8]) {
+        let Some(id) = self.wires.get(&peer).map(|wire| wire.torrent) else {
+            return;
+        };
+        if !self.jobs.0.get(&id).is_some_and(public_discovery) {
+            return;
+        }
+        let Ok(added) = crate::pex::parse_added(payload) else {
+            return;
+        };
+        for address in added {
+            // Loopback, link-local and private addresses from strangers
+            // only with the local-address setting, as for trackers.
+            if peer_allowed(address, self.allow_local_trackers)
+                && self.peer_preference(id, address) != PeerPreference::Block
+            {
+                self.remember_source(
+                    id,
+                    PeerSource {
+                        address,
+                        origin: PeerOrigin::Pex,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Every [`crate::pex::INTERVAL_S`], tell each PEX-capable peer which of
+    /// our dialed peers are connected and which have gone since last time.
+    /// Incoming peers are not listed: their source port is not a listener.
+    fn send_pex(&mut self) {
+        let now = self.elapsed_s();
+        let due: Vec<PeerId> = self
+            .wires
+            .iter()
+            .filter(|(_, wire)| {
+                wire.pex_id.is_some() && now >= wire.pex_at_s.saturating_add(self.pex_interval_s)
+            })
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            let Some(wire) = self.wires.get(&peer) else {
+                continue;
+            };
+            let id = wire.torrent;
+            let Some(job) = self.jobs.0.get(&id) else {
+                continue;
+            };
+            let current: Vec<SocketAddr> = self
+                .wires
+                .iter()
+                .filter(|(other, w)| {
+                    **other != peer
+                        && w.torrent == id
+                        && job
+                            .sources
+                            .iter()
+                            .any(|source| source.address == w.source.address)
+                })
+                .map(|(_, w)| w.source.address)
+                .take(crate::pex::MAX_SENT)
+                .collect();
+            let added: Vec<SocketAddr> = current
+                .iter()
+                .filter(|address| !wire.pex_sent.contains(address))
+                .copied()
+                .collect();
+            let dropped: Vec<SocketAddr> = wire
+                .pex_sent
+                .iter()
+                .filter(|address| !current.contains(address))
+                .copied()
+                .collect();
+            let remote = wire.pex_id;
+            if let Some(wire) = self.wires.get_mut(&peer) {
+                wire.pex_at_s = now;
+            }
+            let Some(remote) = remote else {
+                continue;
+            };
+            if added.is_empty() && dropped.is_empty() {
+                continue;
+            }
+            let payload = Bytes::from(crate::pex::encode(&added, &dropped));
+            if self
+                .queue(
+                    peer,
+                    Message::Extended {
+                        id: remote,
+                        payload,
+                    },
+                )
+                .is_ok()
+                && let Some(wire) = self.wires.get_mut(&peer)
+            {
+                wire.pex_sent = current;
+            }
+        }
     }
 
     fn collect_peers(
@@ -2520,7 +3393,7 @@ impl Driver {
         }
     }
 
-    async fn ingest_peers(
+    fn ingest_peers(
         &mut self,
         id: TorrentId,
         response: &rbit::AnnounceResponse,
@@ -2534,12 +3407,12 @@ impl Driver {
             .copied()
             .filter(|address| peer_allowed(*address, local))
             .filter(|address| self.peer_preference(id, *address) != PeerPreference::Block)
-            .take(CANDIDATE_CAP)
+            .take(POOL_CAP)
             .collect();
+        // Remembered only; [`Driver::fill_connections`] dials them in the
+        // background so an unreachable peer never stalls the step loop.
         for address in addresses {
-            let source = PeerSource { address, origin };
-            self.remember_source(id, source);
-            let _ = self.connect_peer(id, source).await;
+            self.remember_source(id, PeerSource { address, origin });
         }
     }
 
@@ -2547,7 +3420,13 @@ impl Driver {
         let Some(job) = self.jobs.0.get_mut(&id) else {
             return;
         };
-        if job.sources.len() >= CANDIDATE_CAP
+        if job
+            .private_tracker
+            .is_some_and(|tracker| source.origin != PeerOrigin::OriginalTracker(tracker))
+        {
+            return;
+        }
+        if job.sources.len() >= POOL_CAP
             || job
                 .sources
                 .iter()
@@ -2601,6 +3480,7 @@ impl Driver {
                     seeds: None,
                     peers: None,
                     last_error: None,
+                    started: false,
                 });
             }
         }
@@ -2615,26 +3495,40 @@ impl Drop for Driver {
         for wire in self.wires.values() {
             wire.task.abort();
         }
+        for task in self
+            .dialing
+            .values()
+            .chain(self.announcing.values())
+            .chain(self.dht_lookups.values())
+            .chain(self.dht_tasks.iter())
+        {
+            task.abort();
+        }
     }
 }
 
-/// Resolve and classify the tracker again, then announce over the
-/// application-owned HTTP transport to the admitted address. Errors carry the
-/// transport's reason so the Trackers tab can show it.
+/// Resolve and classify the tracker again, then announce once per address
+/// family it resolved to (one IPv4, one IPv6) over the application-owned
+/// HTTP(S) or UDP transport, merging the peers. Healthy if either family
+/// answered. The failure's detail carries each family's reason (and a UDP
+/// tracker's own message) so the Trackers tab can show it.
 async fn announce_detached(
     url: &str,
     allow_local: bool,
     announce: crate::announce::AnnounceRequest<'_>,
-) -> Result<rbit::AnnounceResponse> {
-    let admitted = crate::discovery::admit_tracker(url, allow_local)
-        .await
-        .map_err(DriverError)?;
-    let address = admitted
-        .connect_address()
-        .ok_or(DriverError("tracker host did not resolve"))?;
-    crate::announce::announce(&admitted.tracker, address, &announce)
-        .await
-        .map_err(DriverError)
+) -> std::result::Result<rbit::AnnounceResponse, crate::announce::AnnounceFailure> {
+    crate::announce::announce_tracker(url, allow_local, &announce).await
+}
+
+/// Azureus-style peer ID: `-TE` and the four-digit version (0.1.0 is 0100),
+/// then rbit's twelve random bytes. Trackers and peers key client
+/// identification off the prefix, so it must not borrow another client's.
+pub const PEER_ID_PREFIX: &[u8; 8] = b"-TE0100-";
+
+fn peer_id() -> [u8; 20] {
+    let mut id = *rbit::PeerId::generate().as_bytes();
+    id[..8].copy_from_slice(PEER_ID_PREFIX);
+    id
 }
 
 fn pipeline_for(preference: PeerPreference) -> usize {
@@ -2750,6 +3644,12 @@ fn preference_rank(preference: PeerPreference) -> u8 {
     }
 }
 
+/// Whether DHT and PEX may serve this job: a public torrent whose user did
+/// not ask for strict, tracker-only bootstrap.
+fn public_discovery(job: &Job) -> bool {
+    !job.torrent.is_private() && job.private_tracker.is_none() && job.bootstrap
+}
+
 fn peer_allowed(address: SocketAddr, local_tracker: bool) -> bool {
     if address.port() == 0 || address.ip().is_unspecified() {
         return false;
@@ -2780,6 +3680,116 @@ fn prepare_destination(path: &Path, existing: ExistingData) -> Result<PathBuf> {
         }
     }
     std::fs::canonicalize(path).map_err(|_| DriverError("destination validation failed"))
+}
+
+/// Open one outgoing peer wire. Each attempt is bounded by CONNECT_TIMEOUT.
+/// Under PreferEncrypted a failed or stalled MSE handshake is redialled once
+/// in plaintext; nothing of the BitTorrent handshake was sent before it.
+/// A refused TCP connect or a BitTorrent-level failure is not retried.
+async fn dial_peer(
+    address: SocketAddr,
+    hash: [u8; 20],
+    peer_id: [u8; 20],
+    encryption: PeerEncryption,
+) -> std::result::Result<PeerConnection, &'static str> {
+    #[derive(PartialEq)]
+    enum Stage {
+        Connect,
+        Encryption,
+        Handshake,
+    }
+    let plaintext = async {
+        timeout(
+            CONNECT_TIMEOUT,
+            PeerConnection::connect(address, hash, peer_id),
+        )
+        .await
+        .map_err(|_| "peer handshake deadline exceeded")?
+        .map_err(|_| "peer connection failed")
+    };
+    if encryption == PeerEncryption::PlaintextOnly {
+        return plaintext.await;
+    }
+    let mut stage = Stage::Connect;
+    let attempt = timeout(CONNECT_TIMEOUT, async {
+        let tcp = TcpStream::connect(address)
+            .await
+            .map_err(|_| "peer connection failed")?;
+        let _ = tcp.set_nodelay(true);
+        stage = Stage::Encryption;
+        let stream = mse::initiate(tcp, hash, encryption.policy())
+            .await
+            .map_err(|_| "peer encryption handshake failed")?;
+        stage = Stage::Handshake;
+        PeerConnection::connect_with_stream(stream, address, hash, peer_id, false)
+            .await
+            .map_err(|_| "peer connection failed")
+    })
+    .await
+    .unwrap_or(Err("peer handshake deadline exceeded"));
+    match attempt {
+        Err(_) if stage == Stage::Encryption && encryption == PeerEncryption::PreferEncrypted => {
+            plaintext.await
+        }
+        attempt => attempt,
+    }
+}
+
+/// Classify one accepted socket and route it by info hash. A plaintext
+/// BitTorrent handshake is only peeked, so rbit's accept reads it again;
+/// anything else runs the MSE responder against the public job hashes.
+/// The caller bounds the whole probe with CONNECT_TIMEOUT.
+async fn route_incoming(
+    stream: TcpStream,
+    address: SocketAddr,
+    keys: &Mutex<IncomingKeys>,
+) -> Option<Incoming> {
+    const PREFIX: &[u8; 20] = b"\x13BitTorrent protocol";
+    let encryption = keys.lock().ok()?.encryption;
+    let mut bytes = [0; 68];
+    let plaintext = loop {
+        let n = stream.peek(&mut bytes).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        let have = n.min(PREFIX.len());
+        if bytes[..have] != PREFIX[..have] {
+            break None;
+        }
+        if n == bytes.len() {
+            break Some(Handshake::decode(&bytes).ok()?);
+        }
+        // A partial prefix remains readable; avoid a spin loop.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    if let Some(handshake) = plaintext {
+        return (encryption != PeerEncryption::RequireEncrypted).then_some(Incoming {
+            stream: IncomingStream::Plain(stream),
+            hash: handshake.info_hash,
+            address,
+        });
+    }
+    if encryption == PeerEncryption::PlaintextOnly {
+        return None;
+    }
+    let _ = stream.set_nodelay(true);
+    let accepted = mse::accept(stream, encryption.policy(), |req2| {
+        let keys = keys.lock().ok()?;
+        keys.hashes
+            .iter()
+            .find(|hash| mse::req2_hash(hash) == *req2)
+            .copied()
+    })
+    .await
+    .ok()?;
+    match accepted {
+        mse::Accepted::Encrypted { info_hash, stream } => Some(Incoming {
+            stream: IncomingStream::Negotiated(Box::new(stream)),
+            hash: info_hash,
+            address,
+        }),
+        mse::Accepted::Plaintext(_) => None,
+    }
 }
 
 async fn peer_actor(

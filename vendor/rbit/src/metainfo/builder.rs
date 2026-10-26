@@ -570,11 +570,13 @@ impl TorrentBuilder {
     fn compute_v1_pieces_with_padding(&self) -> (Vec<u8>, Vec<[u8; 20]>) {
         let mut total_data = Vec::new();
 
-        for file in &self.files {
+        for (i, file) in self.files.iter().enumerate() {
             total_data.extend_from_slice(&file.data);
 
-            // Add padding to align to piece boundary
-            if !file.data.is_empty() {
+            // Align to the next piece boundary, except after the last file:
+            // build_files_list_hybrid adds no trailing pad file, so a padded
+            // tail here would hash bytes the v1 file list does not contain.
+            if i < self.files.len() - 1 && !file.data.is_empty() {
                 let remainder = file.data.len() % self.piece_length as usize;
                 if remainder != 0 {
                     let padding = self.piece_length as usize - remainder;

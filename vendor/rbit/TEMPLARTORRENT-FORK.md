@@ -44,11 +44,59 @@ Panic fixes, 2026-10-24, each found by a target in `fuzz/` and pinned by
   and its siblings wrap. The transport always passed exact frames; direct
   callers did not have to.
 
+Hybrid torrents, 2026-10-25: `src/metainfo/torrent.rs` counted a hybrid's
+expected v1 pieces from the unpadded v2 total, so any hybrid whose first
+file was not piece-aligned (including ones rbit's own builder makes) failed
+with "hybrid: v1 piece count doesn't match total length". It now sums each
+non-empty file's piece count, matching the padded v1 stream.
+`src/metainfo/builder.rs` padded the last file too when hashing v1 pieces
+of a hybrid, while its v1 file list (correctly) has no trailing pad file,
+so the final piece hash covered bytes the torrent does not contain.
+
+DHT, 2026-10-25: `src/dht/server.rs` capped peers per info hash at 1000 but
+not the number of info hashes; anyone can obtain a token with get_peers and
+announce_peer arbitrary hashes. The store now keeps at most 1024 info
+hashes, evicting expired ones first and refusing new ones when all are live.
+`get_peers` waited 15 s per query and up to 10 waves, so a lookup could take
+150 s, and each wave asked only the nodes the previous wave returned. It now
+waits 4 s per query, asks the 8 closest unqueried nodes of a shortlist of
+every node seen, and stops at 200 peers.
+
 Performance, 2026-10-24: `src/peer/transport.rs` sets `TCP_NODELAY` on
 every peer stream. Without it a pipelined Request waited for the delayed ACK
 of the previous one (about 40 ms on Linux); the 32 MiB loopback scenario went
 from about 5.3 s to under 0.1 s. Evidence in
 perf-results/2026-10-24-write-path/.
+
+Peer-wire encryption, 2026-10-25 (BitTorrent Message Stream Encryption,
+the Vuze/libtorrent MSE/PE spec):
+
+- `src/peer/mse.rs` (new, `pub mod mse` in `src/peer.rs`): 768-bit
+  Diffie-Hellman with the spec prime and generator 2, RC4 with the first
+  1024 keystream bytes dropped, SHA-1 key and req1/req2/req3 derivation,
+  `initiate` (outgoing; sends an empty IA, so the BitTorrent handshake
+  follows MSE) and `accept` (incoming; detects a plaintext
+  `\x13BitTorrent protocol` prefix without consuming it, otherwise routes
+  by `HASH('req2', SKEY)` through a caller lookup). Resynchronisation reads
+  are bounded by the spec (PadA/PadB at most 512 bytes) and a handshake
+  never buffers more than `MAX_HANDSHAKE_BYTES` (1176). `MseStream`
+  replays bytes the handshake read ahead, encrypts writes into a bounded
+  buffer drained on the next write or `flush`, and decrypts only the IA
+  when plaintext was selected. `EncryptionPolicy` is PreferRc4 /
+  RequireRc4 / PlaintextOnly. Re-exported from `peer`: `EncryptionPolicy`,
+  `MseStream`, `PeerStream`, `BoxedPeerStream`.
+- `src/peer/transport.rs`: `PeerTransport<S = TcpStream>` is generic over
+  any `AsyncRead + AsyncWrite + Unpin` stream; `PeerTransport::new` (TCP,
+  sets `TCP_NODELAY`) and `peer_addr` stay on `PeerTransport<TcpStream>`,
+  `from_stream` is new, and `into_inner` returns `S`. Every handshake and
+  message write is now followed by `flush` (a no-op on TCP) inside the
+  same 30 s write timeout.
+- `src/peer/connection.rs`: `PeerConnection` owns a boxed `PeerStream`.
+  New `connect_with_stream` / `accept_with_stream` take an `MseStream` and
+  the remote address; `connect`, `connect_with_mode`, `accept` and
+  `accept_with_mode` behave as before (TCP, `TCP_NODELAY`, plaintext).
+  New `is_encrypted()`. The handshake code is shared, not changed.
+- `Cargo.toml`: dependency `num-bigint = "0.4"` (pure Rust).
 
 Nothing else is modified. Upgrading rbit means re-applying exactly these
 hunks, or checking that upstream fixed the same inputs.

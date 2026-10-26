@@ -133,6 +133,7 @@ mod hash_request;
 mod holepunch;
 mod message;
 mod metadata;
+pub mod mse;
 mod peer_id;
 mod piece;
 mod transport;
@@ -159,7 +160,8 @@ pub use metadata::{
 };
 pub use peer_id::PeerId;
 pub use piece::{Block, BlockRequest, PieceManager, BLOCK_SIZE, REQUEST_TIMEOUT};
-pub use transport::PeerTransport;
+pub use mse::{EncryptionPolicy, MseStream};
+pub use transport::{BoxedPeerStream, PeerStream, PeerTransport};
 
 #[cfg(test)]
 mod tests;

@@ -14,15 +14,27 @@ use templartorrent_core::{
 };
 use templartorrent_engine::{session::MAX_PIECE_LENGTH, worker::PieceVerifier};
 
-/// FileStore currently retains one handle per file. This explicit gate avoids
-/// pretending it already has the bounded handle cache required for huge jobs.
-pub const MAX_DRIVER_FILES: usize = 128;
+/// FileStore keeps one handle per real file for the job's life; storage
+/// admission also checks the process's open-file budget.
+pub const MAX_DRIVER_FILES: usize = 4096;
 pub const MAX_DRIVER_PIECES: usize = 262_144;
 
+/// A v1 torrent, or the v1 view of a hybrid one (BEP 52): v1 piece hashes,
+/// the v1 `files` list including BEP 47 pad files, and the SHA-1 info hash.
+/// Hybrid swarms are joined through that hash; v2 Merkle data is ignored.
 pub struct ValidatedV1 {
     pub(crate) meta: Metainfo,
     pub(crate) paths: Vec<(Vec<String>, u64)>,
+    /// `pads[i]` marks `paths[i]` as a BEP 47 pad file.
+    pub(crate) pads: Vec<bool>,
+    hash: [u8; 20],
     _permits: Vec<Permit>,
+}
+
+/// File list and pad flags from a v1 or hybrid info dictionary.
+pub(crate) struct Layout {
+    pub paths: Vec<(Vec<String>, u64)>,
+    pub pads: Vec<bool>,
 }
 
 fn text(value: &[u8]) -> Result<&str, &'static str> {
@@ -38,10 +50,17 @@ fn number(value: Option<&[u8]>) -> Result<u64, &'static str> {
 }
 
 pub(crate) fn layout(raw: &[u8]) -> Result<Vec<(Vec<String>, u64)>, &'static str> {
-    if preflight::field(raw, b"meta version").is_some()
-        || preflight::field(raw, b"file tree").is_some()
-    {
-        return Err("v2/hybrid torrents are not supported by this driver");
+    Ok(layout_with_pads(raw)?.paths)
+}
+
+/// Validate the v1 view of `raw`. A hybrid dictionary (meta version 2 with a
+/// file tree and v1 `pieces`) is read through its v1 keys; a pure v2 one,
+/// without `pieces`, is refused.
+pub(crate) fn layout_with_pads(raw: &[u8]) -> Result<Layout, &'static str> {
+    let v2 = preflight::field(raw, b"meta version").is_some()
+        || preflight::field(raw, b"file tree").is_some();
+    if v2 && preflight::field(raw, b"pieces").is_none() {
+        return Err("pure v2 torrents are not supported; hybrid and v1 torrents are");
     }
     let name = text(preflight::field(raw, b"name").ok_or("torrent name missing")?)?;
     validate_component(name).map_err(|_| "unsafe torrent name")?;
@@ -57,17 +76,23 @@ pub(crate) fn layout(raw: &[u8]) -> Result<Vec<(Vec<String>, u64)>, &'static str
     let lengths = preflight::field(raw, b"length");
     let files = preflight::field(raw, b"files");
     let mut paths = Vec::new();
+    let mut pads = Vec::new();
     match (lengths, files) {
-        (Some(length), None) => paths.push((vec![name.into()], number(Some(length))?)),
+        (Some(length), None) => {
+            paths.push((vec![name.into()], number(Some(length))?));
+            pads.push(false);
+        }
         (None, Some(files)) => {
             for file in preflight::list(files, MAX_DRIVER_FILES)? {
-                if preflight::field(file, b"attr").is_some()
-                    || preflight::field(file, b"symlink path").is_some()
-                {
-                    return Err(
-                        "file attributes require a capability this driver does not support",
-                    );
+                // BEP 47: p = pad, x = executable, h = hidden, l = symlink.
+                let attr = match preflight::field(file, b"attr") {
+                    Some(value) => text(value).map_err(|_| "invalid file attributes")?,
+                    None => "",
+                };
+                if attr.contains('l') || preflight::field(file, b"symlink path").is_some() {
+                    return Err("symlink entries are not supported");
                 }
+                pads.push(attr.contains('p'));
                 let mut components = vec![name.to_string()];
                 for component in preflight::list(
                     preflight::field(file, b"path").ok_or("file path missing")?,
@@ -89,7 +114,15 @@ pub(crate) fn layout(raw: &[u8]) -> Result<Vec<(Vec<String>, u64)>, &'static str
     let mut files = HashSet::new();
     let mut directories = HashSet::new();
     let mut total = 0u64;
-    for (components, length) in &paths {
+    for ((components, length), pad) in paths.iter().zip(&pads) {
+        if *pad {
+            // Pad files are never created, and creators reuse names such as
+            // `.pad/16384`, so they take part in no path check.
+            total = total
+                .checked_add(*length)
+                .ok_or("v1 total length overflow")?;
+            continue;
+        }
         RelativeFile::new(components.clone()).map_err(|_| "unsafe original path component")?;
         let key = components.join("/").to_ascii_lowercase();
         if directories.contains(&key) || !files.insert(key) {
@@ -115,7 +148,10 @@ pub(crate) fn layout(raw: &[u8]) -> Result<Vec<(Vec<String>, u64)>, &'static str
     {
         return Err("v1 piece hashes disagree with file sizes or exceed limits");
     }
-    Ok(paths)
+    if pads.iter().all(|pad| *pad) {
+        return Err("torrent has no real files");
+    }
+    Ok(Layout { paths, pads })
 }
 
 impl ValidatedV1 {
@@ -147,9 +183,11 @@ impl ValidatedV1 {
             return Err("torrent file exceeds 16 MiB limit");
         }
         let meta = Metainfo::from_bytes(bytes).map_err(|_| "invalid torrent file")?;
-        let InfoHash::V1(hash) = meta.info_hash else {
-            return Err("v2/hybrid torrents are not supported by this driver");
-        };
+        let hash = meta
+            .info_hash
+            .v1_hash()
+            .ok_or("pure v2 torrents are not supported; hybrid and v1 torrents are")?
+            .0;
         let raw_info = meta.raw_info().to_vec();
         let permit = budget
             .try_acquire(raw_info.len())
@@ -184,24 +222,38 @@ impl ValidatedV1 {
                 .try_acquire(additional)
                 .ok_or("metadata parse working set exceeds budget")?,
         );
-        let paths = layout(&raw_info)?;
+        let Layout { paths, pads } = layout_with_pads(&raw_info)?;
         let mut envelope = Vec::with_capacity(raw_info.len() + 8);
         envelope.extend_from_slice(b"d4:info");
         envelope.extend_from_slice(&raw_info);
         envelope.push(b'e');
         let meta = Metainfo::from_bytes(&envelope).map_err(|_| "invalid v1 metadata")?;
-        if !matches!(meta.info_hash, InfoHash::V1(h) if h == hash) || !meta.info.is_v1() {
-            return Err("v2/hybrid torrents are not supported by this driver");
+        if meta.info_hash.v1_hash().map(|h| h.0) != Some(hash)
+            || !matches!(meta.info_hash, InfoHash::V1(_) | InfoHash::Hybrid { .. })
+        {
+            return Err("pure v2 torrents are not supported; hybrid and v1 torrents are");
+        }
+        if meta.info.piece_count() != paths_pieces(&paths, meta.info.piece_length) {
+            return Err("v1 piece hashes disagree with file sizes or exceed limits");
         }
         Ok(Self {
             meta,
             paths,
+            pads,
+            hash,
             _permits: permits,
         })
     }
 
     pub fn name(&self) -> &str {
         &self.meta.info.name
+    }
+    /// The SHA-1 info hash peers and trackers use, for v1 and hybrid alike.
+    pub fn hash(&self) -> [u8; 20] {
+        self.hash
+    }
+    pub fn is_pad(&self, file: usize) -> bool {
+        self.pads.get(file).copied().unwrap_or(false)
     }
     pub fn is_private(&self) -> bool {
         self.meta.info.private
@@ -215,14 +267,22 @@ impl ValidatedV1 {
     pub fn files(&self) -> Vec<FileSpec> {
         self.paths
             .iter()
-            .map(|(parts, length)| FileSpec {
+            .zip(&self.pads)
+            .map(|((parts, length), pad)| FileSpec {
                 path: parts.join("/"),
                 length: *length,
-                wanted: true,
+                // Pad files are never fetched for their own sake: a piece
+                // is wanted only through the real files it overlaps.
+                wanted: !pad,
             })
             .collect()
     }
 }
+fn paths_pieces(paths: &[(Vec<String>, u64)], piece_length: u64) -> usize {
+    let total: u64 = paths.iter().map(|(_, length)| *length).sum();
+    total.div_ceil(piece_length.max(1)) as usize
+}
+
 impl PieceVerifier for ValidatedV1 {
     fn verify(&self, piece: u32, data: &[u8]) -> bool {
         self.meta

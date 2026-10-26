@@ -29,13 +29,16 @@ pub(super) fn plan(job: &JobFiles) -> Result<Vec<PlannedFile>, StorageError> {
     }
     let mut planned = Vec::with_capacity(job.files.len());
     for file in &job.files {
+        // Pad files were never created, so there is nothing to unlink.
+        let Some(handle) = &file.handle else {
+            continue;
+        };
         if file.path == job.root || !file.path.starts_with(&job.root) {
             return Err(StorageError::IdentityChanged {
                 path: file.path.display().to_string(),
             });
         }
-        let live = file
-            .handle
+        let live = handle
             .metadata()
             .map_err(|error| io_error(&file.path, error))?;
         let on_path = match std::fs::symlink_metadata(&file.path) {

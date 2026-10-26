@@ -8,8 +8,15 @@
 //! into rbit's [`AnnounceResponse`]. `https://` trackers use rustls 0.23.46
 //! with its aws-lc-rs provider. The certificate is checked against the webpki
 //! public roots and the name in the tracker URL. Ring is not linked.
+//!
+//! [`announce_tracker`] is the entry point every driver announce uses: it
+//! admits the URL, announces once per address family the host resolved to
+//! (one IPv4 and one IPv6 address at most, concurrently), over HTTP(S) or
+//! the UDP client in [`crate::udp_announce`], and merges the peers.
 
 use std::{
+    borrow::Cow,
+    future::Future,
     net::SocketAddr,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -24,14 +31,19 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 
-use crate::discovery::ParsedTracker;
+use crate::discovery::{ParsedTracker, TrackerScheme};
 
 /// Whole-announce deadline: connect, send, and read to EOF.
 pub const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest accepted HTTP response (headers plus body). A compact peer list
 /// for 200 peers is about 1.2 KiB; this leaves room for verbose trackers.
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-const MAX_PEERS: usize = 512;
+/// Most peers kept per address-family list of one response.
+pub const MAX_PEERS: usize = 512;
+/// How long the second address family may keep running once the first has
+/// succeeded. A blackholed family must not hold up a healthy announce for
+/// its whole transport deadline (the driver awaits announces inline).
+pub const FAMILY_GRACE: Duration = Duration::from_secs(3);
 
 pub struct AnnounceRequest<'a> {
     pub info_hash: &'a [u8; 20],
@@ -340,6 +352,166 @@ pub fn parse_announce_body(body: &[u8]) -> Result<AnnounceResponse, &'static str
     Ok(response)
 }
 
+/// Why an announce failed. `summary` is a fixed phrase for error values;
+/// `detail` is what the Trackers tab shows: one reason per address family
+/// tried, including a UDP tracker's own error message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnounceFailure {
+    pub summary: &'static str,
+    pub detail: String,
+}
+
+impl From<&'static str> for AnnounceFailure {
+    fn from(reason: &'static str) -> Self {
+        Self {
+            summary: reason,
+            detail: reason.to_string(),
+        }
+    }
+}
+
+/// A transport's reason for one family: fixed text, or a tracker message.
+pub type FamilyError = Cow<'static, str>;
+
+/// Admit `url` (resolve and classify every address, as at add time), then
+/// announce once per address family over the URL's scheme. The tracker is
+/// healthy when either family answered; the peers of both are merged.
+pub async fn announce_tracker(
+    url: &str,
+    allow_local: bool,
+    request: &AnnounceRequest<'_>,
+) -> Result<AnnounceResponse, AnnounceFailure> {
+    let admitted = crate::discovery::admit_tracker(url, allow_local).await?;
+    let addresses = admitted.connect_addresses();
+    let tracker = &admitted.tracker;
+    announce_per_family(&addresses, FAMILY_GRACE, |address| async move {
+        match tracker.scheme {
+            TrackerScheme::Udp => crate::udp_announce::announce(tracker, address, request).await,
+            TrackerScheme::Http | TrackerScheme::Https => announce(tracker, address, request)
+                .await
+                .map_err(Cow::Borrowed),
+        }
+    })
+    .await
+}
+
+/// Run `announce_one` for each of `addresses` (at most one per family is
+/// expected; only the first two are used) concurrently. After one succeeds
+/// the other gets at most `grace` more. Any success is merged into one
+/// response; otherwise every family's reason is reported.
+pub async fn announce_per_family<F, Fut>(
+    addresses: &[SocketAddr],
+    grace: Duration,
+    announce_one: F,
+) -> Result<AnnounceResponse, AnnounceFailure>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<AnnounceResponse, FamilyError>>,
+{
+    let outcomes: Vec<(SocketAddr, Result<AnnounceResponse, FamilyError>)> = match addresses {
+        [] => return Err("tracker host did not resolve".into()),
+        [only] => vec![(*only, announce_one(*only).await)],
+        [first, second, ..] => {
+            let a = announce_one(*first);
+            let b = announce_one(*second);
+            tokio::pin!(a);
+            tokio::pin!(b);
+            let (first_done, early) = tokio::select! {
+                outcome = &mut a => (true, outcome),
+                outcome = &mut b => (false, outcome),
+            };
+            let rest = if first_done { b.as_mut() } else { a.as_mut() };
+            let late = if early.is_ok() {
+                tokio::time::timeout(grace, rest)
+                    .await
+                    .unwrap_or(Err(Cow::Borrowed(
+                        "cut short after the other address family answered",
+                    )))
+            } else {
+                rest.await
+            };
+            if first_done {
+                vec![(*first, early), (*second, late)]
+            } else {
+                vec![(*first, late), (*second, early)]
+            }
+        }
+    };
+    let family = |address: &SocketAddr| if address.is_ipv4() { "IPv4" } else { "IPv6" };
+    let mut answered = Vec::new();
+    let mut failures = Vec::new();
+    for (address, outcome) in outcomes {
+        match outcome {
+            Ok(response) => answered.push(response),
+            Err(reason) => failures.push((family(&address), reason)),
+        }
+    }
+    if !answered.is_empty() {
+        return Ok(merge_responses(answered));
+    }
+    if failures.len() == 1
+        && let Some((_, reason)) = failures.pop()
+    {
+        let detail = reason.to_string();
+        let summary = match reason {
+            Cow::Borrowed(text) => text,
+            Cow::Owned(_) => "tracker reported an error",
+        };
+        return Err(AnnounceFailure { summary, detail });
+    }
+    let detail = failures
+        .iter()
+        .map(|(family, reason)| format!("{family}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(AnnounceFailure {
+        summary: "tracker announce failed on every address family",
+        detail,
+    })
+}
+
+/// One response from the answers of several address families. IPv4 peers go
+/// to `peers` and IPv6 peers to `peers6` whichever list carried them, each
+/// deduplicated and capped at [`MAX_PEERS`]. The shortest interval wins but
+/// never undercuts the longest minimum interval; counts take the maximum,
+/// since each family reports the same swarm.
+pub fn merge_responses(responses: Vec<AnnounceResponse>) -> AnnounceResponse {
+    let interval = responses
+        .iter()
+        .map(|response| response.interval)
+        .min()
+        .unwrap_or(0);
+    let min_interval = responses
+        .iter()
+        .filter_map(|response| response.min_interval)
+        .max();
+    let mut merged = AnnounceResponse::new(min_interval.map_or(interval, |m| interval.max(m)));
+    merged.min_interval = min_interval;
+    merged.complete = responses
+        .iter()
+        .filter_map(|response| response.complete)
+        .max();
+    merged.incomplete = responses
+        .iter()
+        .filter_map(|response| response.incomplete)
+        .max();
+    for response in responses {
+        merged.warning_message = merged.warning_message.or(response.warning_message);
+        merged.tracker_id = merged.tracker_id.or(response.tracker_id);
+        for address in response.peers.into_iter().chain(response.peers6) {
+            let list = if address.is_ipv4() {
+                &mut merged.peers
+            } else {
+                &mut merged.peers6
+            };
+            if list.len() < MAX_PEERS && !list.contains(&address) {
+                list.push(address);
+            }
+        }
+    }
+    merged
+}
+
 fn percent_encode_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(bytes.len() * 3);
@@ -618,5 +790,244 @@ mod tests {
                 .unwrap_err()
                 .contains("dictionary")
         );
+    }
+
+    fn answer(interval: u32, peers: &[&str]) -> AnnounceResponse {
+        let mut response = AnnounceResponse::new(interval);
+        response.peers = peers.iter().map(|peer| peer.parse().unwrap()).collect();
+        response
+    }
+
+    const V4: &str = "1.1.1.1:6969";
+    const V6: &str = "[2001:db8::1]:6969";
+
+    fn both() -> [SocketAddr; 2] {
+        [V4.parse().unwrap(), V6.parse().unwrap()]
+    }
+
+    #[test]
+    fn merged_responses_sort_peers_by_family_dedupe_and_respect_intervals() {
+        let mut v4 = answer(1800, &["10.0.0.1:1", "10.0.0.2:2"]);
+        v4.min_interval = Some(900);
+        v4.complete = Some(4);
+        // An HTTP tracker over IPv6 can list both families in `peers`.
+        let mut v6 = answer(600, &["10.0.0.2:2", "[2001:db8::9]:3"]);
+        v6.peers6 = vec!["[2001:db8::9]:3".parse().unwrap()];
+        v6.incomplete = Some(25);
+        v6.complete = Some(2);
+        let merged = merge_responses(vec![v4, v6]);
+        assert_eq!(merged.interval, 900, "shortest interval, floored at min");
+        assert_eq!(merged.min_interval, Some(900));
+        assert_eq!((merged.complete, merged.incomplete), (Some(4), Some(25)));
+        assert_eq!(
+            merged.peers,
+            vec![
+                "10.0.0.1:1".parse::<SocketAddr>().unwrap(),
+                "10.0.0.2:2".parse().unwrap()
+            ]
+        );
+        assert_eq!(merged.peers6, vec!["[2001:db8::9]:3".parse().unwrap()]);
+        let many: Vec<String> = (0..MAX_PEERS + 5)
+            .map(|port| format!("10.1.0.1:{}", port + 1))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let merged = merge_responses(vec![answer(60, &refs), answer(60, &refs)]);
+        assert_eq!(merged.peers.len(), MAX_PEERS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_family_failing_leaves_the_tracker_healthy() {
+        let response = announce_per_family(&both(), FAMILY_GRACE, |address| async move {
+            if address.is_ipv4() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Err(Cow::Borrowed("tracker connection failed"))
+            } else {
+                Ok(answer(60, &["[2001:db8::7]:1"]))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.peers6.len(), 1);
+        assert!(response.peers.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_family_failing_reports_each_reason() {
+        let failure = announce_per_family(&both(), FAMILY_GRACE, |address| async move {
+            if address.is_ipv4() {
+                Err(Cow::Borrowed("tracker connection failed"))
+            } else {
+                Err(Cow::Owned("tracker error: not registered".to_string()))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            failure.summary,
+            "tracker announce failed on every address family"
+        );
+        assert_eq!(
+            failure.detail,
+            "IPv4: tracker connection failed; IPv6: tracker error: not registered"
+        );
+        let only = [V6.parse().unwrap()];
+        let failure = announce_per_family(&only, FAMILY_GRACE, |_| async {
+            Err(Cow::Owned("tracker error: banned".to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(failure.summary, "tracker reported an error");
+        assert_eq!(failure.detail, "tracker error: banned");
+        let failure = announce_per_family(&[], FAMILY_GRACE, |_| async { Ok(answer(60, &[])) })
+            .await
+            .unwrap_err();
+        assert_eq!(failure.summary, "tracker host did not resolve");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_family_is_cut_after_the_grace_once_the_other_answers() {
+        let started = tokio::time::Instant::now();
+        let response = announce_per_family(&both(), FAMILY_GRACE, |address| async move {
+            if address.is_ipv4() {
+                Ok(answer(60, &["10.0.0.1:1"]))
+            } else {
+                std::future::pending().await
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), FAMILY_GRACE);
+        assert_eq!(response.peers.len(), 1);
+        // A family that answers inside the grace is merged in.
+        let response = announce_per_family(&both(), FAMILY_GRACE, |address| async move {
+            if address.is_ipv4() {
+                Ok(answer(60, &["10.0.0.1:1"]))
+            } else {
+                tokio::time::sleep(FAMILY_GRACE / 2).await;
+                Ok(answer(60, &["[2001:db8::7]:1"]))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((response.peers.len(), response.peers6.len()), (1, 1));
+    }
+
+    /// The same port on 127.0.0.1 and ::1, so `localhost` reaches both.
+    async fn dual_stack_udp(
+        fault: crate::udp_announce::fixture::Fault,
+    ) -> Option<[crate::udp_announce::fixture::Tracker; 2]> {
+        use crate::udp_announce::fixture::start;
+        for _ in 0..20 {
+            let v4 = start("127.0.0.1:0".parse().unwrap(), fault).await?;
+            let v6_bind = SocketAddr::new("::1".parse().unwrap(), v4.address.port());
+            if let Some(v6) = start(v6_bind, fault).await {
+                return Some([v4, v6]);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn udp_localhost_announces_over_both_families_and_merges_peers() {
+        use crate::udp_announce::fixture::{Fault, peer_for};
+        let Some([v4, v6]) = dual_stack_udp(Fault::None).await else {
+            eprintln!("skipping: no ::1 on this host");
+            return;
+        };
+        let url = format!("udp://localhost:{}/announce", v4.address.port());
+        let hash = [3u8; 20];
+        let id = [4u8; 20];
+        let refused = announce_tracker(&url, false, &request(&hash, &id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.summary,
+            "tracker resolves to a local or private address"
+        );
+        let response = announce_tracker(&url, true, &request(&hash, &id))
+            .await
+            .unwrap();
+        assert_eq!(response.peers, vec![peer_for(v4.address, 0)]);
+        assert_eq!(response.peers6, vec![peer_for(v6.address, 0)]);
+        assert_eq!((v4.announces(), v6.announces()), (1, 1));
+        assert_eq!((response.complete, response.incomplete), (Some(3), Some(4)));
+    }
+
+    #[tokio::test]
+    async fn udp_errors_on_both_families_are_reported_per_family() {
+        use crate::udp_announce::fixture::Fault;
+        let Some([v4, _v6]) = dual_stack_udp(Fault::Error).await else {
+            eprintln!("skipping: no ::1 on this host");
+            return;
+        };
+        let url = format!("udp://localhost:{}", v4.address.port());
+        let hash = [3u8; 20];
+        let id = [4u8; 20];
+        let failure = announce_tracker(&url, true, &request(&hash, &id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.detail,
+            "IPv4: tracker error: torrent not registered; IPv6: tracker error: torrent not registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_localhost_announces_over_both_families() {
+        async fn serve(listener: tokio::net::TcpListener, body: &'static [u8]) {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut got = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !got.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        }
+        let mut pair = None;
+        for _ in 0..20 {
+            let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = v4.local_addr().unwrap().port();
+            match tokio::net::TcpListener::bind(("::1", port)).await {
+                Ok(v6) => {
+                    pair = Some((v4, v6));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(_) => break,
+            }
+        }
+        let Some((v4, v6)) = pair else {
+            eprintln!("skipping: no ::1 on this host");
+            return;
+        };
+        let port = v4.local_addr().unwrap().port();
+        // Dictionary peers, the way the Ubuntu tracker answers.
+        let a = tokio::spawn(serve(
+            v4,
+            b"d8:intervali1800e5:peersld2:ip8:10.0.0.14:porti1eeee",
+        ));
+        let b = tokio::spawn(serve(
+            v6,
+            b"d8:intervali1800e5:peersld2:ip8:10.0.0.14:porti1eed2:ip13:2001:db8::1:24:porti2eeee",
+        ));
+        let hash = [3u8; 20];
+        let id = [4u8; 20];
+        let url = format!("http://localhost:{port}/announce");
+        let response = announce_tracker(&url, true, &request(&hash, &id))
+            .await
+            .unwrap();
+        assert_eq!(response.peers, vec!["10.0.0.1:1".parse().unwrap()]);
+        assert_eq!(response.peers6, vec!["[2001:db8::1:2]:2".parse().unwrap()]);
+        a.abort();
+        b.abort();
     }
 }

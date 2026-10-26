@@ -19,6 +19,9 @@ use templartorrent::workflow::{
 use templartorrent_core::model::Limits;
 
 fn main() {
+    // Each real torrent file keeps a handle open; storage admission checks
+    // the budget this leaves.
+    templartorrent_storage::raise_open_file_limit();
     let launch = match workflow::parse_args(std::env::args().skip(1)) {
         Ok(launch) => launch,
         Err(error) => {
@@ -69,7 +72,7 @@ fn run(launch: Launch) -> Result<(), String> {
         public_trackers: load_public_trackers(&tracker_path),
         public_tracker_path: tracker_path,
         geo_db_path: geo::resolve_db_path(geoip_db.as_deref()),
-        listen: "0.0.0.0:0"
+        listen: "[::]:0"
             .parse()
             .map_err(|_| "the listen address is invalid".to_string())?,
         session_dir: Some(session_dir),

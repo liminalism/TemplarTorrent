@@ -25,6 +25,7 @@ use crate::workflow::{
     country_text, eta_text, format_bytes, move_file, preference_text, rank_label, rate_text,
     rtt_text, speed_cap, validate_destination, validate_magnet,
 };
+use templartorrent_rbit_adapter::driver::PeerEncryption;
 
 const BG: u32 = 0xf4f4f2;
 const PANEL: u32 = 0xffffff;
@@ -211,6 +212,10 @@ struct RemoveDialog {
 
 struct SettingsDialog {
     allow_local: bool,
+    encryption: PeerEncryption,
+    port: TextFieldState,
+    bound_port: u16,
+    error: String,
 }
 
 enum Dialog {
@@ -740,8 +745,16 @@ impl Desktop {
     }
 
     fn open_settings(&mut self, view: &SessionView) {
+        let bound_port = match &view.listen {
+            ListenState::Bound(address) => address.port(),
+            _ => 0,
+        };
         self.dialog = Dialog::Settings(Box::new(SettingsDialog {
             allow_local: view.allow_local_trackers,
+            encryption: view.encryption,
+            port: TextFieldState::with_text(bound_port.to_string()),
+            bound_port,
+            error: String::new(),
         }));
     }
 
@@ -1297,10 +1310,12 @@ impl Desktop {
             );
             return;
         }
-        let heights = vec![s.px(28); view.files.len()];
+        // Pad files only align real files to pieces; they are not listed.
+        let files: Vec<&FileRow> = view.files.iter().filter(|file| !file.pad).collect();
+        let heights = vec![s.px(28); files.len()];
         let mut toggle = None;
         let mut pick = None;
-        let files = &view.files;
+        let files = &files;
         let pick_now = self.file_pick;
         let narrow = list.w < s.px(520);
         ui.scroll_list(&mut self.file_scroll, list, &heights, |ui, index, rect| {
@@ -2099,7 +2114,7 @@ impl Desktop {
         body: &TextStyle,
         small: &TextStyle,
     ) {
-        let inner = centered_panel(ui, s, width, height, 640, 360);
+        let inner = centered_panel(ui, s, width, height, 640, 460);
         let Dialog::Settings(dialog) = &mut self.dialog else {
             return;
         };
@@ -2140,6 +2155,56 @@ impl Desktop {
             Rect::new(inner.x, inner.y + s.px(168), s.px(180), s.px(28)),
             "Reload tracker list",
         );
+        ui.label_styled(
+            Rect::new(inner.x, inner.y + s.px(212), inner.w, s.px(20)),
+            "Listen port (TCP, IPv4 and IPv6). A change applies after a restart.",
+            *small,
+            MUTED,
+            Align::Left,
+        );
+        ui.text_field(
+            &mut dialog.port,
+            Rect::new(inner.x, inner.y + s.px(236), s.px(120), s.px(26)),
+            "",
+            true,
+            false,
+        );
+        ui.label_styled(
+            Rect::new(inner.x, inner.y + s.px(270), inner.w, s.px(40)),
+            &format!(
+                "{}. DHT: {}. No UPnP or NAT-PMP: forward this port on your router to accept incoming peers.",
+                listen_text(&view.listen),
+                view.dht_nodes
+                    .map_or("off".to_string(), |nodes| format!("{nodes} nodes")),
+            ),
+            *small,
+            MUTED,
+            Align::Left,
+        );
+        let cycle = ui.button(
+            Rect::new(inner.x, inner.y + s.px(318), s.px(300), s.px(28)),
+            match dialog.encryption {
+                PeerEncryption::PreferEncrypted => "Encryption: prefer encrypted",
+                PeerEncryption::RequireEncrypted => "Encryption: require encrypted",
+                PeerEncryption::PlaintextOnly => "Encryption: plaintext only",
+            },
+        );
+        if cycle {
+            dialog.encryption = match dialog.encryption {
+                PeerEncryption::PreferEncrypted => PeerEncryption::RequireEncrypted,
+                PeerEncryption::RequireEncrypted => PeerEncryption::PlaintextOnly,
+                PeerEncryption::PlaintextOnly => PeerEncryption::PreferEncrypted,
+            };
+        }
+        if !dialog.error.is_empty() {
+            ui.label_styled(
+                Rect::new(inner.x, inner.y + s.px(354), inner.w, s.px(20)),
+                &dialog.error,
+                *small,
+                INK,
+                Align::Left,
+            );
+        }
         let apply = ui.button(
             Rect::new(inner.x, inner.y + inner.h - s.px(36), s.px(120), s.px(28)),
             "Apply",
@@ -2154,6 +2219,9 @@ impl Desktop {
             "Close",
         );
         let allow = dialog.allow_local;
+        let encryption = dialog.encryption;
+        let port_text = dialog.port.text().trim().to_string();
+        let bound_port = dialog.bound_port;
         if reload {
             if self.client.try_request(Request::ReloadTrackers).is_ok() {
                 self.status = "Reloaded the public tracker list.".into();
@@ -2161,6 +2229,29 @@ impl Desktop {
                 self.status = "command queue is full".into();
             }
         } else if apply {
+            let port = match port_text.parse::<u16>() {
+                Ok(port) if port >= 1024 => port,
+                _ => {
+                    if let Dialog::Settings(dialog) = &mut self.dialog {
+                        dialog.error = "Listen port must be 1024 to 65535.".into();
+                    }
+                    return;
+                }
+            };
+            if (encryption != view.encryption
+                && self
+                    .client
+                    .try_request(Request::SetEncryption(encryption))
+                    .is_err())
+                || (port != bound_port
+                    && self
+                        .client
+                        .try_request(Request::SetListenPort(port))
+                        .is_err())
+            {
+                self.status = "command queue is full".into();
+                return;
+            }
             if self.client.try_request(Request::AllowLocal(allow)).is_ok() {
                 self.status = if allow {
                     "Local trackers are allowed for the next magnet.".into()

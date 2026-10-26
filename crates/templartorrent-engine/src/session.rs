@@ -712,6 +712,21 @@ impl Session {
         Ok(())
     }
 
+    /// Diagnostics for one job: leased pieces, requests in flight across its
+    /// peers, peers choking us, and pieces still pickable.
+    pub fn lease_stats(&self, torrent: TorrentId) -> Option<(usize, usize, usize, usize)> {
+        let job = self.jobs.iter().find(|job| job.id == torrent)?;
+        Some((
+            job.coordinator.outstanding_len(),
+            job.peers.values().map(|actor| actor.in_flight()).sum(),
+            job.peers
+                .values()
+                .filter(|actor| !actor.is_productive())
+                .count(),
+            job.coordinator.pickable_len(),
+        ))
+    }
+
     pub fn peer_pipeline(&self, torrent: TorrentId, peer: PeerId) -> Result<usize, EngineError> {
         let job = self
             .jobs
@@ -922,7 +937,16 @@ impl Session {
                     name: Arc::clone(&job.name),
                     state: job.state,
                     wanted_bytes: wanted,
-                    verified_bytes: sequence.file_verified_bytes().iter().sum(),
+                    // Same files as `wanted_bytes`, so progress never passes
+                    // 100% through deselected files or BEP 47 pad files that
+                    // share a verified piece.
+                    verified_bytes: sequence
+                        .files()
+                        .iter()
+                        .zip(sequence.file_verified_bytes())
+                        .filter(|(file, _)| file.wanted)
+                        .map(|(_, bytes)| *bytes)
+                        .sum(),
                     total_payload_downloaded: job.downloaded_bytes,
                     total_payload_uploaded: job.uploaded_bytes,
                     down_bps: 0,

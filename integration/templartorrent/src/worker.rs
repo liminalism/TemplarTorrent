@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use templartorrent_core::model::{Command, JobState, Limits, PeerPreference, Snapshot, TorrentId};
-use templartorrent_rbit_adapter::driver::{Driver, ExistingData};
+use templartorrent_rbit_adapter::driver::{Driver, ExistingData, PeerEncryption};
 use tokio::sync::{mpsc, watch};
 
 use crate::geo::GeoDb;
@@ -54,6 +54,8 @@ pub struct FileRow {
     pub verified_bytes: u64,
     pub wanted: bool,
     pub rank: u32,
+    /// BEP 47 pad file: kept for the order permutation, never shown.
+    pub pad: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,9 @@ pub struct SessionView {
     pub public_tracker_count: usize,
     pub public_tracker_path: String,
     pub note: Option<String>,
+    /// DHT routing-table size; `None` when the DHT is off or failed.
+    pub dht_nodes: Option<usize>,
+    pub encryption: PeerEncryption,
 }
 
 impl SessionView {
@@ -135,6 +140,8 @@ impl SessionView {
             public_tracker_count: 0,
             public_tracker_path,
             note: None,
+            dht_nodes: None,
+            encryption: PeerEncryption::default(),
         }
     }
 }
@@ -159,6 +166,8 @@ struct Visible {
     allow_local_trackers: bool,
     public_tracker_count: usize,
     note: Option<String>,
+    dht_nodes: Option<usize>,
+    encryption: PeerEncryption,
 }
 
 pub fn same_visible(left: &SessionView, right: &SessionView) -> bool {
@@ -227,6 +236,8 @@ fn visible(view: &SessionView) -> Visible {
         allow_local_trackers: view.allow_local_trackers,
         public_tracker_count: view.public_tracker_count,
         note: view.note.clone(),
+        dht_nodes: view.dht_nodes,
+        encryption: view.encryption,
     }
 }
 
@@ -242,11 +253,27 @@ pub struct WorkerConfig {
 }
 
 pub enum Request {
-    Command { seq: u64, command: Command },
-    ListDir { seq: u64, path: PathBuf },
-    ReadTorrent { seq: u64, path: PathBuf },
-    Space { seq: u64, path: PathBuf },
+    Command {
+        seq: u64,
+        command: Command,
+    },
+    ListDir {
+        seq: u64,
+        path: PathBuf,
+    },
+    ReadTorrent {
+        seq: u64,
+        path: PathBuf,
+    },
+    Space {
+        seq: u64,
+        path: PathBuf,
+    },
     AllowLocal(bool),
+    /// Save a new listen port; the listener rebinds on the next launch.
+    SetListenPort(u16),
+    /// Apply and save the MSE/PE policy for new connections.
+    SetEncryption(PeerEncryption),
     ReloadTrackers,
 }
 
@@ -363,6 +390,36 @@ struct Memory {
     store: Option<SessionStore>,
     resume_flushed_at: Instant,
     resume_verified: u64,
+    /// Saved peer listen port; 0 until a port is chosen.
+    listen_port: u16,
+    encryption: PeerEncryption,
+    /// `.torrent` files the Add dialog read, keyed by the magnet it was shown.
+    /// Adding that magnet uses these bytes, so no metadata is fetched.
+    torrent_files: std::collections::VecDeque<(String, Vec<u8>)>,
+}
+
+/// `.torrent` files kept between reading and Add.
+const TORRENT_FILE_CACHE: usize = 4;
+
+/// The listen address for this launch. An explicit port wins; otherwise the
+/// saved port; otherwise, for an unspecified (production) address, a random
+/// port from the dynamic range, saved by the caller. Loopback test configs
+/// keep port 0.
+fn choose_listen(config: SocketAddr, saved: u16) -> SocketAddr {
+    if config.port() != 0 {
+        return config;
+    }
+    if saved != 0 {
+        return SocketAddr::new(config.ip(), saved);
+    }
+    if !config.ip().is_unspecified() {
+        return config;
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    let port = 49_152 + (hasher.finish() % 16_000) as u16;
+    SocketAddr::new(config.ip(), port)
 }
 
 async fn run_session(
@@ -383,16 +440,35 @@ async fn run_session(
         store: config.session_dir.clone().map(SessionStore::new),
         resume_flushed_at: Instant::now(),
         resume_verified: 0,
+        listen_port: 0,
+        encryption: PeerEncryption::default(),
+        torrent_files: std::collections::VecDeque::new(),
     };
+    let saved_port = memory
+        .store
+        .as_ref()
+        .and_then(|store| store.load_settings().ok().flatten())
+        .map_or(0, |settings| settings.listen_port);
+    let listen = choose_listen(config.listen, saved_port);
     let mut engine = match Driver::new(config.limits) {
         Ok(mut driver) => {
             driver.set_allow_local_trackers(config.allow_local_trackers);
             driver.set_public_trackers(config.public_trackers);
-            match driver.listen(config.listen).await {
-                Ok(_) => Engine::Live {
-                    driver: Box::new(driver),
-                    listen_error: None,
-                },
+            match driver.listen(listen).await {
+                Ok(bound) => {
+                    if config.listen.ip().is_unspecified() {
+                        memory.listen_port = bound.port();
+                        // Production only: loopback test sessions never
+                        // contact the public DHT.
+                        if let Err(error) = driver.enable_dht(bound.port()).await {
+                            memory.note = Some(format!("DHT unavailable: {}", error.0));
+                        }
+                    }
+                    Engine::Live {
+                        driver: Box::new(driver),
+                        listen_error: None,
+                    }
+                }
                 Err(error) => Engine::Live {
                     driver: Box::new(driver),
                     listen_error: Some(error.0.to_string()),
@@ -403,6 +479,14 @@ async fn run_session(
     };
     let mut last = publish(&mut engine, &mut memory, &shared);
     restore_session(&mut engine, &mut memory).await;
+    // Keep the first launch's port, so a router forward stays valid.
+    if memory.listen_port != 0
+        && memory.listen_port != saved_port
+        && let Engine::Live { driver, .. } = &engine
+        && let Err(error) = save_settings(driver, &memory)
+    {
+        memory.note = Some(format!("session not saved: {error}"));
+    }
     loop {
         if *stop.borrow() {
             break;
@@ -465,6 +549,8 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
         Ok(Some(settings)) => {
             memory.allow_local = settings.allow_local_trackers;
             driver.set_allow_local_trackers(settings.allow_local_trackers);
+            memory.encryption = settings.encryption;
+            driver.set_peer_encryption(settings.encryption);
             if driver.set_limits(settings.limits).await.is_err() {
                 notes.push("saved limits were rejected".to_string());
             }
@@ -572,6 +658,8 @@ fn save_settings(driver: &Driver, memory: &Memory) -> Result<(), String> {
     store.save_settings(&Settings {
         limits: driver.limits().clone(),
         allow_local_trackers: memory.allow_local,
+        listen_port: memory.listen_port,
+        encryption: memory.encryption,
     })
 }
 
@@ -662,6 +750,8 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
             public_tracker_count: memory.public_trackers.len(),
             public_tracker_path: path,
             note: Some((*reason).to_string()),
+            dht_nodes: None,
+            encryption: memory.encryption,
         },
         Engine::Live {
             driver,
@@ -705,6 +795,8 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
                 public_tracker_count: memory.public_trackers.len(),
                 public_tracker_path: path,
                 note: memory.note.clone(),
+                dht_nodes: driver.dht_nodes(),
+                encryption: memory.encryption,
             }
         }
     }
@@ -759,6 +851,7 @@ fn file_rows(driver: &Driver, id: TorrentId) -> Vec<FileRow> {
             verified_bytes: file.verified_bytes,
             wanted: file.wanted,
             rank: file.rank,
+            pad: driver.is_pad_file(id, index),
         })
         .collect()
 }
@@ -816,7 +909,15 @@ async fn dispatch(
                 (Command::Remove { id, .. }, Engine::Live { driver, .. }) => driver.info_hash(*id),
                 _ => None,
             };
-            let result = run_command(engine, shared, &command).await;
+            let torrent = match &command {
+                Command::Add { source, .. } => memory
+                    .torrent_files
+                    .iter()
+                    .find(|(magnet, _)| magnet == source)
+                    .map(|(_, bytes)| bytes.clone()),
+                _ => None,
+            };
+            let result = run_command(engine, shared, &command, torrent.as_deref()).await;
             if let Ok(added) = &result {
                 persist_after(engine, memory, &command, *added, removed);
             }
@@ -853,7 +954,14 @@ async fn dispatch(
         }
         Request::ReadTorrent { seq, path } => {
             let (accepted, message, magnet) = match read_torrent(&path) {
-                Ok(magnet) => (true, String::new(), Some(magnet)),
+                Ok((magnet, bytes)) => {
+                    memory.torrent_files.retain(|(known, _)| *known != magnet);
+                    if memory.torrent_files.len() >= TORRENT_FILE_CACHE {
+                        memory.torrent_files.pop_front();
+                    }
+                    memory.torrent_files.push_back((magnet.clone(), bytes));
+                    (true, String::new(), Some(magnet))
+                }
                 Err(message) => (false, message, None),
             };
             push_ack(
@@ -893,6 +1001,26 @@ async fn dispatch(
             }
             false
         }
+        Request::SetEncryption(encryption) => {
+            memory.encryption = encryption;
+            if let Engine::Live { driver, .. } = engine {
+                driver.set_peer_encryption(encryption);
+                if let Err(error) = save_settings(driver, memory) {
+                    memory.note = Some(format!("session not saved: {error}"));
+                }
+            }
+            false
+        }
+        Request::SetListenPort(port) => {
+            memory.listen_port = port;
+            if let Engine::Live { driver, .. } = engine {
+                memory.note = Some(match save_settings(driver, memory) {
+                    Ok(()) => format!("Listen port {port} applies after a restart."),
+                    Err(error) => format!("session not saved: {error}"),
+                });
+            }
+            false
+        }
         Request::ReloadTrackers => {
             memory.public_trackers = workflow::load_public_trackers(&memory.public_path);
             if let Engine::Live { driver, .. } = engine {
@@ -904,10 +1032,13 @@ async fn dispatch(
 }
 
 /// `Ok(Some(id))` only for an accepted Add, so the new job can be saved.
+/// `torrent` holds the `.torrent` bytes behind an Add's magnet when the Add
+/// dialog read a file; the job is then added from them without BEP-9.
 async fn run_command(
     engine: &mut Engine,
     shared: &Shared,
     command: &Command,
+    torrent: Option<&[u8]>,
 ) -> Result<Option<TorrentId>, String> {
     let Engine::Live { driver, .. } = engine else {
         return Err("the session driver did not start".into());
@@ -925,6 +1056,13 @@ async fn run_command(
             } else {
                 ExistingData::Refuse
             };
+            if let Some(bytes) = torrent {
+                return driver
+                    .add_torrent(bytes, destination, existing)
+                    .await
+                    .map(Some)
+                    .map_err(|error| error.0.to_string());
+            }
             return driver
                 .add_magnet_with_discovery(
                     source,
@@ -1005,7 +1143,7 @@ fn list_dir(path: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn read_torrent(path: &Path) -> Result<String, String> {
+fn read_torrent(path: &Path) -> Result<(String, Vec<u8>), String> {
     let torrent = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1024,7 +1162,8 @@ fn read_torrent(path: &Path) -> Result<String, String> {
     if bytes.len() > 16 * 1024 * 1024 {
         return Err("torrent file exceeds 16 MiB limit".into());
     }
-    Driver::magnet_from_torrent_bytes(&bytes).map_err(|error| error.0.to_string())
+    let magnet = Driver::magnet_from_torrent_bytes(&bytes).map_err(|error| error.0.to_string())?;
+    Ok((magnet, bytes))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1108,6 +1247,9 @@ mod tests {
             store: None,
             resume_flushed_at: Instant::now(),
             resume_verified: 0,
+            listen_port: 0,
+            encryption: PeerEncryption::default(),
+            torrent_files: std::collections::VecDeque::new(),
         };
         let shared = Shared {
             view: Arc::new(Mutex::new(SessionView::idle(
@@ -1244,6 +1386,8 @@ mod tests {
                     ..Limits::default()
                 },
                 allow_local_trackers: true,
+                listen_port: 0,
+                encryption: PeerEncryption::default(),
             })
             .unwrap();
         store

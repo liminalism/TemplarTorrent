@@ -1045,13 +1045,15 @@ fn parse_info_hybrid(value: &Value, piece_layers: PieceLayers) -> Result<Info, M
     // Validate hybrid torrent consistency per BEP-52:
     // The v1 and v2 parts must describe identical content
 
-    // 1. Validate v1 piece count matches total length
-    let expected_v1_pieces = if total_length == 0 {
-        0
-    } else {
-        total_length.div_ceil(piece_length) as usize
-    };
-    if v1_pieces.len() != expected_v1_pieces {
+    // 1. Validate the v1 piece count. Every non-empty file starts on a piece
+    //    boundary (v1 carries pad files between them), so the v1 stream holds
+    //    each file's own piece count, not total_length / piece_length.
+    let expected_v1_pieces: u64 = files
+        .iter()
+        .filter(|f| f.length > 0)
+        .map(|f| f.length.div_ceil(piece_length))
+        .sum();
+    if v1_pieces.len() as u64 != expected_v1_pieces {
         return Err(MetainfoError::InvalidField(
             "hybrid: v1 piece count doesn't match total length",
         ));

@@ -20,6 +20,7 @@ templartorrent-rbit-adapter = { path = "../integration/rbit-adapter" }
 templartorrent = { path = "../integration/templartorrent" }
 templartorrent-core = { path = "../crates/templartorrent-core" }
 templartorrent-engine = { path = "../crates/templartorrent-engine" }
+tokio = { version = "1", features = ["rt", "io-util", "macros"] }
 
 [workspace]
 members = ["."]
@@ -75,6 +76,27 @@ bench = false
 [[bin]]
 name = "engine_session"
 path = "fuzz_targets/engine_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_tracker_response"
+path = "fuzz_targets/udp_tracker_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mse_handshake"
+path = "fuzz_targets/mse_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pex_and_dht"
+path = "fuzz_targets/pex_and_dht.rs"
 test = false
 doc = false
 bench = false

@@ -6,9 +6,11 @@ pub mod announce;
 pub mod discovery;
 pub mod driver;
 pub mod metadata;
+pub mod pex;
 mod preflight;
 pub mod resume;
 pub mod torrent;
+pub mod udp_announce;
 use rbit::{
     AnnounceResponse, Block, BlockRequest, ExtensionHandshake, MagnetLink, Message, Metainfo,
     PeerConnection, PeerError,

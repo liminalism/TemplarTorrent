@@ -20,11 +20,16 @@ use super::node_id_security::{
 };
 use super::routing::RoutingTable;
 
-const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+// Mainline nodes answer in well under a second or not at all; a long
+// per-query wait only stretches every lookup wave.
+const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_PENDING_QUERIES: usize = 100;
-const DHT_ALPHA: usize = 3;
+const DHT_ALPHA: usize = 8;
 const DHT_MAX_ITERATIONS: usize = 10;
 const MAX_PEERS_PER_TORRENT: usize = 1000;
+/// Info hashes the announce store keeps. Tokens are free to obtain, so
+/// without this a remote node could grow the store without bound.
+const MAX_STORED_TORRENTS: usize = 1024;
 const PEER_ANNOUNCE_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 pub const BOOTSTRAP_NODES: &[&str] = &[
@@ -50,9 +55,19 @@ impl PeerStore {
     }
 
     fn add_peer(&mut self, info_hash: [u8; 20], addr: SocketAddr) {
+        let now = Instant::now();
+        if !self.peers.contains_key(&info_hash) && self.peers.len() >= MAX_STORED_TORRENTS {
+            // Drop expired entries first; if every slot is live, refuse.
+            self.peers.retain(|_, peers| {
+                peers.retain(|p| now.duration_since(p.announced_at) < PEER_ANNOUNCE_LIFETIME);
+                !peers.is_empty()
+            });
+            if self.peers.len() >= MAX_STORED_TORRENTS {
+                return;
+            }
+        }
         let peers = self.peers.entry(info_hash).or_default();
 
-        let now = Instant::now();
         peers.retain(|p| now.duration_since(p.announced_at) < PEER_ANNOUNCE_LIFETIME);
         peers.retain(|p| p.addr != addr);
 
@@ -331,81 +346,59 @@ impl DhtServer {
 
         let mut peers = Vec::new();
         let mut queried = std::collections::HashSet::new();
-        let mut to_query: Vec<Node> = self.routing_table.find_closest(&target, 8);
+        // Every node seen so far, so a wave that returns nothing new still
+        // leaves the next-closest unqueried nodes to ask.
+        let mut shortlist: Vec<Node> = self.routing_table.find_closest(&target, 16);
 
         for _ in 0..DHT_MAX_ITERATIONS {
-            if to_query.is_empty() {
+            shortlist.sort_by(|a, b| a.id.distance(&target).cmp(&b.id.distance(&target)));
+            shortlist.dedup_by(|a, b| a.id == b.id);
+            shortlist.truncate(64);
+
+            let nodes_to_query: Vec<Node> = shortlist
+                .iter()
+                .filter(|node| !queried.contains(&node.id))
+                .take(DHT_ALPHA)
+                .cloned()
+                .collect();
+            if nodes_to_query.is_empty() {
                 break;
             }
-
-            to_query.sort_by(|a, b| {
-                let dist_a = a.id.distance(&target);
-                let dist_b = b.id.distance(&target);
-                dist_a.cmp(&dist_b)
-            });
-
             let mut queries = Vec::new();
-            let mut nodes_to_query = Vec::new();
-
-            for node in to_query.iter() {
-                if !queried.contains(&node.id) && queries.len() < DHT_ALPHA {
-                    queried.insert(node.id);
-                    nodes_to_query.push(node.clone());
-
-                    let tid = self.generate_transaction_id();
-                    let our_id = self.our_id();
-                    let msg = DhtMessage::get_peers(tid.clone(), &our_id, info_hash);
-                    queries.push(self.send_query(node.addr, msg, tid));
-                }
-            }
-
-            if queries.is_empty() {
-                break;
+            for node in &nodes_to_query {
+                queried.insert(node.id);
+                let tid = self.generate_transaction_id();
+                let our_id = self.our_id();
+                let msg = DhtMessage::get_peers(tid.clone(), &our_id, info_hash);
+                queries.push(self.send_query(node.addr, msg, tid));
             }
 
             let results = futures::future::join_all(queries).await;
-            let mut new_nodes = Vec::new();
 
             for (i, result) in results.into_iter().enumerate() {
                 match result {
-                    Ok(DhtResponse::GetPeers {
-                        peers: Some(p),
-                        nodes,
-                        ..
-                    }) => {
-                        peers.extend(p);
-                        if let Some(nodes) = nodes {
-                            for n in nodes {
-                                if !queried.contains(&n.id) {
-                                    self.routing_table.add_node(n.clone());
-                                    new_nodes.push(n);
-                                }
-                            }
+                    Ok(DhtResponse::GetPeers { peers: p, nodes, .. }) => {
+                        if let Some(p) = p {
+                            peers.extend(p);
                         }
-                    }
-                    Ok(DhtResponse::GetPeers {
-                        nodes: Some(nodes), ..
-                    }) => {
-                        for n in nodes {
+                        for n in nodes.unwrap_or_default() {
                             if !queried.contains(&n.id) {
                                 self.routing_table.add_node(n.clone());
-                                new_nodes.push(n);
+                                shortlist.push(n);
                             }
                         }
                     }
                     Ok(_) => {}
                     Err(e) => {
                         debug!("get_peers query failed: {}", e);
-                        if i < nodes_to_query.len() {
-                            self.routing_table.mark_failed(&nodes_to_query[i].id);
-                        }
+                        self.routing_table.mark_failed(&nodes_to_query[i].id);
                     }
                 }
             }
 
-            to_query = new_nodes;
-
-            if peers.len() >= 50 {
+            peers.sort();
+            peers.dedup();
+            if peers.len() >= 200 {
                 break;
             }
         }

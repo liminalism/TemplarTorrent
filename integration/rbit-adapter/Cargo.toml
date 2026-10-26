@@ -21,5 +21,5 @@ tokio-rustls = "0.26"
 webpki-roots = "0.26"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "test-util"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
