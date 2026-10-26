@@ -130,7 +130,7 @@ async fn internet_smoke() {
                 .filter_map(|t| t.last_error.clone())
                 .collect();
             println!(
-                "TT_SMOKE t_s={} state={:?} verified={} wanted={} peers={} unchoked_us={} encrypted={} down_bps={} verified_rate_bps={:.0} connections={} trackers_ok={}/{} tracker_errors={:?} pool_tracker_dht_pex_other={:?} dht_nodes={:?} leases_inflight_blocked_pickable={:?} payload={:?} hash_failures={} peer_errors={:?} rss={} slow_steps={} steps={}",
+                "TT_SMOKE t_s={} state={:?} verified={} wanted={} peers={} unchoked_us={} encrypted={} down_bps={} verified_rate_bps={:.0} connections={} trackers_ok={}/{} tracker_errors={:?} pool_tracker_dht_pex_other={:?} dht_nodes={:?} dht_announced={} leases_inflight_blocked_pickable={:?} payload={:?} hash_failures={} peer_errors={:?} rss={} slow_steps={} steps={}",
                 start.elapsed().as_secs(),
                 row.state,
                 row.verified_bytes,
@@ -146,6 +146,7 @@ async fn internet_smoke() {
                 tracker_errors,
                 driver.candidate_counts(id),
                 driver.dht_nodes(),
+                driver.dht_announced(),
                 driver.lease_stats(id),
                 {
                     let stats = driver.payload_stats();

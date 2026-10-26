@@ -1860,6 +1860,73 @@ async fn driver_rejects_pure_v2_before_any_storage_exists() {
     .unwrap();
 }
 
+/// The IPv6 peer path without an IPv6 Internet route: an outgoing download
+/// from a seeder on ::1, then a dual-stack `[::]` listener seeding to a
+/// leech over ::1 and to one over IPv4 loopback through the same socket.
+#[tokio::test]
+async fn driver_moves_payload_over_ipv6_and_a_dual_stack_listener() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(73, false);
+        let server = Server::start_at("::1", fixture.clone(), Fault::default()).await;
+        assert!(server.source.address.is_ipv6());
+        let mut seed = Driver::with_peer_id(Limits::default(), [41; 20]).unwrap();
+        seed.set_allow_local_trackers(true);
+        let listen = seed.listen("[::]:0".parse().unwrap()).await.unwrap();
+        let id = seed
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        while seed.snapshot().jobs[0].state != JobState::Seeding {
+            seed.step(Duration::from_millis(5)).await.unwrap();
+        }
+        fixture.assert_files(&root.job());
+        for ip in ["::1", "127.0.0.1"] {
+            let target = Root::new();
+            let address: std::net::SocketAddr = format!(
+                "{}:{}",
+                if ip.contains(':') { "[::1]" } else { ip },
+                listen.port()
+            )
+            .parse()
+            .unwrap();
+            let magnet = fixture.magnet();
+            let path = target.job();
+            let leech = tokio::spawn(async move {
+                let mut leech = driver();
+                let source = PeerSource {
+                    address,
+                    origin: PeerOrigin::UserProvided,
+                };
+                leech
+                    .add_magnet(&magnet, &path, ExistingData::Refuse, &[source], true)
+                    .await
+                    .unwrap();
+                assert_eq!(complete(&mut leech).await, 0);
+                leech.shutdown().await;
+            });
+            while !leech.is_finished() {
+                seed.step(Duration::from_millis(5)).await.unwrap();
+            }
+            leech.await.unwrap();
+            fixture.assert_files(&target.job());
+        }
+        // An IPv4 peer reached the [::] listener as a plain IPv4 address.
+        assert!(seed.snapshot().jobs[0].total_payload_uploaded >= 2 * fixture.data.len() as u64);
+        let _ = id;
+        seed.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
 /// More files than the old 128-file gate: 300 small files across piece
 /// boundaries, transferred and verified over loopback.
 #[tokio::test]

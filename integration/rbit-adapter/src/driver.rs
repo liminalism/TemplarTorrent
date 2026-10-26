@@ -60,6 +60,8 @@ const RETRY_BASE_S: u64 = 30;
 const RETRY_MAX_S: u64 = 1800;
 /// Seconds between DHT get_peers lookups for one downloading job.
 const DHT_INTERVAL_S: u64 = 300;
+/// Seconds between DHT announces for a seeding job.
+const DHT_SEED_INTERVAL_S: u64 = 1800;
 /// Retry delay after a lookup that returned no peers.
 const DHT_EMPTY_RETRY_S: u64 = 30;
 /// Bound on one DHT lookup, including its iterative queries.
@@ -414,8 +416,10 @@ pub struct Driver {
     dht: Option<Arc<rbit::DhtServer>>,
     dht_tasks: Vec<JoinHandle<()>>,
     dht_lookups: HashMap<TorrentId, JoinHandle<()>>,
-    dht_sender: mpsc::Sender<(TorrentId, Vec<SocketAddr>)>,
-    dht_found: mpsc::Receiver<(TorrentId, Vec<SocketAddr>)>,
+    dht_sender: mpsc::Sender<(TorrentId, Vec<SocketAddr>, usize)>,
+    dht_found: mpsc::Receiver<(TorrentId, Vec<SocketAddr>, usize)>,
+    /// announce_peer queries remote nodes accepted, since start.
+    dht_announced: usize,
     pex_interval_s: u64,
 }
 
@@ -481,6 +485,7 @@ impl Driver {
             dht_lookups: HashMap::new(),
             dht_sender,
             dht_found,
+            dht_announced: 0,
             pex_interval_s: crate::pex::INTERVAL_S,
         })
     }
@@ -3121,9 +3126,10 @@ impl Driver {
 
     /// Join the mainline DHT on UDP `port` (the TCP listen port by
     /// convention; 0 picks one). Bootstrap runs in the background. Public
-    /// downloading jobs then look up peers every [`DHT_INTERVAL_S`]. Lookups
-    /// only: this node answers queries but does not announce_peer, so other
-    /// peers find us through trackers and PEX rather than the DHT.
+    /// downloading jobs then look up peers every [`DHT_INTERVAL_S`], and
+    /// seeding ones every [`DHT_SEED_INTERVAL_S`]. With a listener, each
+    /// lookup also announces our TCP listen port to the closest nodes that
+    /// returned a token (BEP 5 announce_peer).
     pub async fn enable_dht(&mut self, port: u16) -> Result<u16> {
         if let Some(dht) = &self.dht {
             return Ok(dht.port());
@@ -3188,6 +3194,11 @@ impl Driver {
         counts
     }
 
+    /// announce_peer queries that remote DHT nodes accepted since start.
+    pub fn dht_announced(&self) -> usize {
+        self.dht_announced
+    }
+
     /// Routing-table size, or `None` without a DHT node.
     pub fn dht_nodes(&self) -> Option<usize> {
         self.dht
@@ -3208,39 +3219,60 @@ impl Driver {
         let rows = self.snapshot();
         let mut due = Vec::new();
         for row in rows.jobs.iter() {
-            if row.state != JobState::Downloading || self.dht_lookups.contains_key(&row.id) {
+            let interval = match row.state {
+                JobState::Downloading => DHT_INTERVAL_S,
+                // A seed looks up only to obtain write tokens and announce.
+                JobState::Seeding if self.listener.is_some() => DHT_SEED_INTERVAL_S,
+                _ => continue,
+            };
+            if self.dht_lookups.contains_key(&row.id) {
                 continue;
             }
             if let Some(job) = self.jobs.0.get(&row.id)
                 && public_discovery(job)
                 && now >= job.dht_due_s
             {
-                due.push((row.id, job.torrent.hash()));
+                due.push((row.id, job.torrent.hash(), interval));
             }
         }
-        for (id, hash) in due {
+        // Announce our TCP listen port, which the DHT socket shares.
+        let port = self.listening_address().map(|address| address.port());
+        for (id, hash, interval) in due {
             if let Some(job) = self.jobs.0.get_mut(&id) {
-                job.dht_due_s = now + DHT_INTERVAL_S;
+                job.dht_due_s = now + interval;
             }
             let Some(dht) = self.dht.clone() else {
                 return;
             };
             let sender = self.dht_sender.clone();
             let task = tokio::spawn(async move {
-                let peers = timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers(hash))
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok())
-                    .unwrap_or_default();
-                let _ = sender.send((id, peers)).await;
+                let (peers, announced) = match port {
+                    Some(port) => {
+                        timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers_and_announce(hash, port))
+                            .await
+                            .ok()
+                            .and_then(|result| result.ok())
+                            .unwrap_or_default()
+                    }
+                    None => (
+                        timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers(hash))
+                            .await
+                            .ok()
+                            .and_then(|result| result.ok())
+                            .unwrap_or_default(),
+                        0,
+                    ),
+                };
+                let _ = sender.send((id, peers, announced)).await;
             });
             self.dht_lookups.insert(id, task);
         }
     }
 
     fn collect_dht(&mut self) {
-        while let Ok((id, peers)) = self.dht_found.try_recv() {
+        while let Ok((id, peers, announced)) = self.dht_found.try_recv() {
             self.dht_lookups.remove(&id);
+            self.dht_announced += announced;
             if !self.jobs.0.get(&id).is_some_and(public_discovery) {
                 continue;
             }

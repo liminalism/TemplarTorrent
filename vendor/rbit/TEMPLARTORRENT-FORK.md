@@ -61,6 +61,9 @@ hashes, evicting expired ones first and refusing new ones when all are live.
 150 s, and each wave asked only the nodes the previous wave returned. It now
 waits 4 s per query, asks the 8 closest unqueried nodes of a shortlist of
 every node seen, and stops at 200 peers.
+`get_peers_and_announce` (new) runs the same lookup, keeps each answering
+node's write token, and sends announce_peer for the given TCP port to the 8
+closest; a KRPC announce reply parses as a ping reply, so any reply counts.
 
 Performance, 2026-10-24: `src/peer/transport.rs` sets `TCP_NODELAY` on
 every peer stream. Without it a pipelined Request waited for the delayed ACK

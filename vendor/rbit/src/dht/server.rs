@@ -25,6 +25,9 @@ use super::routing::RoutingTable;
 const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_PENDING_QUERIES: usize = 100;
 const DHT_ALPHA: usize = 8;
+/// Nodes that receive announce_peer after a lookup (BEP 5 suggests the
+/// closest few that answered).
+const ANNOUNCE_FANOUT: usize = 8;
 const DHT_MAX_ITERATIONS: usize = 10;
 const MAX_PEERS_PER_TORRENT: usize = 1000;
 /// Info hashes the announce store keeps. Tokens are free to obtain, so
@@ -342,8 +345,47 @@ impl DhtServer {
     }
 
     pub async fn get_peers(&self, info_hash: [u8; 20]) -> Result<Vec<SocketAddr>, DhtError> {
+        Ok(self.lookup(info_hash).await?.0)
+    }
+
+    /// [`DhtServer::get_peers`], then BEP 5 announce_peer for `port` to the
+    /// [`ANNOUNCE_FANOUT`] closest nodes that answered with a token, so other
+    /// peers' lookups find us. Announce replies are awaited with the normal
+    /// query timeout and their failures ignored.
+    pub async fn get_peers_and_announce(
+        &self,
+        info_hash: [u8; 20],
+        port: u16,
+    ) -> Result<(Vec<SocketAddr>, usize), DhtError> {
+        let (peers, mut tokens) = self.lookup(info_hash).await?;
+        let target = NodeId::from_bytes(&info_hash)?;
+        tokens.sort_by(|a, b| a.0.id.distance(&target).cmp(&b.0.id.distance(&target)));
+        tokens.dedup_by(|a, b| a.0.id == b.0.id);
+        let our_id = self.our_id();
+        let announces = tokens.into_iter().take(ANNOUNCE_FANOUT).map(|(node, token)| {
+            let tid = self.generate_transaction_id();
+            let msg = DhtMessage::announce_peer(tid.clone(), &our_id, info_hash, port, token);
+            self.send_query(node.addr, msg, tid)
+        });
+        let accepted = futures::future::join_all(announces)
+            .await
+            .into_iter()
+            // A KRPC reply does not name its query: an announce_peer reply
+            // carries only `id` and parses as a ping reply. Any reply counts.
+            .filter(|result| result.is_ok())
+            .count();
+        Ok((peers, accepted))
+    }
+
+    /// Iterative get_peers: peers found, and each answering node with the
+    /// write token it issued.
+    async fn lookup(
+        &self,
+        info_hash: [u8; 20],
+    ) -> Result<(Vec<SocketAddr>, Vec<(Node, Bytes)>), DhtError> {
         let target = NodeId::from_bytes(&info_hash)?;
 
+        let mut tokens: Vec<(Node, Bytes)> = Vec::new();
         let mut peers = Vec::new();
         let mut queried = std::collections::HashSet::new();
         // Every node seen so far, so a wave that returns nothing new still
@@ -377,7 +419,15 @@ impl DhtServer {
 
             for (i, result) in results.into_iter().enumerate() {
                 match result {
-                    Ok(DhtResponse::GetPeers { peers: p, nodes, .. }) => {
+                    Ok(DhtResponse::GetPeers {
+                        peers: p,
+                        nodes,
+                        token,
+                        ..
+                    }) => {
+                        if !token.is_empty() && token.len() <= 64 {
+                            tokens.push((nodes_to_query[i].clone(), token));
+                        }
                         if let Some(p) = p {
                             peers.extend(p);
                         }
@@ -408,7 +458,7 @@ impl DhtServer {
             peers.len(),
             queried.len()
         );
-        Ok(peers)
+        Ok((peers, tokens))
     }
 
     async fn send_query(
