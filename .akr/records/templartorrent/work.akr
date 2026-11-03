@@ -352,6 +352,32 @@ record templartorrent.work.picker-buckets/1 : work {
     part_of [ @templartorrent.milestone.picker-optimization ]
 }
 
+record templartorrent.work.power-loss-batched-sync/1 : work {
+    title "Prove the batched sync against power loss with a fault-injected disk"
+    state proposed
+    intent """
+        Close the open gate on the batched write path (milestone loopback-throughput dropped the per-piece fdatasync): show that a resume bitmap written at a checkpoint names only pieces the checkpoint's sync made durable, so a power loss after the checkpoint cannot leave a trusted bit over bytes that never reached the disk. The forced-kill test could not show this because the page cache survives a killed process. Add a disk observer seam to the storage crate, a shadow that models durable versus volatile bytes, and a driver test that loses power after a checkpoint, restores the durable image with the checkpoint's mtimes, restarts from the record and completes with matching bytes; and a negative control that forges one lost piece into the bitmap and shows the resulting hole, proving the harness can tell.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Storage and adapter suites, format check and Clippy with warnings denied pass with the observer seam in place
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p templartorrent-storage -p templartorrent-rbit-adapter --no-fail-fast"
+        }
+        check power-loss {
+            statement """
+                After a simulated power loss the restart trusts the checkpoint bitmap (resume_scan note None, trusted equals the bitmap's pieces), completes, and the files match; the same run with a forged bit over a lost piece ends with zeros in that piece
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver driver_resume_bitmap_survives_a_power_loss_after_the_sync"
+        }
+    }
+    part_of [ @templartorrent.milestone.loopback-throughput ]
+    author "Claude"
+}
+
 record templartorrent.work.rate-ranked-slots/1 : work {
     title "Per-peer payload rates, rate-ranked regular upload slots with hysteresis, rates in the Peers tab"
     state completed

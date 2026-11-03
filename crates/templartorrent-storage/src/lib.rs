@@ -250,15 +250,45 @@ pub fn delete_owned_file(root: &Path, path: &Path) -> Result<bool, StorageError>
     deletion::unlink_regular(root, path)
 }
 
+/// Sees every payload write and every durability barrier, in order. A test
+/// harness models power loss with it: bytes written since the last `synced`
+/// may vanish, bytes before it may not. Production installs none.
+pub trait DiskObserver: Send {
+    /// `data` was written to `path` at `offset` within that file.
+    fn wrote(&mut self, path: &Path, offset: u64, data: &[u8]);
+    /// Every handle of `job` completed `sync_all`.
+    fn synced(&mut self, job: TorrentId);
+}
+
 /// Direct single-owner file storage. Register each job with [`FileStore::add_job`].
 #[derive(Default)]
 pub struct FileStore {
     jobs: HashMap<u64, JobFiles>,
+    observer: Mutex<Option<Box<dyn DiskObserver>>>,
 }
 
 impl FileStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install or remove the write and sync observer (fault injection).
+    pub fn set_observer(&self, observer: Option<Box<dyn DiskObserver>>) {
+        *self
+            .observer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = observer;
+    }
+
+    fn observe(&self, notify: impl FnOnce(&mut dyn DiskObserver)) {
+        if let Some(observer) = self
+            .observer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+        {
+            notify(observer.as_mut());
+        }
     }
 
     /// Close every handle for a quiesced job; leaves all data intact.
@@ -484,6 +514,7 @@ impl FileStore {
                     .map_err(|error| io_error(&file.path, error))?;
             }
         }
+        self.observe(|observer| observer.synced(id));
         self.file_identity(id)
     }
 
@@ -549,8 +580,8 @@ impl PieceSink for FileStore {
         piece: u32,
         data: &[u8],
     ) -> Result<(), SinkError> {
-        let job = self.job_mut(torrent)?;
-        let (mut offset, expected) = job
+        let (mut offset, expected) = self
+            .job(torrent)?
             .piece_range(piece)
             .ok_or_else(|| storage_to_sink(StorageError::UnknownPiece(piece)))?;
         if data.len() != expected {
@@ -559,6 +590,13 @@ impl PieceSink for FileStore {
                 data.len()
             )));
         }
+        let observing = self
+            .observer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some();
+        let mut written: Vec<(PathBuf, u64, Vec<u8>)> = Vec::new();
+        let job = self.job_mut(torrent)?;
         let mut remaining = data;
         while !remaining.is_empty() {
             let index = job
@@ -586,8 +624,18 @@ impl PieceSink for FileStore {
             handle
                 .write_all(&remaining[..writable])
                 .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            if observing {
+                written.push((
+                    file.path.clone(),
+                    offset - file.offset,
+                    remaining[..writable].to_vec(),
+                ));
+            }
             remaining = &remaining[writable..];
             offset += writable as u64;
+        }
+        for (path, at, bytes) in written {
+            self.observe(|observer| observer.wrote(&path, at, &bytes));
         }
         Ok(())
     }
@@ -658,6 +706,14 @@ pub struct SharedStore {
 impl SharedStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// See [`FileStore::set_observer`].
+    pub fn set_observer(&self, observer: Option<Box<dyn DiskObserver>>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .set_observer(observer);
     }
 
     pub fn close_job(&self, id: TorrentId) -> Result<bool, StorageError> {

@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:d8377524dbeb103c435b86477b0414cb244cb454ec33f1ced234fa26d4f5700b"
+    source_graph "sha256:0867ae1d6b06feb0a0269f41c6b6fab3e27db7a3fe49cbdd8cd648678a3cf282"
 }
 
 source ".akr/project.akr" {
@@ -44,8 +44,8 @@ source ".akr/records/templartorrent/questions.akr" {
 }
 
 source ".akr/records/templartorrent/work.akr" {
-    hash "sha256:c823d11ba36217429eda6e7002b20aaa252b78dbb398981c0634fa23430530ba"
-    records 22
+    hash "sha256:f42bb3137f6e123759ef125f304527ccfa2cf0453fd7d2782570855c4bf5f534"
+    records 23
 }
 
 resolution @templartorrent.decision.fork-rbit-for-native-gate/1 {
@@ -694,6 +694,12 @@ resolution @templartorrent.work.picker-buckets/1 {
     slot part_of
     to @templartorrent.milestone.picker-optimization/1
     hash "sha256:4159d1422016ebec317ae3a83d37819de40e4abc76b2b87b179cc08fb186c5af"
+}
+
+resolution @templartorrent.work.power-loss-batched-sync/1 {
+    slot part_of
+    to @templartorrent.milestone.loopback-throughput/1
+    hash "sha256:a16670961a01b1c7ffbd91c9a2cce28b2f17738263802f4c6b7d03930e04a59d"
 }
 
 resolution @templartorrent.work.rbit-driver/1 {

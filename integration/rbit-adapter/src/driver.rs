@@ -586,6 +586,11 @@ impl Driver {
     pub fn download_rate(&self) -> (templartorrent_core::bandwidth::SharedBucket, Instant) {
         (self.session.download_rate(), self.started)
     }
+    /// Fault injection: see every payload write and every durability
+    /// barrier. Tests model power loss with it; production installs none.
+    pub fn set_disk_observer(&self, observer: Box<dyn templartorrent_storage::DiskObserver>) {
+        self.store.set_observer(Some(observer));
+    }
     pub fn payload_stats(&self) -> templartorrent_engine::session::PayloadStats {
         self.session.payload_stats()
     }

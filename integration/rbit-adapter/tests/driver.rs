@@ -2859,3 +2859,260 @@ async fn driver_routes_encrypted_incoming_to_the_job_its_skey_names() {
     .await
     .unwrap();
 }
+
+/// What the disk holds after a power loss: bytes written before the last
+/// sync are durable, bytes after it are gone. Fed by the storage crate's
+/// disk observer; `freeze` marks the checkpoint the loss is measured from.
+#[derive(Clone, Default)]
+struct Shadow(Arc<Mutex<ShadowState>>);
+
+#[derive(Default)]
+struct ShadowState {
+    durable: std::collections::HashMap<PathBuf, Vec<u8>>,
+    volatile: Vec<(PathBuf, u64, Vec<u8>)>,
+    frozen: bool,
+}
+
+impl Shadow {
+    fn with_files(files: &[(PathBuf, usize)]) -> Self {
+        let shadow = Self::default();
+        {
+            let mut state = shadow.0.lock().unwrap();
+            for (path, len) in files {
+                state.durable.insert(path.clone(), vec![0; *len]);
+            }
+        }
+        shadow
+    }
+
+    /// Later syncs do not count: the power goes out before them.
+    fn freeze(&self) {
+        self.0.lock().unwrap().frozen = true;
+    }
+
+    /// Pieces that have bytes written since the freeze, per `piece_len`,
+    /// given each file's offset in the torrent stream.
+    fn lost_pieces(&self, offsets: &[(PathBuf, u64)], piece_len: u64) -> Vec<usize> {
+        let state = self.0.lock().unwrap();
+        let mut pieces: Vec<usize> = state
+            .volatile
+            .iter()
+            .filter_map(|(path, at, data)| {
+                let base = offsets.iter().find(|(p, _)| p == path)?.1;
+                let first = (base + at) / piece_len;
+                let last = (base + at + data.len() as u64 - 1) / piece_len;
+                Some(first..=last)
+            })
+            .flatten()
+            .map(|piece| piece as usize)
+            .collect();
+        pieces.sort_unstable();
+        pieces.dedup();
+        pieces
+    }
+
+    /// Put every file back to its durable image, in place, keeping the inode.
+    fn power_loss(&self) {
+        let state = self.0.lock().unwrap();
+        for (path, image) in &state.durable {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_len(image.len() as u64).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&file, image, 0).unwrap();
+            file.sync_all().unwrap();
+        }
+    }
+}
+
+impl templartorrent_storage::DiskObserver for Shadow {
+    fn wrote(&mut self, path: &Path, offset: u64, data: &[u8]) {
+        self.0
+            .lock()
+            .unwrap()
+            .volatile
+            .push((path.to_path_buf(), offset, data.to_vec()));
+    }
+
+    fn synced(&mut self, _job: templartorrent_core::model::TorrentId) {
+        let mut guard = self.0.lock().unwrap();
+        let state = &mut *guard;
+        if state.frozen {
+            return;
+        }
+        for (path, offset, data) in state.volatile.drain(..) {
+            let image = state.durable.entry(path).or_default();
+            let end = offset as usize + data.len();
+            if image.len() < end {
+                image.resize(end, 0);
+            }
+            image[offset as usize..end].copy_from_slice(&data);
+        }
+    }
+}
+
+fn resume_bit(record: &ResumeRecord, piece: usize) -> bool {
+    record.bits[piece / 8] & (1 << (piece % 8)) != 0
+}
+
+/// Download part of a fixture with the shadow attached, checkpoint, keep
+/// going, lose power, restore the durable image with the checkpoint's mtimes,
+/// then restart from the saved record. `forge` sets the bit of a piece the
+/// loss took, which a correct checkpoint never does. Returns whether the
+/// finished files match the fixture.
+async fn power_loss_run(fixture: &Arc<Fixture>, forge: bool) -> bool {
+    const SMALL: u64 = 16384;
+    let root = Root::new();
+    let files: Vec<(PathBuf, usize, u64)> = fixture
+        .meta
+        .info
+        .files
+        .iter()
+        .map(|file| {
+            (
+                root.job().join(&file.path),
+                file.length as usize,
+                file.offset,
+            )
+        })
+        .collect();
+    for (path, len, _) in &files {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; *len]).unwrap();
+    }
+    let shadow = Shadow::with_files(
+        &files
+            .iter()
+            .map(|(path, len, _)| (path.clone(), *len))
+            .collect::<Vec<_>>(),
+    );
+    let server = Server::start(
+        fixture.clone(),
+        Fault {
+            delay_ms: 15,
+            ..Fault::default()
+        },
+    )
+    .await;
+    let mut first = driver();
+    first.set_disk_observer(Box::new(shadow.clone()));
+    let id = first
+        .add_magnet(
+            &fixture.magnet(),
+            &root.job(),
+            ExistingData::Recheck,
+            &[server.source],
+            false,
+        )
+        .await
+        .unwrap();
+    let verified = |driver: &mut Driver| driver.snapshot().jobs[0].verified_bytes;
+    assert_eq!(verified(&mut first), 0, "zero-filled files verify nothing");
+    let start = Instant::now();
+    while verified(&mut first) < 6 * SMALL {
+        assert!(start.elapsed() < DEADLINE, "transfer never started");
+        first.step(Duration::from_millis(10)).await.unwrap();
+    }
+    let record = first.export_job(id).unwrap();
+    let mut resume = first.export_resume(id).unwrap();
+    shadow.freeze();
+    assert!(resume.barrier);
+    let in_bitmap: Vec<usize> = (0..resume.pieces)
+        .filter(|piece| resume_bit(&resume, *piece))
+        .collect();
+    assert!(in_bitmap.len() >= 6, "{in_bitmap:?}");
+    while verified(&mut first) < 16 * SMALL {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "transfer stalled after the checkpoint"
+        );
+        first.step(Duration::from_millis(10)).await.unwrap();
+    }
+    first.shutdown().await;
+    server.close().await;
+    let offsets: Vec<(PathBuf, u64)> = files
+        .iter()
+        .map(|(path, _, offset)| (path.clone(), *offset))
+        .collect();
+    let lost = shadow.lost_pieces(&offsets, SMALL);
+    assert!(
+        lost.iter().all(|piece| !resume_bit(&resume, *piece)),
+        "a checkpoint never names a piece written after its sync: {lost:?} vs {in_bitmap:?}"
+    );
+    let lost_piece = *lost
+        .iter()
+        .find(|piece| **piece > 0)
+        .expect("some piece was lost");
+    shadow.power_loss();
+    // The record's stamps were taken at the sync; the files are byte for
+    // byte what the sync made durable, so their mtimes go back too.
+    for (index, (path, _, _)) in files.iter().enumerate() {
+        let stamp = resume.files[index];
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+                + Duration::new(stamp.mtime_sec as u64, stamp.mtime_nsec as u32),
+        )
+        .unwrap();
+    }
+    if forge {
+        resume.bits[lost_piece / 8] |= 1 << (lost_piece % 8);
+    }
+    let mut restarted = driver();
+    let id = restarted
+        .restore_job_with_resume(&record, Some(&resume))
+        .await
+        .unwrap();
+    let scan = restarted.resume_scan(id).unwrap();
+    assert_eq!(scan.note, None, "the record is trusted after the loss");
+    assert_eq!(
+        scan.trusted,
+        in_bitmap.len() + usize::from(forge),
+        "exactly the bitmap's pieces are adopted without hashing"
+    );
+    let server = Server::start(fixture.clone(), Fault::default()).await;
+    restarted.connect_peer(id, server.source).await.unwrap();
+    complete(&mut restarted).await;
+    let matches = fixture.meta.info.files.iter().all(|file| {
+        std::fs::read(root.job().join(&file.path)).unwrap()
+            == fixture.data[file.offset as usize..(file.offset + file.length) as usize]
+    });
+    if forge {
+        // The forged piece was never downloaded: its bytes are the zeros the
+        // loss left behind.
+        let (path, _, base) = files
+            .iter()
+            .find(|(_, len, offset)| {
+                let start = lost_piece as u64 * SMALL;
+                start >= *offset && start < offset + *len as u64
+            })
+            .unwrap();
+        let on_disk = std::fs::read(path).unwrap();
+        let at = (lost_piece as u64 * SMALL - base) as usize;
+        assert!(on_disk[at..at + SMALL as usize].iter().all(|b| *b == 0));
+    }
+    restarted.shutdown().await;
+    server.close().await;
+    matches
+}
+
+/// DESIGN.md section 7: resume bits are durable only after the data
+/// barrier. Power is lost after a checkpoint; the bitmap written at that
+/// checkpoint names only pieces the sync made durable, so the restart
+/// trusts it and still ends with the right bytes. A bitmap that named one
+/// more piece, written after the sync and lost, would be trusted too and
+/// leave a hole, which is why the order in `export_resume` is load-bearing.
+#[tokio::test]
+async fn driver_resume_bitmap_survives_a_power_loss_after_the_sync() {
+    timeout(Duration::from_secs(90), async {
+        let fixture = Fixture::large(83, 24);
+        assert!(
+            power_loss_run(&fixture, false).await,
+            "restored files match"
+        );
+        assert!(
+            !power_loss_run(&fixture, true).await,
+            "a forged bit over a lost piece corrupts the file; the harness can tell"
+        );
+    })
+    .await
+    .unwrap();
+}
