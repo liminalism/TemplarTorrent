@@ -5,14 +5,14 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pixelkit_raster::{Painter, RasterKernel, Rect, WindowBuffer};
-use pixelkit_shell::{Input, KeyInput, Modifiers, MouseButton, Scale};
-use pixelkit_text::font::{FaceId, FontSet};
-use pixelkit_text::{Align, TextCache, TextStyle};
-use pixelkit_ui::{
+use liminalkit_raster::{Painter, RasterKernel, Rect, WindowBuffer};
+use liminalkit_shell::{Input, KeyInput, Modifiers, MouseButton, Scale};
+use liminalkit_text::font::{FaceId, FontSet};
+use liminalkit_text::{Align, TextCache, TextStyle};
+use liminalkit_ui::{
     Cell, CellAppearance, Column, Row, ScrollState, TableState, TextFieldState, Theme, Ui, navigate,
 };
-use pixelkit_windowing::{CursorShape, PaneMetrics, Panes, PixelApp, Side, Waker};
+use liminalkit_windowing::{CursorShape, PaneMetrics, Panes, PixelApp, Side, Waker};
 use templartorrent_core::model::{
     Command, JobState, PeerPreference, TorrentId, TorrentRow, clean_label,
 };
@@ -1134,7 +1134,7 @@ impl Desktop {
         body: &TextStyle,
     ) {
         let content_width = (area.w - TABLE_GUTTER).max(0);
-        let widths = pixelkit_ui::column_widths(columns, content_width, COLUMN_GAP);
+        let widths = liminalkit_ui::column_widths(columns, content_width, COLUMN_GAP);
         let header_h = ui.theme.row_height;
         let mut x = area.x;
         for (column, width) in columns.iter().zip(&widths) {
@@ -2691,9 +2691,9 @@ impl PixelApp for App {
             .set_waker(Arc::new(move || activate.wake()));
         let redraw = waker;
         self.input
-            .attach_clipboard(pixelkit_shell::clipboard::ClipboardWorker::new(move || {
-                redraw.wake()
-            }));
+            .attach_clipboard(liminalkit_shell::clipboard::ClipboardWorker::new(
+                move || redraw.wake(),
+            ));
     }
 
     fn render(&mut self, buffer: &mut WindowBuffer, s: Scale) {
@@ -2772,10 +2772,10 @@ mod tests {
     use crate::activate::{Activation, activate, spawn};
     use crate::persist::{SessionStore, UiState, hex};
     use crate::worker::{WorkerConfig, WorkerHandle};
-    use pixelkit_raster::WindowBuffer;
-    use pixelkit_shell::{KeyInput, Modifiers, Scale};
-    use pixelkit_text::font::{Face, FontSet};
-    use pixelkit_windowing::{PixelApp, Waker};
+    use liminalkit_raster::WindowBuffer;
+    use liminalkit_shell::{KeyInput, Modifiers, Scale};
+    use liminalkit_text::font::{Face, FontSet};
+    use liminalkit_windowing::{PixelApp, Waker};
     use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
@@ -2800,7 +2800,7 @@ mod tests {
     /// previous text back, or clears when there was none. A clipboard that
     /// held only an image cannot be restored by this text round-trip.
     struct ClipboardGuard {
-        clipboard: pixelkit_shell::Clipboard,
+        clipboard: liminalkit_shell::Clipboard,
         previous: Option<String>,
         /// Set when the clipboard had no text. Cleared once that state is put back.
         clear_on_drop: bool,
@@ -2808,7 +2808,7 @@ mod tests {
 
     impl ClipboardGuard {
         fn replace_text(text: &str) -> Result<Self, String> {
-            let mut clipboard = pixelkit_shell::Clipboard::new();
+            let mut clipboard = liminalkit_shell::Clipboard::new();
             let previous = clipboard
                 .try_text()
                 .map_err(|error| format!("clipboard read failed: {error}"))?;

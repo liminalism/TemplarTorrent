@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:22772b6e4658d85e324688b65472cf929b3cea570bcd1cae1a6025bb77fc2cb4"
+    source_graph "sha256:a477699b8bb1b36f4888d9a86bdebe6c9d4009cdcae793474282454909e5e79a"
 }
 
 source ".akr/project.akr" {
@@ -14,8 +14,8 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/templartorrent/decisions.akr" {
-    hash "sha256:7f5deadd6012227fd7cdb2bacf9f6142c870c0d0579466d9337d43fa67be77ba"
-    records 2
+    hash "sha256:4ea69392310a047b57a972a2cb30de77eecc1bb80831cb5c91c688fe6e9d2d18"
+    records 3
 }
 
 source ".akr/records/templartorrent/evidence.akr" {

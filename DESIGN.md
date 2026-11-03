@@ -3,8 +3,8 @@
 **Design baseline: 9 October 2026.** Linux desktop application; Windows is optional
 following the user's 15 October 2026 scope change. Windows-specific requirements
 below are retained as future reference and are not completion gates. Rust
-1.99.0 / edition 2024. PixelKit for the complete application-owned UI, rbit 0.2.2
-for protocol primitives. This is the implementation specification; the archive's
+1.99.0 / edition 2024. liminalkit (formerly PixelKit) for the complete application-owned UI, rbit
+0.2.2 for protocol primitives. This is the implementation specification; the archive's
 reference code implements only the parts identified in README.md.
 
 ## 1. Product boundary
@@ -28,9 +28,13 @@ assume an upstream `Session::add_torrent` API. [S1]
 ### Reviewed versions and compatibility gates
 
 Use Rust 1.99.0, released 1 October 2026, and pin the release toolchain rather than
-letting CI change underneath a performance comparison. [S2] Pin all PixelKit git
-dependencies to revision `614c9c6e84ce3cd0bc6c81988f636b493b30a497`. Version bumps
-must include changed API review, lockfile diff and a baseline comparison.
+letting CI change underneath a performance comparison. [S2] The UI toolkit is
+liminalkit, the renamed and improved successor of the PixelKit revision
+`614c9c6e84ce3cd0bc6c81988f636b493b30a497` this design was written against
+(user's 3 November 2026 instruction). It is taken from its `main` branch and
+held by `Cargo.lock`, not by a `rev` in the manifests: a bump is a deliberate
+lockfile change that must include changed API review, the lockfile diff and a
+baseline comparison. [S13]
 
 The requested Rust-only application architecture is retained. Strictly excluding
 non-Rust third-party implementation code is a separate release requirement:
@@ -696,6 +700,8 @@ https://github.com/liminalism/pixelkit/blob/614c9c6e84ce3cd0bc6c81988f636b493b30
 [S9] maxminddb reader: https://docs.rs/maxminddb/latest/maxminddb/
 [S10] Rust runtime CPU detection: https://doc.rust-lang.org/std/macro.is_x86_feature_detected.html
 [S11] wide: https://docs.rs/wide/latest/wide/
+[S13] liminalkit README and crates (the toolkit's current name and API):
+https://github.com/liminalism/liminalkit
 [S12] Linux Download Manager v0.3.0 README and `src-tauri/src/download/`, read as a
 behaviour reference only: https://github.com/ekremx25/linux-download-manager
 

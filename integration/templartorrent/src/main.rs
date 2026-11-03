@@ -4,8 +4,8 @@
 use std::io::Read;
 use std::path::Path;
 
-use pixelkit_text::font::{Face, FontSet};
-use pixelkit_windowing::{WindowConfig, run_app};
+use liminalkit_text::font::{Face, FontSet};
+use liminalkit_windowing::{WindowConfig, run_app};
 use templartorrent::activate::{
     Activation, activate, default_runtime_dir, spawn, valid_activation,
 };

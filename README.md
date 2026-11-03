@@ -1,8 +1,8 @@
 # TemplarTorrent
 
 A small Linux desktop client for BitTorrent and for ordinary `http://` and
-`https://` file downloads, written in Rust with a PixelKit window and the
-in-tree rbit 0.2.2 fork for protocol primitives. One process, one window;
+`https://` file downloads, written in Rust with a liminalkit (formerly
+PixelKit) window and the in-tree rbit 0.2.2 fork for protocol primitives. One process, one window;
 closing the window stops every transfer. Windows is optional per the
 2026-10-15 scope change and is not a completion gate.
 
@@ -30,8 +30,10 @@ builds the client `templartorrent` and the policy crates; the policy crates
 (`integration/pixelkit-preview`) and the fuzz targets (`fuzz/`) are separate
 workspaces.
 
-The GUI pins all PixelKit crates to
-`614c9c6e84ce3cd0bc6c81988f636b493b30a497`. The rbit adapter pins
+The GUI takes the liminalkit crates from
+`https://github.com/liminalism/liminalkit` (main branch); the exact commit
+is held by `Cargo.lock`, and a bump is a reviewed lockfile change. The rbit
+adapter pins
 `rbit = "=0.2.2"`, resolved through `[patch.crates-io]` to the fork at
 `vendor/rbit`: identical source with `reqwest` behind an off-by-default
 `http-client` feature, so the default graph carries no reqwest or ring. Tracker
@@ -127,8 +129,8 @@ terms; check them before redistributing any database file.
 | `crates/templartorrent-simd` | Runtime-dispatched AVX2 eligibility kernel with a scalar oracle |
 | `crates/templartorrent-bench` | Deterministic microbenchmarks (JSONL) |
 | `integration/rbit-adapter` | The rbit driver (peers, trackers, DHT, PEX, MSE, port mapping) and the HTTP download engine |
-| `integration/templartorrent` | The PixelKit client: window, dialogs, worker thread, session store, activation |
-| `integration/pixelkit-preview` | Labeled layout fixture, a separate workspace |
+| `integration/templartorrent` | The liminalkit client: window, dialogs, worker thread, session store, activation |
+| `integration/pixelkit-preview` | Labeled layout fixture on liminalkit, a separate workspace (directory name kept) |
 | `fuzz/` | libFuzzer targets for every parser remote or on-disk bytes reach |
 | `vendor/rbit` | The rbit 0.2.2 fork |
 

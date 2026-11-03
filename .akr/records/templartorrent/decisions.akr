@@ -38,3 +38,25 @@ record templartorrent.decision.http-download-manager/1 : decision {
         """
     author "Claude"
 }
+
+record templartorrent.decision.liminalkit-unpinned/1 : decision {
+    title "Take the UI toolkit as liminalkit from its main branch, held by Cargo.lock"
+    state proposed
+    scope [
+        path "Cargo.lock",
+        path "DESIGN.md",
+        path "integration/pixelkit-preview/Cargo.toml",
+        path "integration/templartorrent/Cargo.toml"
+    ]
+    topic ui-toolkit
+    decision """
+        The client and the preview depend on liminalkit-raster, -shell, -text, -ui and -windowing from https://github.com/liminalism/liminalkit without a rev; Cargo.lock holds the exact commit (19c5cd393ad6ee802170a789fd3fd1e4ff84bcdf at this decision). A toolkit bump is a deliberate lockfile change reviewed for API drift, lockfile diff and a baseline comparison, as DESIGN.md's compatibility gate already required of a rev bump. The pixelkit-preview directory keeps its name.
+        """
+    context """
+        On 2026-11-03 the user said PixelKit no longer needs to be pinned to 614c9c6e84ce3cd0bc6c81988f636b493b30a497: the toolkit has improved since and is now called liminalkit. The API the client uses (Theme, Ui, table, text_field, checkbox, scroll_list, underline_tabs, Panes, PixelApp, Waker, WindowConfig, run_app, Input, Clipboard, ClipboardWorker, FontSet, TextCache) is unchanged at liminalkit 19c5cd3 apart from the crate names, so the move was a rename of the five dependency lines and the crate paths in the client and preview sources.
+        """
+    consequences """
+        Cargo.lock changed by exactly the five toolkit entries; every other dependency is the same version. At 19c5cd3 the client suite passed 38 of 39 (the clipboard test still needs a display), Clippy with warnings denied passed, and the preview's 10 headless tests passed. A baseline comparison of first frame and RSS was not possible in the build container (no display); it is owed on the next measured machine before any release claim. Because main can move, cargo update will take new toolkit commits: that is the reviewed path for bumps, and CI builds with the locked commit.
+        """
+    author "Claude"
+}
