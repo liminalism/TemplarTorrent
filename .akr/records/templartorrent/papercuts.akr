@@ -147,6 +147,17 @@ record templartorrent.papercut.resuming-from-the-ledger-the-inherited/1 : paperc
     created_at 2026-10-22
 }
 
+record templartorrent.papercut.running-akr-evidence-add-many-with-records-that/1 : papercut {
+    title "Running akr evidence add-many with records that lack observed_at…"
+    state verified
+    statement """
+        Running akr evidence add-many with records that lack observed_at printed two AKR-T022 errors and 'nothing written', then '3 evidence records written in one pass' on the next line although nothing was written; the success line should not print after a refused pass, and the help text could say add-many does not default observed_at to HEAD the way evidence add does.
+        """
+    observed_at git:dfa95bf6a1104f6761a67d115f7ee640838841d3
+    author "claude"
+    created_at 2026-11-03
+}
+
 record templartorrent.papercut.running-the-rbit-fork-s-own-cargo-test-lib/1 : papercut {
     title "Running the rbit fork's own `cargo test --lib` without features fails…"
     state verified

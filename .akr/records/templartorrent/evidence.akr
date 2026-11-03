@@ -295,6 +295,46 @@ record templartorrent.evidence.fuzz-targets-build/1 : evidence {
         """
 }
 
+record templartorrent.evidence.http-client-wiring/1 : evidence {
+    title "Commit dfa95bf: cargo test -p templartorrent passed 38 of 39, the one failure being the pre-existing clipboard test that needs an X11 or Wayland display the container lacks"
+    state verified
+    result pass
+    method command
+    observed_at git:dfa95bf6a1104f6761a67d115f7ee640838841d3
+    command "cargo test -p templartorrent"
+    summary """
+        Commit dfa95bf, same host: 38 of 39 client tests passed; the one failure, ui::tests::paste_magnet_from_the_system_clipboard, fails at ClipboardGuard::replace_text with "X11 server connection timed out because it was unreachable" because the container has no display, and it failed identically on the parent commit 7593b71 before any change. New: worker::tests::url_jobs_are_added_saved_restored_and_removed_through_the_worker added a loopback URL through Command::AddUrl, saw the URL row reach Complete with the server-named file and matching bytes, saw url_detail published for the selected job, found one complete .url record in the store, had Retry refused for a torrent id and Cancel refused for a complete job, saved the URL allowance off through Request::AllowLocalUrls, restored the job as Complete on a second worker, had a loopback add refused under the saved allowance, and saw the record deleted by Remove with the data kept. persist::tests::url_records_roundtrip_and_reject_inconsistent_parts round-trips a record with two parts, an unknown-size record, and refuses a bad version, parts that do not tile or exceed their range, a size the parts do not cover, 9 connections, a bad flag, an ftp URL, an unknown field, a missing URL and a traversal name. workflow::tests::sources_split_into_a_magnet_or_a_bounded_url_batch covers the magnet-or-URLs classification, duplicates, the 16-URL bound, the optional digest and --allow-local-urls. ui::tests::url_details_show_an_em_dash_for_an_unknown_size checks the Details lines and the progress cell for an unknown size.
+        """
+    author "Claude"
+}
+
+record templartorrent.evidence.http-fixtures/1 : evidence {
+    title "Commit dfa95bf on Linux 6.18 x86_64 (cloud container, Xeon 2.10GHz), rustc 1.99.0: all 12 loopback tests in http_download.rs passed in 9.1 s, three runs in a row"
+    state verified
+    result pass
+    method command
+    observed_at git:dfa95bf6a1104f6761a67d115f7ee640838841d3
+    command "cargo test -p templartorrent-rbit-adapter --test http_download"
+    summary """
+        Commit dfa95bf on Linux 6.18 x86_64 (a cloud container, Intel Xeon 2.10GHz), rustc 1.99.0, 12 of 12 tests passed in 9.1 s, repeated three times with the same result. Every fixture is a loopback server on an owned temporary root. ranged_body_downloads_in_parallel_parts_and_matches: a 5 MiB body with Accept-Ranges became four parts on four connections (one Range: bytes=0- probe, Accept-Encoding: identity on all), the final bytes matched, the .part sibling was gone and the record was complete. plain_body_uses_one_connection_and_a_chunked_size_is_unknown: no ranges meant one request and a Content-Disposition name; a chunked body at 400 kB/s showed wanted_bytes 0 (rendered as an em dash) and size None while in flight, then the exact length when done. redirects_are_followed_five_times_and_refused_on_the_sixth: /redirect/5 completed after six requests, /redirect/6 stopped with "too many redirects", a loopback URL was refused at add without the allowance, 169.254.169.254, [fd00:ec2::254] and 100.100.100.200 were refused by admission, a redirect hop to a local address was refused, and ftp/file/userinfo/empty-host/whitespace URLs failed to parse. https_checks_the_certificate_name_and_refuses_a_downgrade: an rcgen CA trusted for localhost downloaded over TLS, an https-to-http redirect stopped with "https to http", a certificate for other.example stopped with "TLS handshake failed". identity_mismatch_on_resume_stops_with_a_reason_and_keeps_the_partial: after a mid-way pause the fixture's ETag changed and Resume stopped with "file changed (ETag differs)" keeping image.iso.part; with the ETag restored Retry completed and matched; the same with Last-Modified as the validator. pause_and_resume_continue_from_the_recorded_offsets: a paused job sent nothing and held no connection, its record had paused 1 and offsets no larger than the sparse file, every resume request carried Range from start+done to end-1 and If-Range with the ETag, the file matched; Cancel kept the .part, Resume refused it, Retry completed it. shared_speed_limit_and_budget_govern_url_downloads: with Driver limits download_kb_s 200 the URL manager took the driver's own SharedBucket (same_bucket true) and ByteBudget; a 400 kB file took at least 1.6 s, the budget high watermark was between 16 KiB and 8 x 64 KiB and zero afterwards, and the same file was quick once the limit was 0. crash_resume_from_a_persisted_record_never_trusts_unsynced_bytes: a checkpointed record's offsets never exceeded the file, tasks were aborted without a sync, a new manager restored the record as Queued, resumed each incomplete part at start+done with If-Range and matched; a server without a validator restarted from byte 0 with a visible note. sha256_is_checked_before_completion: the right digest completed, a wrong one stopped with "SHA-256 mismatch" keeping bad.bin.part. a_silent_connection_is_cut_and_retried_without_a_total_timeout: a connection silent after 100 kB was cut by the idle deadline and the second request resumed at byte 100000; a server silent on every attempt stopped with the attempts reason. delete_data_removes_the_file_and_part_but_refuses_links: removal with data deleted the file and left the folder and a bystander file, removal without data kept the file, a .part swapped for a symlink was refused with the link and its target untouched, a hardlinked .part was refused. existing_files_are_never_overwritten: an existing name stopped the job with "already exists", a file as destination was refused, a duplicate URL for the same folder was refused.
+        """
+    author "Claude"
+}
+
+record templartorrent.evidence.http-gates/1 : evidence {
+    title "Commit dfa95bf: cargo fmt --check clean, Clippy on all targets with warnings denied clean, workspace suite 262 passed and 2 failed, both environmental (no ::1, no display); unit, packet, privacy and storage tests ran"
+    state verified
+    result pass
+    method command
+    observed_at git:dfa95bf6a1104f6761a67d115f7ee640838841d3
+    command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+    artifact "perf-results/2026-11-03-http-downloads/gates.log"
+    summary """
+        Commit dfa95bf on Linux 6.18 x86_64, rustc 1.99.0: cargo fmt --all --check exit 0; cargo clippy --workspace --all-targets -- -D warnings exit 0; cargo test --workspace --all-targets --no-fail-fast ran 264 tests with 262 passed, 2 failed and 2 ignored (the opt-in Internet smoke test and one adapter unit test). The two failures are environmental and failed identically on the parent commit 7593b71 before any change: driver_moves_payload_over_ipv6_and_a_dual_stack_listener cannot bind ::1 ("Address family not supported by protocol": the container has no IPv6 at all, /proc/net/if_inet6 is absent), and ui::tests::paste_magnet_from_the_system_clipboard has no X11 or Wayland display. Per binary: client 38, core 3 + 1 + 29, engine 1 + 10 + 23, adapter unit 65 (one ignored), dht 1, driver 34 of 35, http_download 12, localhost 11, mse 8, multiblock 3, parser_regressions 9, simd 2, storage 12. The packet, privacy and storage layers all ran: the mse, parser_regressions and multiblock binaries (peer wire and tracker bodies), the localhost and driver suites (private and unknown-private discovery, blocked peers), and the storage suite (symlinks, hardlinks, deletion). cargo tree --workspace -i ring found nothing. The preview workspace and the fuzz workspace both pass cargo check with the new Command variants. Not run: a headful window, Windows, any Internet transfer.
+        """
+    author "Claude"
+}
+
 record templartorrent.evidence.https-rustls/1 : evidence {
     title "Localhost HTTPS announce checks the certificate name"
     state verified
