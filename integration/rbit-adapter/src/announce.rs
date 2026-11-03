@@ -167,7 +167,9 @@ async fn announce_with(
     parse_announce_body(&body)
 }
 
-fn public_tls() -> Arc<ClientConfig> {
+/// The one rustls client configuration: webpki public roots, no client
+/// auth, no ALPN. Shared by tracker announces and HTTP file downloads.
+pub(crate) fn public_tls() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
         let mut roots = RootCertStore::empty();

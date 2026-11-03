@@ -92,7 +92,10 @@ pub fn parse_tracker_url(raw: &str) -> Result<ParsedTracker, &'static str> {
     })
 }
 
-fn split_host_port(hostport: &str, default_port: u16) -> Result<(String, u16), &'static str> {
+pub(crate) fn split_host_port(
+    hostport: &str,
+    default_port: u16,
+) -> Result<(String, u16), &'static str> {
     if let Some(rest) = hostport.strip_prefix('[') {
         let end = rest.find(']').ok_or("tracker IPv6 host is missing ']'")?;
         let host = rest[..end].to_string();
@@ -192,19 +195,25 @@ pub fn classify_addresses(addresses: &[IpAddr], allow_local: bool) -> Result<(),
 }
 
 pub async fn resolve_tracker(parsed: &ParsedTracker) -> Result<Vec<IpAddr>, &'static str> {
-    if parsed.host.eq_ignore_ascii_case("localhost") {
+    resolve_host(&parsed.host, parsed.port).await
+}
+
+/// Resolve `host` once, within 5 s, to its distinct addresses. `localhost`
+/// is both loopback families without a lookup; a literal address is itself.
+pub async fn resolve_host(host: &str, port: u16) -> Result<Vec<IpAddr>, &'static str> {
+    if host.eq_ignore_ascii_case("localhost") {
         return Ok(vec![
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(Ipv6Addr::LOCALHOST),
         ]);
     }
-    if let Ok(ip) = parsed.host.parse::<IpAddr>() {
+    if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
-    let lookup = if parsed.host.contains(':') {
-        format!("[{}]:{}", parsed.host, parsed.port)
+    let lookup = if host.contains(':') {
+        format!("[{host}]:{port}")
     } else {
-        format!("{}:{}", parsed.host, parsed.port)
+        format!("{host}:{port}")
     };
     let looked = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&lookup))
         .await

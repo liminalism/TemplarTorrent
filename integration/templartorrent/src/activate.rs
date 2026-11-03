@@ -47,7 +47,10 @@ pub fn valid_activation(text: &str) -> bool {
     {
         return false;
     }
-    if crate::workflow::normalize_magnet(text).is_ok() {
+    if crate::workflow::normalize_magnet(text).is_ok()
+        || text.starts_with("http://")
+        || text.starts_with("https://")
+    {
         return true;
     }
     Path::new(text)

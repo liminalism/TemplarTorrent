@@ -1,9 +1,14 @@
-//! Linux deletion through `openat` / `unlinkat`.
+//! Linux handle-relative file access: opening payload files and deleting
+//! them through `openat` / `mkdirat` / `unlinkat`.
 //!
-//! Each directory component is opened with `O_NOFOLLOW | O_DIRECTORY`, and the
-//! final name is stat'd and unlinked with `AT_SYMLINK_NOFOLLOW`. A symlink
-//! cannot become the removal target. The inode must still match the handle
-//! captured while the job file was open, and `nlink` must be 1.
+//! Each directory component is opened with `O_NOFOLLOW | O_DIRECTORY` from
+//! the previous directory's descriptor, so no component is ever re-walked by
+//! the kernel from a path string between a check and a use. A payload file is
+//! created and opened with `O_NOFOLLOW` on its parent descriptor and then
+//! checked by `fstat` to be a regular file. For deletion the final name is
+//! stat'd and unlinked with `AT_SYMLINK_NOFOLLOW`; a symlink cannot become
+//! the removal target, the inode must still match the handle captured while
+//! the job file was open, and `nlink` must be 1.
 #![allow(unsafe_code)]
 
 use std::{
@@ -14,6 +19,123 @@ use std::{
 };
 
 use super::{JobFiles, StorageError, io_error};
+
+/// Open (creating when missing) the payload file `parts` names under `root`,
+/// handle-relative: every directory is opened `O_NOFOLLOW | O_DIRECTORY` from
+/// its parent's descriptor (and created with `mkdirat` when absent), and the
+/// file is opened `O_RDWR | O_CREAT | O_NOFOLLOW` on the last directory's
+/// descriptor. A symlink at any level, including one planted between two
+/// steps, fails the open instead of being followed. The returned path is for
+/// labels and later identity checks only.
+pub(super) fn open_payload(
+    root: &Path,
+    parts: &[String],
+) -> Result<(std::fs::File, PathBuf), StorageError> {
+    let (name, directories) = parts
+        .split_last()
+        .ok_or_else(|| StorageError::Io("torrent file path is empty".into()))?;
+    let mut path = root.to_path_buf();
+    let mut dir = open_directory(root)?;
+    for part in directories {
+        path.push(part);
+        let c_part = cstring(OsStr::new(part))?;
+        dir = match try_open_child(&dir, &c_part) {
+            Ok(next) => next,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c_part.as_ptr(), 0o755) };
+                if rc != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(StorageError::Io(format!("{}: {error}", path.display())));
+                    }
+                }
+                try_open_child(&dir, &c_part)
+                    .map_err(|error| classify_open_error(error, &dir, &c_part, &path))?
+            }
+            Err(error) => return Err(classify_open_error(error, &dir, &c_part, &path)),
+        };
+    }
+    path.push(name);
+    let c_name = cstring(OsStr::new(name))?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(libc::ELOOP) {
+            StorageError::Symlink {
+                path: path.display().to_string(),
+            }
+        } else {
+            StorageError::Io(format!("{}: {error}", path.display()))
+        });
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = file.metadata().map_err(|error| io_error(&path, error))?;
+    if !meta.is_file() {
+        return Err(StorageError::Io(format!(
+            "{}: torrent file path is not a file",
+            path.display()
+        )));
+    }
+    Ok((file, path))
+}
+
+/// `openat(O_DIRECTORY | O_NOFOLLOW)` of one child, with the raw error so
+/// the caller can tell a missing directory from a symlink or a file.
+fn try_open_child(parent: &OwnedFd, c_name: &CString) -> Result<OwnedFd, std::io::Error> {
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A failed directory open, named. Linux answers `ENOTDIR` for a symlink
+/// opened with `O_DIRECTORY | O_NOFOLLOW` (and `ELOOP` on some paths), so
+/// the name is stat'd without following to tell a link from a plain file.
+fn classify_open_error(
+    error: std::io::Error,
+    parent: &OwnedFd,
+    c_name: &CString,
+    path: &Path,
+) -> StorageError {
+    if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                c_name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let is_link =
+            rc == 0 && unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK;
+        return if is_link || error.raw_os_error() == Some(libc::ELOOP) {
+            StorageError::Symlink {
+                path: path.display().to_string(),
+            }
+        } else {
+            StorageError::Io(format!(
+                "{}: parent path is not a directory",
+                path.display()
+            ))
+        };
+    }
+    StorageError::Io(format!("{}: {error}", path.display()))
+}
 
 pub(super) struct PlannedFile {
     pub path: PathBuf,
@@ -107,6 +229,58 @@ pub(super) fn unlink_matched(
         )));
     }
     Ok(())
+}
+
+/// Unlink one regular file under `root` by name, never following a symlink
+/// at any component, refusing a hardlinked or non-regular target. `Ok(false)`
+/// when nothing is at that name. Used for files a job owns outright (an HTTP
+/// download and its temporary sibling), where no handle-captured inode exists.
+pub(super) fn unlink_regular(root: &Path, path: &Path) -> Result<bool, StorageError> {
+    if path == root || !path.starts_with(root) {
+        return Err(StorageError::IdentityChanged {
+            path: path.display().to_string(),
+        });
+    }
+    let (dir, name) = open_parent(root, path)?;
+    let c_name = cstring(&name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(StorageError::Io(format!("{}: {error}", path.display())));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let path_text = path.display().to_string();
+    let mode = stat.st_mode & libc::S_IFMT;
+    if mode == libc::S_IFLNK {
+        return Err(StorageError::Symlink { path: path_text });
+    }
+    if mode != libc::S_IFREG {
+        return Err(StorageError::Io(format!(
+            "{path_text}: refusing to unlink a non-regular file"
+        )));
+    }
+    if stat.st_nlink > 1 {
+        return Err(StorageError::Hardlink { path: path_text });
+    }
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(StorageError::Io(format!(
+            "{path_text}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(true)
 }
 
 /// Remove empty directories that used to contain deleted files. Never removes

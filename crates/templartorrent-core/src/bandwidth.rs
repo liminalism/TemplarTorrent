@@ -1,5 +1,9 @@
 //! Global payload token bucket. Uses caller-supplied monotonic nanoseconds for reproducibility.
 //! Apply once per direction per session, not a separate copy per peer.
+//! [`SharedBucket`] is that one bucket behind a handle, so a transfer that
+//! does not go through the session (an HTTP file download) still spends from
+//! the same limit as every peer.
+use std::sync::{Arc, Mutex, MutexGuard};
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     bytes_per_second: u64,
@@ -73,5 +77,41 @@ impl TokenBucket {
         self.tokens = self.tokens.min(self.capacity);
         self.remainder = 0;
         Some(())
+    }
+}
+
+/// One token bucket shared by every spender in a direction. Cloning the
+/// handle does not clone the tokens: a limit change through one handle is
+/// seen by all, and bytes reserved by one are gone for the others.
+#[derive(Debug, Clone)]
+pub struct SharedBucket(Arc<Mutex<TokenBucket>>);
+impl SharedBucket {
+    pub fn new(bucket: TokenBucket) -> Self {
+        Self(Arc::new(Mutex::new(bucket)))
+    }
+    fn lock(&self) -> MutexGuard<'_, TokenBucket> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+    /// See [`TokenBucket::reserve`].
+    pub fn reserve(&self, bytes: u64, now_ns: u64) -> bool {
+        self.lock().reserve(bytes, now_ns)
+    }
+    /// See [`TokenBucket::wait_ns`].
+    pub fn wait_ns(&self, bytes: u64, now_ns: u64) -> Option<u64> {
+        self.lock().wait_ns(bytes, now_ns)
+    }
+    /// See [`TokenBucket::set_limit`].
+    pub fn set_limit(&self, kb_per_second: u64, now_ns: u64) -> Option<()> {
+        self.lock().set_limit(kb_per_second, now_ns)
+    }
+    pub fn rate(&self) -> u64 {
+        self.lock().rate()
+    }
+    pub fn capacity(&self) -> u64 {
+        self.lock().capacity()
+    }
+    /// True when two handles name the same bucket.
+    pub fn same_bucket(&self, other: &SharedBucket) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }

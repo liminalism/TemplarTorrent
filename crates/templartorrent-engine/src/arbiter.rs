@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use templartorrent_core::{
-    bandwidth::TokenBucket,
+    bandwidth::{SharedBucket, TokenBucket},
     budget::ByteBudget,
     model::{JobState, Limits, TorrentId, admitted_jobs},
 };
@@ -17,7 +17,7 @@ pub struct SessionArbiter {
     connections: HashMap<TorrentId, usize>,
     total_connections: usize,
     budget: ByteBudget,
-    down: TokenBucket,
+    down: SharedBucket,
     up: TokenBucket,
 }
 
@@ -31,7 +31,7 @@ impl SessionArbiter {
             limits,
             connections: HashMap::new(),
             total_connections: 0,
-            down,
+            down: SharedBucket::new(down),
             up,
         })
     }
@@ -96,6 +96,13 @@ impl SessionArbiter {
 
     pub fn budget(&self) -> &ByteBudget {
         &self.budget
+    }
+
+    /// The session's download bucket as a handle. Spenders outside the
+    /// session (HTTP file downloads) reserve from it directly, so one limit
+    /// covers peers and URL connections.
+    pub fn download_rate(&self) -> SharedBucket {
+        self.down.clone()
     }
 
     pub fn budget_used(&self) -> usize {

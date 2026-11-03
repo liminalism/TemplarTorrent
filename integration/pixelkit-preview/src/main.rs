@@ -1,12 +1,12 @@
 //! Interactive layout reference with FIXTURE DATA. No live transfers or fake working controls.
 //! Run with --font /path/to/a/static-TrueType.ttf. No font files are distributed here.
 #![forbid(unsafe_code)]
-use pixelkit_raster::{Painter, RasterKernel, Rect, WindowBuffer};
-use pixelkit_shell::{Input, KeyInput, MouseButton, Scale};
-use pixelkit_text::font::{Face, FaceId, FontSet};
-use pixelkit_text::{Align, TextCache, TextStyle};
-use pixelkit_ui::{Cell, Column, Row, ScrollState, TableState, Theme, Ui};
-use pixelkit_windowing::{CursorShape, PaneMetrics, Panes, PixelApp, Side, WindowConfig, run_app};
+use liminalkit_raster::{Painter, RasterKernel, Rect, WindowBuffer};
+use liminalkit_shell::{Input, KeyInput, MouseButton, Scale};
+use liminalkit_text::font::{Face, FaceId, FontSet};
+use liminalkit_text::{Align, TextCache, TextStyle};
+use liminalkit_ui::{Cell, Column, Row, ScrollState, TableState, Theme, Ui};
+use liminalkit_windowing::{CursorShape, PaneMetrics, Panes, PixelApp, Side, WindowConfig, run_app};
 mod bridge;
 mod view;
 

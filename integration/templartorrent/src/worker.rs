@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use templartorrent_core::model::{Command, JobState, Limits, PeerPreference, Snapshot, TorrentId};
 use templartorrent_rbit_adapter::driver::{Driver, ExistingData, PeerEncryption};
+use templartorrent_rbit_adapter::http::{
+    IDLE_TIMEOUT, UrlConfig, UrlDetail, UrlManager, UrlRecord,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::geo::GeoDb;
@@ -122,6 +125,9 @@ pub struct SessionView {
     pub port_mapping: bool,
     /// What the router mapping is doing now, without the external address.
     pub port_mapping_status: String,
+    /// The selected job's URL download state, when it is a URL job.
+    pub url_detail: Option<UrlDetail>,
+    pub allow_local_urls: bool,
 }
 
 impl SessionView {
@@ -148,6 +154,8 @@ impl SessionView {
             encryption: PeerEncryption::default(),
             port_mapping: false,
             port_mapping_status: "off".into(),
+            url_detail: None,
+            allow_local_urls: false,
         }
     }
 }
@@ -176,6 +184,8 @@ struct Visible {
     encryption: PeerEncryption,
     port_mapping: bool,
     port_mapping_status: String,
+    url_detail: Option<UrlDetail>,
+    allow_local_urls: bool,
 }
 
 pub fn same_visible(left: &SessionView, right: &SessionView) -> bool {
@@ -248,12 +258,16 @@ fn visible(view: &SessionView) -> Visible {
         encryption: view.encryption,
         port_mapping: view.port_mapping,
         port_mapping_status: view.port_mapping_status.clone(),
+        url_detail: view.url_detail.clone(),
+        allow_local_urls: view.allow_local_urls,
     }
 }
 
 pub struct WorkerConfig {
     pub limits: Limits,
     pub allow_local_trackers: bool,
+    /// URL downloads may reach loopback, private and link-local addresses.
+    pub allow_local_urls: bool,
     pub public_trackers: Vec<String>,
     pub public_tracker_path: PathBuf,
     pub geo_db_path: Option<PathBuf>,
@@ -280,6 +294,8 @@ pub enum Request {
         path: PathBuf,
     },
     AllowLocal(bool),
+    /// Save the URL address allowance; applies to the next Add.
+    AllowLocalUrls(bool),
     /// Save a new listen port; the listener rebinds on the next launch.
     SetListenPort(u16),
     /// Apply and save the MSE/PE policy for new connections.
@@ -385,13 +401,30 @@ struct Shared {
 enum Engine {
     Live {
         driver: Box<Driver>,
+        /// URL jobs, spending from the driver's budget and download rate.
+        urls: Box<UrlManager>,
         listen_error: Option<String>,
     },
     Down(&'static str),
 }
 
+/// A manager on the driver's shared limits.
+fn url_manager(driver: &Driver, allow_local: bool) -> Box<UrlManager> {
+    let (rate, origin) = driver.download_rate();
+    Box::new(UrlManager::new(UrlConfig {
+        budget: driver.payload_budget(),
+        rate,
+        origin,
+        allow_local,
+        tls: None,
+        idle: IDLE_TIMEOUT,
+        max_active: driver.limits().download_jobs,
+    }))
+}
+
 struct Memory {
     allow_local: bool,
+    allow_local_urls: bool,
     public_trackers: Vec<String>,
     public_path: PathBuf,
     geo: GeoDb,
@@ -443,6 +476,7 @@ async fn run_session(
 ) {
     let mut memory = Memory {
         allow_local: config.allow_local_trackers,
+        allow_local_urls: config.allow_local_urls,
         public_trackers: config.public_trackers.clone(),
         public_path: config.public_tracker_path.clone(),
         geo: GeoDb::new(config.geo_db_path),
@@ -478,15 +512,21 @@ async fn run_session(
                             memory.note = Some(format!("DHT unavailable: {}", error.0));
                         }
                     }
+                    let urls = url_manager(&driver, config.allow_local_urls);
                     Engine::Live {
                         driver: Box::new(driver),
+                        urls,
                         listen_error: None,
                     }
                 }
-                Err(error) => Engine::Live {
-                    driver: Box::new(driver),
-                    listen_error: Some(error.0.to_string()),
-                },
+                Err(error) => {
+                    let urls = url_manager(&driver, config.allow_local_urls);
+                    Engine::Live {
+                        driver: Box::new(driver),
+                        urls,
+                        listen_error: Some(error.0.to_string()),
+                    }
+                }
             }
         }
         Err(error) => Engine::Down(error.0),
@@ -527,26 +567,50 @@ async fn run_session(
             break;
         }
         match &mut engine {
-            Engine::Live { driver, .. } => {
+            Engine::Live { driver, urls, .. } => {
+                urls.tick();
                 if let Err(error) = driver.step(Duration::from_millis(200)).await {
                     memory.note = Some(error.0.to_string());
+                }
+                urls.tick();
+                // Names, sizes, completions and failures are saved as they
+                // arrive; offsets wait for the synced checkpoint below.
+                if let Some(store) = memory.store.as_ref()
+                    && let Err(error) = save_urls(store, &urls.take_dirty())
+                {
+                    memory.note = Some(format!("URL records not saved: {error}"));
                 }
             }
             Engine::Down(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
         last = publish_if_changed(&mut engine, &mut memory, &shared, last);
-        maybe_flush_resumes(&mut engine, &mut memory);
+        maybe_flush_resumes(&mut engine, &mut memory).await;
     }
-    if let Engine::Live { driver, .. } = &mut engine {
+    if let Engine::Live { driver, urls, .. } = &mut engine {
         let flush_error = memory
             .store
             .as_ref()
             .and_then(|store| flush_resumes(driver, store).err());
+        // URL tasks stop at an await point, their files are synced, and the
+        // durable offsets are saved; running intent survives for the next launch.
+        let records = urls.shutdown().await;
+        if let Some(store) = memory.store.as_ref()
+            && let Err(error) = save_urls(store, &records)
+        {
+            memory.note = Some(format!("URL records not saved: {error}"));
+        }
         driver.shutdown().await;
         if let Some(error) = flush_error {
             memory.note = Some(format!("resume bitmap not saved: {error}"));
         }
     }
+}
+
+fn save_urls(store: &SessionStore, records: &[UrlRecord]) -> Result<(), String> {
+    for record in records {
+        store.save_url(record)?;
+    }
+    Ok(())
 }
 
 /// Apply saved settings, then reinstall every saved job through a disk
@@ -556,7 +620,7 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
     let Some(store) = &memory.store else {
         return;
     };
-    let Engine::Live { driver, .. } = engine else {
+    let Engine::Live { driver, urls, .. } = engine else {
         return;
     };
     let mut notes = Vec::new();
@@ -564,9 +628,12 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
         Ok(Some(settings)) => {
             memory.allow_local = settings.allow_local_trackers;
             driver.set_allow_local_trackers(settings.allow_local_trackers);
+            memory.allow_local_urls = settings.allow_local_urls;
+            urls.set_allow_local(settings.allow_local_urls);
             memory.encryption = settings.encryption;
             driver.set_peer_encryption(settings.encryption);
             memory.port_mapping = settings.port_mapping;
+            urls.set_max_active(settings.limits.download_jobs);
             if driver.set_limits(settings.limits).await.is_err() {
                 notes.push("saved limits were rejected".to_string());
             }
@@ -601,6 +668,20 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
             Err(error) => {
                 skipped += 1;
                 first_skip.get_or_insert_with(|| format!("saved job skipped: {}", error.0));
+            }
+        }
+    }
+    let (url_records, url_errors) = store.load_urls();
+    skipped += url_errors.len();
+    if first_skip.is_none() {
+        first_skip = url_errors.into_iter().next();
+    }
+    for record in url_records {
+        match urls.restore(record) {
+            Ok(_) => restored += 1,
+            Err(error) => {
+                skipped += 1;
+                first_skip.get_or_insert_with(|| format!("saved URL job skipped: {error}"));
             }
         }
     }
@@ -652,13 +733,20 @@ fn flush_resumes(driver: &mut Driver, store: &SessionStore) -> Result<(), String
     Ok(())
 }
 
-fn maybe_flush_resumes(engine: &mut Engine, memory: &mut Memory) {
+async fn maybe_flush_resumes(engine: &mut Engine, memory: &mut Memory) {
     if memory.resume_flushed_at.elapsed() < RESUME_BATCH {
         return;
     }
-    let Engine::Live { driver, .. } = engine else {
+    let Engine::Live { driver, urls, .. } = engine else {
         return;
     };
+    // URL offsets: sync first, then save what moved.
+    let changed = urls.checkpoint().await;
+    if let Some(store) = memory.store.as_ref()
+        && let Err(error) = save_urls(store, &changed)
+    {
+        memory.note = Some(format!("URL records not saved: {error}"));
+    }
     let verified = driver
         .snapshot()
         .jobs
@@ -690,6 +778,7 @@ fn save_settings(driver: &Driver, memory: &Memory) -> Result<(), String> {
         listen_port: memory.listen_port,
         encryption: memory.encryption,
         port_mapping: memory.port_mapping,
+        allow_local_urls: memory.allow_local_urls,
     })
 }
 
@@ -700,9 +789,9 @@ fn persist_after(
     memory: &mut Memory,
     command: &Command,
     added: Option<TorrentId>,
-    removed: Option<[u8; 20]>,
+    removed: Option<Removed>,
 ) {
-    let Engine::Live { driver, .. } = engine else {
+    let Engine::Live { driver, urls, .. } = engine else {
         return;
     };
     let Some(store) = &memory.store else {
@@ -713,13 +802,21 @@ fn persist_after(
             Some(id) => save_job(driver, store, id),
             None => Ok(()),
         },
+        Command::AddUrl { .. } | Command::Retry(_) | Command::Cancel(_) => {
+            save_urls(store, &urls.take_dirty())
+        }
+        Command::Pause(id) | Command::Resume(id) if UrlManager::is_url_id(*id) => {
+            save_urls(store, &urls.take_dirty())
+        }
         Command::Pause(id)
         | Command::Resume(id)
         | Command::SetFileOrder { id, .. }
+        | Command::SetFileOrderAutomatic(id)
         | Command::SetFileWanted { id, .. }
         | Command::SetPeerPreference { id, .. } => save_job(driver, store, *id),
         Command::Remove { .. } => match removed {
-            Some(hash) => store.remove_job(&hash),
+            Some(Removed::Torrent(hash)) => store.remove_job(&hash),
+            Some(Removed::Url(key)) => store.remove_url(&key),
             None => Ok(()),
         },
         Command::SetLimits(_) => save_settings(driver, memory),
@@ -728,6 +825,12 @@ fn persist_after(
     if let Err(error) = result {
         memory.note = Some(format!("session not saved: {error}"));
     }
+}
+
+/// What a Remove took away, so its record can go too.
+enum Removed {
+    Torrent([u8; 20]),
+    Url([u8; 20]),
 }
 
 fn publish_if_changed(
@@ -784,12 +887,20 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
             encryption: memory.encryption,
             port_mapping: memory.port_mapping,
             port_mapping_status: "off".into(),
+            url_detail: None,
+            allow_local_urls: memory.allow_local_urls,
         },
         Engine::Live {
             driver,
+            urls,
             listen_error,
         } => {
             let mut snapshot = driver.snapshot();
+            if !urls.is_empty() {
+                let mut jobs = snapshot.jobs.to_vec();
+                jobs.extend(urls.rows());
+                snapshot.jobs = jobs.into();
+            }
             apply_rates(&mut snapshot, memory);
             let selected = selected.filter(|id| snapshot.jobs.iter().any(|job| job.id == *id));
             let listen = match (driver.listening_address(), listen_error.clone()) {
@@ -797,7 +908,15 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
                 (None, Some(error)) => ListenState::Failed(error),
                 (None, None) => ListenState::Starting,
             };
+            let url_detail = selected.and_then(|id| urls.detail(id));
             let (files, peers, trackers, destination, last_error) = match selected {
+                Some(_) if url_detail.is_some() => (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    url_detail.as_ref().map(|detail| detail.destination.clone()),
+                    url_detail.as_ref().and_then(|detail| detail.error.clone()),
+                ),
                 Some(id) => (
                     file_rows(driver, id),
                     peer_rows(driver, id, &mut memory.geo),
@@ -831,6 +950,8 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
                 encryption: memory.encryption,
                 port_mapping: memory.port_mapping,
                 port_mapping_status: driver.port_mapping_status().describe(),
+                url_detail,
+                allow_local_urls: memory.allow_local_urls,
             }
         }
     }
@@ -940,7 +1061,13 @@ async fn dispatch(
         Request::Command { seq, command } => {
             let stop = matches!(command, Command::Shutdown);
             let removed = match (&command, &*engine) {
-                (Command::Remove { id, .. }, Engine::Live { driver, .. }) => driver.info_hash(*id),
+                (Command::Remove { id, .. }, Engine::Live { driver, urls, .. }) => {
+                    if UrlManager::is_url_id(*id) {
+                        urls.key(*id).map(Removed::Url)
+                    } else {
+                        driver.info_hash(*id).map(Removed::Torrent)
+                    }
+                }
                 _ => None,
             };
             let torrent = match &command {
@@ -1035,6 +1162,16 @@ async fn dispatch(
             }
             false
         }
+        Request::AllowLocalUrls(allow) => {
+            memory.allow_local_urls = allow;
+            if let Engine::Live { driver, urls, .. } = engine {
+                urls.set_allow_local(allow);
+                if let Err(error) = save_settings(driver, memory) {
+                    memory.note = Some(format!("session not saved: {error}"));
+                }
+            }
+            false
+        }
         Request::SetEncryption(encryption) => {
             memory.encryption = encryption;
             if let Engine::Live { driver, .. } = engine {
@@ -1084,9 +1221,41 @@ async fn run_command(
     command: &Command,
     torrent: Option<&[u8]>,
 ) -> Result<Option<TorrentId>, String> {
-    let Engine::Live { driver, .. } = engine else {
+    let Engine::Live { driver, urls, .. } = engine else {
         return Err("the session driver did not start".into());
     };
+    match command {
+        Command::AddUrl {
+            url,
+            destination,
+            sha256,
+        } => return urls.add(url, destination, *sha256).await.map(Some),
+        Command::Pause(id) if UrlManager::is_url_id(*id) => {
+            return urls.pause(*id).await.map(|()| None);
+        }
+        Command::Resume(id) if UrlManager::is_url_id(*id) => {
+            return urls.resume(*id).map(|()| None);
+        }
+        Command::Retry(id) => {
+            if !UrlManager::is_url_id(*id) {
+                return Err("only URL downloads can be retried".into());
+            }
+            return urls.retry(*id).map(|()| None);
+        }
+        Command::Cancel(id) => {
+            if !UrlManager::is_url_id(*id) {
+                return Err(
+                    "only URL downloads can be cancelled; pause the torrent instead".into(),
+                );
+            }
+            return urls.cancel(*id).await.map(|()| None);
+        }
+        Command::Remove { id, delete_data } if UrlManager::is_url_id(*id) => {
+            return urls.remove(*id, *delete_data).await.map(|_| None);
+        }
+        Command::SetLimits(limits) => urls.set_max_active(limits.download_jobs),
+        _ => {}
+    }
     let outcome = match command {
         Command::Add {
             source,
@@ -1126,6 +1295,7 @@ async fn run_command(
         Command::SetFileOrder { id, file_indices } => {
             driver.set_file_order(*id, file_indices.clone())
         }
+        Command::SetFileOrderAutomatic(id) => driver.set_file_order_automatic(*id),
         Command::SetFileWanted {
             id,
             file_index,
@@ -1142,6 +1312,9 @@ async fn run_command(
             Ok(())
         }
         Command::Shutdown => Ok(()),
+        Command::AddUrl { .. } | Command::Retry(_) | Command::Cancel(_) => {
+            unreachable!("routed to the URL manager above")
+        }
     };
     outcome.map(|()| None).map_err(|error| error.0.to_string())
 }
@@ -1242,6 +1415,7 @@ mod tests {
         WorkerConfig {
             limits: Limits::default(),
             allow_local_trackers: false,
+            allow_local_urls: true,
             public_trackers: Vec::new(),
             public_tracker_path: PathBuf::from("public-trackers.txt"),
             geo_db_path: None,
@@ -1281,6 +1455,7 @@ mod tests {
     fn capture_without_a_geo_database_reports_not_loaded() {
         let mut memory = Memory {
             allow_local: false,
+            allow_local_urls: false,
             public_trackers: Vec::new(),
             public_path: PathBuf::from("public-trackers.txt"),
             geo: GeoDb::new(None),
@@ -1434,6 +1609,7 @@ mod tests {
                 listen_port: 0,
                 encryption: PeerEncryption::default(),
                 port_mapping: false,
+                allow_local_urls: false,
             })
             .unwrap();
         store
@@ -1445,6 +1621,7 @@ mod tests {
                 public_bootstrap: false,
                 wanted: vec![true, true],
                 order: vec![1, 0],
+                tiers: Vec::new(),
                 trackers: Vec::new(),
                 preferences: vec![("10.0.0.9".parse().unwrap(), PeerPreference::Block)],
             })
@@ -1551,6 +1728,7 @@ mod tests {
                 public_bootstrap: false,
                 wanted: vec![true, true],
                 order: vec![1, 0],
+                tiers: Vec::new(),
                 trackers: Vec::new(),
                 preferences: Vec::new(),
             })
@@ -1672,6 +1850,180 @@ mod tests {
         assert!(ack.accepted, "{}", ack.message);
         assert!(!resume_path.exists(), "removal deletes the bitmap");
         handle.shutdown();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A URL job goes through the same command channel as a torrent: it is
+    /// added, shows in the snapshot, is saved as a record, restored on the
+    /// next launch, and its record goes when it is removed.
+    #[test]
+    fn url_jobs_are_added_saved_restored_and_removed_through_the_worker() {
+        use templartorrent_rbit_adapter::http::fixture::{self, Behaviour};
+        let base =
+            std::env::temp_dir().join(format!("templartorrent-worker-url-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = runtime.block_on(fixture::start(Behaviour {
+            body: data.clone(),
+            ..Behaviour::default()
+        }));
+        let url = server.url("/worker.bin");
+        let server_task = std::thread::spawn(move || {
+            runtime.block_on(async {
+                let _server = server;
+                std::future::pending::<()>().await;
+            });
+        });
+        let store = SessionStore::new(base.join("session"));
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            session_dir: Some(base.join("session")),
+            ..config()
+        })
+        .unwrap();
+        handle
+            .try_request(Request::Command {
+                seq: 1,
+                command: Command::AddUrl {
+                    url: url.clone(),
+                    destination: base.join("files"),
+                    sha256: None,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(1, Duration::from_secs(5)).expect("add ack");
+        assert!(ack.accepted, "{}", ack.message);
+        let start = Instant::now();
+        let view = loop {
+            let view = handle.view();
+            if view
+                .snapshot
+                .jobs
+                .iter()
+                .any(|job| job.state == JobState::Complete)
+            {
+                break view;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "never completed: {:?}",
+                view.snapshot.jobs
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let job = view.snapshot.jobs[0].clone();
+        assert!(UrlManager::is_url_id(job.id));
+        assert_eq!(&*job.name, "worker.bin");
+        assert_eq!(job.wanted_bytes, data.len() as u64);
+        assert_eq!(std::fs::read(base.join("files/worker.bin")).unwrap(), data);
+        handle.set_selected(Some(job.id));
+        let start = Instant::now();
+        loop {
+            let view = handle.view();
+            if let Some(detail) = view.url_detail {
+                assert_eq!(detail.state, JobState::Complete);
+                assert_eq!(
+                    view.destination.as_deref(),
+                    Some(detail.destination.as_str())
+                );
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "no URL detail");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (records, errors) = store.load_urls();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].complete);
+        // Retry and Cancel refuse torrent ids and a complete URL job.
+        handle
+            .try_request(Request::Command {
+                seq: 2,
+                command: Command::Retry(TorrentId(1)),
+            })
+            .unwrap();
+        let ack = handle.wait_ack(2, Duration::from_secs(5)).unwrap();
+        assert!(
+            !ack.accepted && ack.message.contains("only URL"),
+            "{}",
+            ack.message
+        );
+        handle
+            .try_request(Request::Command {
+                seq: 3,
+                command: Command::Cancel(job.id),
+            })
+            .unwrap();
+        let ack = handle.wait_ack(3, Duration::from_secs(5)).unwrap();
+        assert!(
+            !ack.accepted && ack.message.contains("complete"),
+            "{}",
+            ack.message
+        );
+        handle.try_request(Request::AllowLocalUrls(false)).unwrap();
+        let start = Instant::now();
+        while handle.view().allow_local_urls {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.shutdown();
+        assert!(!store.load_settings().unwrap().unwrap().allow_local_urls);
+
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            session_dir: Some(base.join("session")),
+            ..config()
+        })
+        .unwrap();
+        let start = Instant::now();
+        let restored = loop {
+            let view = handle.view();
+            if view.snapshot.jobs.len() == 1 {
+                break view.snapshot.jobs[0].clone();
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "{:?}", view.note);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(restored.state, JobState::Complete);
+        assert_eq!(&*restored.name, "worker.bin");
+        // The saved allowance was off, so a second add of the loopback URL is refused.
+        handle
+            .try_request(Request::Command {
+                seq: 1,
+                command: Command::AddUrl {
+                    url: url.clone(),
+                    destination: base.join("other"),
+                    sha256: None,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(1, Duration::from_secs(5)).unwrap();
+        assert!(
+            !ack.accepted && ack.message.contains("local or private"),
+            "{}",
+            ack.message
+        );
+        handle
+            .try_request(Request::Command {
+                seq: 2,
+                command: Command::Remove {
+                    id: restored.id,
+                    delete_data: false,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(2, Duration::from_secs(5)).unwrap();
+        assert!(ack.accepted, "{}", ack.message);
+        assert!(store.load_urls().0.is_empty(), "the record is gone");
+        assert!(
+            base.join("files/worker.bin").exists(),
+            "data kept by default"
+        );
+        handle.shutdown();
+        drop(server_task);
         let _ = std::fs::remove_dir_all(&base);
     }
 

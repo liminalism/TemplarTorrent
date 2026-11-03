@@ -3,16 +3,18 @@
 **Design baseline: 9 October 2026.** Linux desktop application; Windows is optional
 following the user's 15 October 2026 scope change. Windows-specific requirements
 below are retained as future reference and are not completion gates. Rust
-1.99.0 / edition 2024. PixelKit for the complete application-owned UI, rbit 0.2.2
-for protocol primitives. This is the implementation specification; the archive's
+1.99.0 / edition 2024. liminalkit (formerly PixelKit) for the complete application-owned UI, rbit
+0.2.2 for protocol primitives. This is the implementation specification; the archive's
 reference code implements only the parts identified in README.md.
 
 ## 1. Product boundary
 
-A small, direct torrent client: add a magnet or `.torrent`, choose a destination,
-download, seed, inspect files/peers, change limits, and remove the job safely. No
-web UI, daemon, media player, content search, advertising, account, RSS subscription,
-plugin runtime or automatic content execution. Do not call external torrent tools.
+A small, direct download client: add a magnet, a `.torrent`, or (since the
+3 November 2026 scope change, section 11) an `http://` or `https://` file URL;
+choose a destination; download, seed torrents, inspect files/peers, change limits,
+and remove the job safely. No web UI, webview, daemon, media player, stream
+capture, content search, advertising, account, RSS subscription, plugin runtime or
+automatic content execution. Do not call external torrent or download tools.
 
 One process and one native main window by default. Closing the window performs an
 orderly shutdown and stops transfers; do not quietly introduce a background service.
@@ -26,9 +28,13 @@ assume an upstream `Session::add_torrent` API. [S1]
 ### Reviewed versions and compatibility gates
 
 Use Rust 1.99.0, released 1 October 2026, and pin the release toolchain rather than
-letting CI change underneath a performance comparison. [S2] Pin all PixelKit git
-dependencies to revision `614c9c6e84ce3cd0bc6c81988f636b493b30a497`. Version bumps
-must include changed API review, lockfile diff and a baseline comparison.
+letting CI change underneath a performance comparison. [S2] The UI toolkit is
+liminalkit, the renamed and improved successor of the PixelKit revision
+`614c9c6e84ce3cd0bc6c81988f636b493b30a497` this design was written against
+(user's 3 November 2026 instruction). It is taken from its `main` branch and
+held by `Cargo.lock`, not by a `rev` in the manifests: a bump is a deliberate
+lockfile change that must include changed API review, the lockfile diff and a
+baseline comparison. [S13]
 
 The requested Rust-only application architecture is retained. Strictly excluding
 non-Rust third-party implementation code is a separate release requirement:
@@ -129,7 +135,9 @@ title changes; use PixelKit `poll_title`, not raw window handles. [S4]
 ### Add dialog
 
 Single-line magnet input with paste support, `.torrent` file selection and drop
-support. A destination field, Browse action, recent directories and available space
+support. The same input accepts one `http://` or `https://` file URL, or a bounded
+batch of them separated by whitespace (section 11); the public-discovery checkbox
+does not apply to a URL and an optional SHA-256 field applies to one URL only. A destination field, Browse action, recent directories and available space
 indicator follow. Use a small asynchronous PixelKit folder browser rather than
 adding a GTK/Qt dependency for one dialog. Windows shell APIs can be an optional
 native browser adapter; the application code remains Rust.
@@ -237,9 +245,16 @@ clips are ambiguous. Unrelated files use ordinary rarest-first rather than claim
 a filename guess is certain. Padding is not a user-downloadable file; small sidecar
 files can be scheduled after their associated primary file under a documented rule.
 
-The reference natural comparator is allocation-free and handles arbitrarily long
-ASCII numeric runs, but group inference and full locale/Unicode collation are not
-implemented. This is deliberate: the scalar policy is the correctness baseline.
+The natural comparator is allocation-free and handles arbitrarily long ASCII
+numeric runs; full locale/Unicode collation is not implemented. Group inference
+lives in `templartorrent-core::grouping` (3 November 2026): files that share one
+name template differing in one or two numeric runs form the sequence, ordered
+outer run first; sidecars (subtitles, checksums, notes) whose stem begins with a
+member's follow that member in their own tier; three or more varying runs
+(dates), two templates of equal size, or fewer than two members mean no claim,
+and every file shares one tier so the picker stays rarest-first. A tier is a set
+of files with one rank; the user's manual order is always strict, and
+"Automatic order" returns to the detected tiers. Pad files trail.
 
 ### Scheduler definition
 
@@ -571,6 +586,111 @@ No release claim until a clean Rust build, live transfer, upload, correctness an
 safe-removal tests pass on Windows and Linux. No strict "100% Rust dependencies"
 claim until the TLS/native-source audit is closed.
 
+## 11. HTTP and HTTPS file downloads
+
+**Scope change, 3 November 2026.** The user asked for the same application to be a
+download manager for ordinary `http://` and `https://` files. The behaviour below
+follows the transfer rules of the reviewed reference client [S12], and leaves its
+stack behind: no Tauri or WebKit, no browser extension in this tree, no yt-dlp,
+FFmpeg, HLS or stream capture, and no tray background mode. Closing the window
+still stops every transfer. Internet transfers stay opt-in and use content the
+user names; the only automated proof is localhost fixtures.
+
+### Jobs and queue
+
+A URL job is a row in the same download list, with the same Pause, Resume and
+Remove commands and the same remove dialog, whose data checkbox stays unchecked
+by default. URL jobs add Retry (restart a failed job, keeping a resumable partial
+file) and Cancel (stop and keep the partial file; Retry restarts it). The Add
+dialog takes one URL or a batch of at most 16, each becoming its own job and its
+own acknowledgement. The `Download jobs` setting admits URL jobs as its own pool
+of the same size; torrent admission is unchanged. Rows are keyed in the same
+`TorrentId` space, so selection, the inspector and the window title work
+unchanged; URL rows show `—` for peers, trackers and ratio.
+
+### Transport and admission
+
+Downloads use the application's rustls 0.23.46 transport from the tracker
+announce path: webpki public roots, the certificate checked against the host in
+the URL, HTTP/1.1 only. Admission before any connection: scheme `http` or
+`https` only, no userinfo, URL at most 2048 bytes, the host resolved once and
+every address classified. Loopback, private (RFC 1918), carrier-grade NAT,
+link-local (including `169.254.169.254` and `fe80::/10`), unique-local,
+documentation, multicast and unspecified addresses are refused with a reason
+unless the user passes `--allow-local-urls` or ticks the equivalent setting,
+mirroring `--allow-local-trackers`. Redirects are followed at most 5 times; each
+`Location` is re-admitted under the same rules, a relative location is resolved
+against the previous URL, and an `https` to `http` downgrade is refused. The
+request asks for identity encoding; a body served with another
+`Content-Encoding` is taken as a single stream with no byte offsets and no resume.
+
+### Ranges and connections
+
+The first request is a GET with `Range: bytes=0-`. A `206` whose `Content-Range`
+names a total makes the job ranged: when the total is at least 1 MiB, it is split
+into contiguous parts, by default 4 and never more than 8 (the hard cap), each
+on its own connection; the first connection serves part 0 and is closed once part
+0 is complete. A `200` means one connection; its `Content-Length`, when present,
+is the size, and `Accept-Ranges: bytes` is remembered for resume. A body with no
+length (chunked or read to EOF) has an unknown size, shown as `—`, never a
+plausible zero. A `206` whose `Content-Range` does not start at the requested
+offset or whose total differs from the known size is a protocol failure, not data.
+
+Every connection reserves its read buffer (64 KiB) from the global payload
+budget of section 7 before reading and releases it after the bytes are written,
+and reserves those bytes from the same session download token bucket of section 3
+that peers spend from; the bucket is shared, not copied. A connection is dropped
+after 30 seconds without data and the part retried with bounded exponential
+backoff, at most 5 attempts; a part that made progress keeps its remaining
+attempts. There is no total transfer timeout.
+
+### Resume identity
+
+A resumable job records a strong validator from the first response: an ETag that
+is quoted and not weak, else `Last-Modified` when the response `Date` is at least
+60 seconds later (RFC 9110 section 8.8.2.2). A resume request carries
+`Range: bytes=<done>-<end>` and `If-Range: <validator>` and is accepted only as a
+`206` whose `Content-Range` starts at `<done>` with the recorded total and whose
+validator, when echoed, is unchanged. Anything else stops the job with a visible
+reason ("the server's file changed") and keeps the partial file. A job without a
+validator cannot resume: Resume after a pause or a restart begins again at byte
+zero and says so. Parts progress is written to the session record only after the
+temporary file has been synced, so a persisted offset never exceeds durable bytes;
+after a crash the client trusts the record, truncates nothing, and rewrites from
+the persisted offsets.
+
+### Files and completion
+
+The destination is a folder, validated like a torrent destination. The file name
+comes from `Content-Disposition` when it carries a sane filename, else from the
+last URL path segment, else `download`; names are sanitized to a single
+component without control characters and bounded to 255 bytes. Bytes go to a
+temporary sibling `<name>.part` opened without following links; an existing
+`<name>` or an unowned `<name>.part` refuses the add rather than overwriting.
+Completion is: optional SHA-256 over the temporary file against the user-supplied
+digest (a mismatch is an error that keeps the file), `fdatasync`, rename to
+`<name>`, directory sync, then the row turns `Complete`. Removing with data
+deletes `<name>` and `<name>.part` through the same handle-relative, no-follow,
+hardlink-refusing path as torrent files, and never the folder.
+
+### Persistence
+
+Each URL job has a schema-versioned `<key>.url` record beside the torrent records
+under the session directory: URL, destination, file name, size or unknown,
+validator, part offsets, expected digest, paused or running intent and last
+error. Records are written atomically on add, pause, resume, cancel, every ten
+seconds while offsets change, and on shutdown, and are deleted on remove. On
+launch every record is restored as a row without contacting the server; a running
+job resumes under the identity rules above.
+
+### Proof
+
+Localhost fixtures only, each on an owned temporary root: a ranged body and a
+non-ranged body; the redirect bound; an identity mismatch on resume; pause and
+resume; the shared speed limit with a torrent-sized budget; crash resume from a
+persisted record; safe deletion that refuses a symlink. Unit, packet, privacy and
+storage tests run after every transport change.
+
 ## Sources reviewed
 
 [S1] rbit 0.2.2 overview and architecture: https://docs.rs/rbit/0.2.2/rbit/
@@ -587,6 +707,10 @@ https://github.com/liminalism/pixelkit/blob/614c9c6e84ce3cd0bc6c81988f636b493b30
 [S9] maxminddb reader: https://docs.rs/maxminddb/latest/maxminddb/
 [S10] Rust runtime CPU detection: https://doc.rust-lang.org/std/macro.is_x86_feature_detected.html
 [S11] wide: https://docs.rs/wide/latest/wide/
+[S13] liminalkit README and crates (the toolkit's current name and API):
+https://github.com/liminalism/liminalkit
+[S12] Linux Download Manager v0.3.0 README and `src-tauri/src/download/`, read as a
+behaviour reference only: https://github.com/ekremx25/linux-download-manager
 
 Sources establish upstream capabilities/protocol facts. Numeric defaults, budgets,
 architecture, scoring, UI choices and performance targets are this design's

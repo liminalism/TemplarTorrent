@@ -1,8 +1,9 @@
 //! File-backed piece storage: one validated directory tree per job, v1
 //! concatenated-file mapping, explicit errors instead of silent overwrite.
 //!
-//! Paths are validated lexically ([`RelativeFile`]) and refused when any level
-//! is a symlink. Pre-existing files at or under the torrent length resume in
+//! Paths are validated lexically ([`RelativeFile`]) and opened handle-relative
+//! with `O_NOFOLLOW` at every level, so a symlink anywhere under the root is
+//! refused rather than followed, even one planted while the job is being set up. Pre-existing files at or under the torrent length resume in
 //! place; longer files are an explicit [`StorageError::LengthMismatch`], never
 //! silently truncated. Every piece write ends with a data sync so verified
 //! bytes are durable before the engine credits them. A resume checkpoint
@@ -18,16 +19,16 @@
 //! bytes), reads return zeros, and their identity stamp is a fixed
 //! placeholder so resume records keep one entry per torrent file.
 //!
-//! Deletion is Linux handle-relative: `openat`/`unlinkat` with
+//! Deletion is Linux handle-relative too: `openat`/`unlinkat` with
 //! `O_NOFOLLOW`, inode identity taken from the still-open handle, hardlink
-//! refusal, and no removal of the destination directory itself. Symlink
-//! checks at open time still do not re-validate every later read.
+//! refusal, and no removal of the destination directory itself. Reads and
+//! writes go through the handles opened at set-up, never through paths.
 
 #![deny(unsafe_code)]
 
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -237,15 +238,58 @@ impl JobFiles {
     }
 }
 
+/// Delete one file a job owns outright, by name under `root`: every directory
+/// component is opened `O_NOFOLLOW`, the target is stat'd without following,
+/// and a symlink, a non-regular file or a hardlinked file is refused. The
+/// root itself is never removed. `Ok(false)` when the name is absent.
+pub fn delete_owned_file(root: &Path, path: &Path) -> Result<bool, StorageError> {
+    if !root.is_absolute() {
+        return Err(StorageError::Io(
+            "storage root must be an absolute directory".into(),
+        ));
+    }
+    deletion::unlink_regular(root, path)
+}
+
+/// Sees every payload write and every durability barrier, in order. A test
+/// harness models power loss with it: bytes written since the last `synced`
+/// may vanish, bytes before it may not. Production installs none.
+pub trait DiskObserver: Send {
+    /// `data` was written to `path` at `offset` within that file.
+    fn wrote(&mut self, path: &Path, offset: u64, data: &[u8]);
+    /// Every handle of `job` completed `sync_all`.
+    fn synced(&mut self, job: TorrentId);
+}
+
 /// Direct single-owner file storage. Register each job with [`FileStore::add_job`].
 #[derive(Default)]
 pub struct FileStore {
     jobs: HashMap<u64, JobFiles>,
+    observer: Mutex<Option<Box<dyn DiskObserver>>>,
 }
 
 impl FileStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install or remove the write and sync observer (fault injection).
+    pub fn set_observer(&self, observer: Option<Box<dyn DiskObserver>>) {
+        *self
+            .observer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = observer;
+    }
+
+    fn observe(&self, notify: impl FnOnce(&mut dyn DiskObserver)) {
+        if let Some(observer) = self
+            .observer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_mut()
+        {
+            notify(observer.as_mut());
+        }
     }
 
     /// Close every handle for a quiesced job; leaves all data intact.
@@ -331,41 +375,8 @@ impl FileStore {
                 continue;
             }
             let relative = RelativeFile::new(components.clone()).map_err(StorageError::Path)?;
-            let mut path = root.to_path_buf();
-            let parts = relative.components();
-            for (index, part) in parts.iter().enumerate() {
-                path.push(part);
-                let last = index + 1 == parts.len();
-                match probe(&path)? {
-                    Some(meta) => {
-                        if last && !meta.is_file() {
-                            return Err(StorageError::Io(format!(
-                                "{}: torrent file path is not a file",
-                                path.display()
-                            )));
-                        }
-                        if !last && !meta.is_dir() {
-                            return Err(StorageError::Io(format!(
-                                "{}: parent path is not a directory",
-                                path.display()
-                            )));
-                        }
-                    }
-                    None => {
-                        if last {
-                            File::create(&path).map_err(|error| io_error(&path, error))?;
-                        } else {
-                            std::fs::create_dir(&path).map_err(|error| io_error(&path, error))?;
-                        }
-                        probe(&path)?;
-                    }
-                }
-            }
-            let handle = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(|error| io_error(&path, error))?;
+            // Handle-relative, no-follow open: see `deletion::open_payload`.
+            let (handle, path) = deletion::open_payload(root, relative.components())?;
             let found = handle
                 .metadata()
                 .map_err(|error| io_error(&path, error))?
@@ -471,6 +482,7 @@ impl FileStore {
                     .map_err(|error| io_error(&file.path, error))?;
             }
         }
+        self.observe(|observer| observer.synced(id));
         self.file_identity(id)
     }
 
@@ -536,8 +548,8 @@ impl PieceSink for FileStore {
         piece: u32,
         data: &[u8],
     ) -> Result<(), SinkError> {
-        let job = self.job_mut(torrent)?;
-        let (mut offset, expected) = job
+        let (mut offset, expected) = self
+            .job(torrent)?
             .piece_range(piece)
             .ok_or_else(|| storage_to_sink(StorageError::UnknownPiece(piece)))?;
         if data.len() != expected {
@@ -546,6 +558,13 @@ impl PieceSink for FileStore {
                 data.len()
             )));
         }
+        let observing = self
+            .observer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some();
+        let mut written: Vec<(PathBuf, u64, Vec<u8>)> = Vec::new();
+        let job = self.job_mut(torrent)?;
         let mut remaining = data;
         while !remaining.is_empty() {
             let index = job
@@ -573,8 +592,18 @@ impl PieceSink for FileStore {
             handle
                 .write_all(&remaining[..writable])
                 .map_err(|error| storage_to_sink(io_error(&file.path, error)))?;
+            if observing {
+                written.push((
+                    file.path.clone(),
+                    offset - file.offset,
+                    remaining[..writable].to_vec(),
+                ));
+            }
             remaining = &remaining[writable..];
             offset += writable as u64;
+        }
+        for (path, at, bytes) in written {
+            self.observe(|observer| observer.wrote(&path, at, &bytes));
         }
         Ok(())
     }
@@ -645,6 +674,14 @@ pub struct SharedStore {
 impl SharedStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// See [`FileStore::set_observer`].
+    pub fn set_observer(&self, observer: Option<Box<dyn DiskObserver>>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .set_observer(observer);
     }
 
     pub fn close_job(&self, id: TorrentId) -> Result<bool, StorageError> {

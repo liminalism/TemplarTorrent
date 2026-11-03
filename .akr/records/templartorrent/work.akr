@@ -132,6 +132,34 @@ record templartorrent.work.file-storage/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.handle-relative-store/1 : work {
+    title "Open payload files handle-relative with O_NOFOLLOW at every level"
+    state completed
+    intent """
+        Close the FileStore hardening gap of DESIGN.md section 3: payload files were probed with symlink_metadata and then created or opened by path, leaving a window in which a symlink planted between the check and the open would be followed. Open every directory component from its parent's descriptor with O_NOFOLLOW | O_DIRECTORY (creating it with mkdirat when absent) and the file with openat O_RDWR | O_CREAT | O_NOFOLLOW on that descriptor, then confirm by fstat that the handle is a regular file. Reads, writes and the resume identity continue to use the handles, never paths. Windows reparse handling stays optional and out of scope.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Adapter and client suites still transfer, resume and delete through the handle-relative store; format and Clippy with warnings denied pass
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+            verified_by [ @templartorrent.evidence.handle-relative-store/1 ]
+        }
+        check no-follow {
+            statement """
+                Storage tests: a symlink at the final name, a symlinked directory component, and a symlink to a regular file are refused as Symlink; a file where a directory should be is refused; a missing directory chain is created and pre-existing files still resume
+                """
+            method command
+            command "cargo test -p templartorrent-storage"
+            verified_by [ @templartorrent.evidence.handle-relative-store/1 ]
+        }
+    }
+    part_of [ @templartorrent.milestone.safety-and-peer-policy ]
+    author "Claude"
+}
+
 record templartorrent.work.https-rustls/1 : work {
     title "HTTPS tracker announces through rustls 0.23.46"
     state completed
@@ -234,6 +262,33 @@ record templartorrent.work.optimistic-unchoke/1 : work {
             verified_by [ @templartorrent.evidence.optimistic-rotation/1 ]
         }
     }
+}
+
+record templartorrent.work.peer-id-client-fallback/1 : work {
+    title "Name peers from their BEP 20 peer id when no extension handshake names them"
+    state completed
+    intent """
+        Close the README's "peer-ID client fallback" gap: a peer that sends no extension handshake, or one without a v string, showed as Unknown in the Peers tab. Decode Azureus-style, Shadow-style, Mainline and the known fixed-prefix ids into a bounded clean label at connection time, keep the extension handshake's own name as the better source when it arrives, and never let the guess reach policy.
+        """
+    acceptance {
+        check decoder {
+            statement """
+                Unit tests cover Azureus codes with dotted versions, Shadow and Mainline forms, fixed prefixes, unknown ids and ids carrying control bytes
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --lib client_id"
+            verified_by [ @templartorrent.evidence.peer-id-client-fallback/1 ]
+        }
+        check wire {
+            statement """
+                Over a real loopback wire, fixture peers with the id -TR4040- and no extension name show as Transmission 4.0.4.0 in peer_status
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver driver_peer_preference_narrows_retains_and_blocks"
+            verified_by [ @templartorrent.evidence.peer-id-client-fallback/1 ]
+        }
+    }
+    author "Claude"
 }
 
 record templartorrent.work.peer-preference/1 : work {
@@ -368,6 +423,34 @@ record templartorrent.work.picker-buckets/1 : work {
     part_of [ @templartorrent.milestone.picker-optimization ]
 }
 
+record templartorrent.work.power-loss-batched-sync/1 : work {
+    title "Prove the batched sync against power loss with a fault-injected disk"
+    state completed
+    intent """
+        Close the open gate on the batched write path (milestone loopback-throughput dropped the per-piece fdatasync): show that a resume bitmap written at a checkpoint names only pieces the checkpoint's sync made durable, so a power loss after the checkpoint cannot leave a trusted bit over bytes that never reached the disk. The forced-kill test could not show this because the page cache survives a killed process. Add a disk observer seam to the storage crate, a shadow that models durable versus volatile bytes, and a driver test that loses power after a checkpoint, restores the durable image with the checkpoint's mtimes, restarts from the record and completes with matching bytes; and a negative control that forges one lost piece into the bitmap and shows the resulting hole, proving the harness can tell.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Storage and adapter suites, format check and Clippy with warnings denied pass with the observer seam in place
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p templartorrent-storage -p templartorrent-rbit-adapter --no-fail-fast"
+            verified_by [ @templartorrent.evidence.power-loss-batched-sync/1 ]
+        }
+        check power-loss {
+            statement """
+                After a simulated power loss the restart trusts the checkpoint bitmap (resume_scan note None, trusted equals the bitmap's pieces), completes, and the files match; the same run with a forged bit over a lost piece ends with zeros in that piece
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver driver_resume_bitmap_survives_a_power_loss_after_the_sync"
+            verified_by [ @templartorrent.evidence.power-loss-batched-sync/1 ]
+        }
+    }
+    part_of [ @templartorrent.milestone.loopback-throughput ]
+    author "Claude"
+}
+
 record templartorrent.work.rate-ranked-slots/1 : work {
     title "Per-peer payload rates, rate-ranked regular upload slots with hysteresis, rates in the Peers tab"
     state completed
@@ -496,6 +579,41 @@ record templartorrent.work.seam-hardening/1 : work {
         """
     after [ @templartorrent.work.transfer-seed-loop ]
     part_of [ @templartorrent.milestone.local-v1-transfer ]
+}
+
+record templartorrent.work.sequence-group-detection/1 : work {
+    title "Detect sequence groups for the automatic file order; unrelated files stay rarest-first"
+    state completed
+    intent """
+        Close the sequence-group detection gap of DESIGN.md section 4. The automatic order treated every torrent as a sequence in natural name order. Now grouping::automatic finds one name template differing in one or two numeric runs (S01E01, Disc 1/01, part1, .part01.rar, .r00), orders members outer run first with ties by the natural comparator and wire index, schedules sidecars after their member, and otherwise claims nothing: one tier of equally ranked files, which the picker takes rarest-first. The Sequence carries tiers (files sharing a rank), the session, driver, job record and persistence carry tier starts, the UI's Automatic order asks the driver for the detected order, and shared ranks are labelled.
+        """
+    acceptance {
+        check detection {
+            statement """
+                Unit tests cover episodes across seasons and widths, discs and tracks with a cue sidecar, archive volumes and parts, unrelated names, dates, equal clusters, duplicates, pads and samples
+                """
+            method command
+            command "cargo test -p templartorrent-core --lib grouping"
+            verified_by [ @templartorrent.evidence.sequence-group-detection/1 ]
+        }
+        check gates {
+            statement """
+                Workspace format, Clippy with warnings denied, core, engine, adapter and client suites, the preview and fuzz workspaces compile; saved records with a tiers line round-trip
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+            verified_by [ @templartorrent.evidence.sequence-group-detection/1 ]
+        }
+        check ranks {
+            statement """
+                Policy test: unrelated files share rank 0, a clear series has strict ranks and promotes per tier, saved tiers round-trip and are validated, a manual order is strict, set_automatic returns to the detected tiers
+                """
+            method command
+            command "cargo test -p templartorrent-core --test policies automatic_order_uses_tiers"
+            verified_by [ @templartorrent.evidence.sequence-group-detection/1 ]
+        }
+    }
+    author "Claude"
 }
 
 record templartorrent.work.session-persistence/1 : work {

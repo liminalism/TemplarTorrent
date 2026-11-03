@@ -1,0 +1,13 @@
+[
+  {
+    "added_at": "2026-11-03",
+    "availability": "full",
+    "byte_len": 18265,
+    "content_hash": "sha256:70122cea80abfc2fbef76460d7debe7724dffdca5affc8fd9a631e1c3ec6f43f",
+    "id": "ldm-readme-v0.3.0",
+    "media_type": "text/markdown",
+    "origin": "external",
+    "path": "sources/external/ldm-readme-v0.3.0--70122cea.md",
+    "title": "Linux Download Manager v0.3.0 README (behaviour reference)"
+  }
+]

@@ -179,6 +179,14 @@ impl Session {
         Ok(job.coordinator.sequence().verified_words().to_vec())
     }
 
+    /// The global payload budget, for spenders that live outside the session.
+    pub fn payload_budget(&self) -> templartorrent_core::budget::ByteBudget {
+        self.arbiter.budget().clone()
+    }
+    /// The shared download token bucket; see [`SessionArbiter::download_rate`].
+    pub fn download_rate(&self) -> templartorrent_core::bandwidth::SharedBucket {
+        self.arbiter.download_rate()
+    }
     pub fn reserve_control(&self, bytes: usize) -> Option<templartorrent_core::budget::Permit> {
         self.arbiter.budget().try_acquire(bytes)
     }
@@ -499,6 +507,36 @@ impl Session {
             .coordinator
             .sequence_mut()
             .set_order(order)?;
+        self.cancel_work(id)
+    }
+
+    /// Tier starts within [`Session::file_order`]; see [`Sequence::tier_starts`].
+    pub fn file_tier_starts(&self, id: TorrentId) -> Result<Vec<usize>, EngineError> {
+        let job = self
+            .jobs
+            .iter()
+            .find(|job| job.id == id)
+            .ok_or(EngineError::UnknownJob)?;
+        Ok(job.coordinator.sequence().tier_starts().to_vec())
+    }
+
+    /// A saved order with its tiers.
+    pub fn set_tiers(
+        &mut self,
+        id: TorrentId,
+        order: Vec<usize>,
+        starts: Vec<usize>,
+    ) -> Result<(), EngineError> {
+        self.job_mut(id)?
+            .coordinator
+            .sequence_mut()
+            .set_tiers(order, starts)?;
+        self.cancel_work(id)
+    }
+
+    /// Back to the detected automatic order.
+    pub fn set_order_automatic(&mut self, id: TorrentId) -> Result<(), EngineError> {
+        self.job_mut(id)?.coordinator.sequence_mut().set_automatic();
         self.cancel_work(id)
     }
 

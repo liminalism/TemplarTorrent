@@ -8,11 +8,11 @@ license = "MIT"
 [dependencies]
 templartorrent-core = { path = "../../crates/templartorrent-core" }
 templartorrent-engine = { path = "../../crates/templartorrent-engine" }
-pixelkit-raster = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
-pixelkit-shell = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
-pixelkit-text = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
-pixelkit-ui = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
-pixelkit-windowing = { git = "https://github.com/liminalism/pixelkit", rev = "614c9c6e84ce3cd0bc6c81988f636b493b30a497" }
+liminalkit-raster = { git = "https://github.com/liminalism/liminalkit" }
+liminalkit-shell = { git = "https://github.com/liminalism/liminalkit" }
+liminalkit-text = { git = "https://github.com/liminalism/liminalkit" }
+liminalkit-ui = { git = "https://github.com/liminalism/liminalkit" }
+liminalkit-windowing = { git = "https://github.com/liminalism/liminalkit" }
 
 [workspace]
 

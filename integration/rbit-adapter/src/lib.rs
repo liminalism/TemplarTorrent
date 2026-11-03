@@ -3,8 +3,10 @@
 //! release-ready full session client. See driver module for remaining gates.
 #![forbid(unsafe_code)]
 pub mod announce;
+pub mod client_id;
 pub mod discovery;
 pub mod driver;
+pub mod http;
 pub mod metadata;
 pub mod pex;
 pub mod portmap;
@@ -129,10 +131,20 @@ pub async fn set_choking(connection: &mut PeerConnection, choking: bool) -> Resu
     Ok(())
 }
 pub fn client_name(handshake: Option<&ExtensionHandshake>) -> String {
+    handshake_client(handshake).unwrap_or_else(|| "Unknown".into())
+}
+/// The extension handshake's own `v` name, cleaned, when it sent one.
+pub fn handshake_client(handshake: Option<&ExtensionHandshake>) -> Option<String> {
     handshake
         .and_then(|h| h.client.as_deref())
         .map(|s| clean_label(s, 80))
         .filter(|s| !s.is_empty())
+}
+/// The label for a peer that has not (yet) named itself: the BEP 20 reading
+/// of its peer id, else `Unknown`.
+pub fn peer_id_client(peer_id: Option<&[u8; 20]>) -> String {
+    peer_id
+        .and_then(client_id::client_from_peer_id)
         .unwrap_or_else(|| "Unknown".into())
 }
 pub fn record_tracker_success(

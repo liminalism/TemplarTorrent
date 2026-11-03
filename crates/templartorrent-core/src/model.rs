@@ -102,8 +102,19 @@ pub enum Command {
         destination: PathBuf,
         public_magnet_bootstrap: bool,
     },
+    /// One http:// or https:// file into `destination`, optionally checked
+    /// against a SHA-256 before completion. One command per URL of a batch.
+    AddUrl {
+        url: String,
+        destination: PathBuf,
+        sha256: Option<[u8; 32]>,
+    },
     Pause(TorrentId),
     Resume(TorrentId),
+    /// Restart a stopped URL job from its partial file.
+    Retry(TorrentId),
+    /// Stop a URL job and keep its partial file.
+    Cancel(TorrentId),
     Remove {
         id: TorrentId,
         delete_data: bool,
@@ -113,6 +124,8 @@ pub enum Command {
         id: TorrentId,
         file_indices: Vec<usize>,
     },
+    /// Back to the detected automatic order (DESIGN.md section 4).
+    SetFileOrderAutomatic(TorrentId),
     SetFileWanted {
         id: TorrentId,
         file_index: usize,
