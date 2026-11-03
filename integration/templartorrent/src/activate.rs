@@ -47,7 +47,7 @@ pub fn valid_activation(text: &str) -> bool {
     {
         return false;
     }
-    if text.starts_with("magnet:?") {
+    if text.starts_with("magnet:?") || text.starts_with("http://") || text.starts_with("https://") {
         return true;
     }
     Path::new(text)

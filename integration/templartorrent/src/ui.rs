@@ -21,11 +21,13 @@ use crate::activate::Activator;
 use crate::persist::{SessionStore, UiState};
 use crate::worker::{FileRow, ListenState, Request, SessionView, TrackerView, WorkerHandle};
 use crate::workflow::{
-    self, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, automatic_order, cooldown_text,
-    country_text, eta_text, format_bytes, move_file, preference_text, rank_label, rate_text,
-    rtt_text, speed_cap, validate_destination, validate_magnet,
+    self, AddSource, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, automatic_order,
+    classify_source, cooldown_text, country_text, eta_text, format_bytes, move_file,
+    parse_optional_sha256, preference_text, rank_label, rate_text, rtt_text, speed_cap,
+    validate_destination,
 };
 use templartorrent_rbit_adapter::driver::PeerEncryption;
+use templartorrent_rbit_adapter::http::UrlDetail;
 
 const BG: u32 = 0xf4f4f2;
 const PANEL: u32 = 0xffffff;
@@ -164,6 +166,7 @@ enum AddFocus {
     Magnet,
     Torrent,
     Destination,
+    Digest,
 }
 
 impl AddFocus {
@@ -171,15 +174,19 @@ impl AddFocus {
         match self {
             Self::Magnet => Self::Torrent,
             Self::Torrent => Self::Destination,
-            Self::Destination => Self::Magnet,
+            Self::Destination => Self::Digest,
+            Self::Digest => Self::Magnet,
         }
     }
 }
 
 struct AddDialog {
+    /// A magnet, or one or more http(s) URLs.
     magnet: TextFieldState,
     torrent: TextFieldState,
     destination: TextFieldState,
+    /// Optional SHA-256 for a single URL.
+    digest: TextFieldState,
     public_bootstrap: bool,
     focus: AddFocus,
     error: String,
@@ -212,6 +219,7 @@ struct RemoveDialog {
 
 struct SettingsDialog {
     allow_local: bool,
+    allow_local_urls: bool,
     encryption: PeerEncryption,
     port_mapping: bool,
     port: TextFieldState,
@@ -428,9 +436,21 @@ impl Desktop {
         }
     }
 
+    /// Send without tracking an acknowledgement: the earlier URLs of a batch.
+    /// Their rejections still reach the status line through `apply_ack`.
+    fn submit_quiet(&mut self, command: Command) -> bool {
+        let seq = self.seq.wrapping_add(1);
+        if let Err(reason) = self.client.try_request(Request::Command { seq, command }) {
+            self.status = reason.into();
+            return false;
+        }
+        self.seq = seq;
+        true
+    }
+
     fn submit(&mut self, command: Command) {
         let kind = match &command {
-            Command::Add { .. } => Pending::Add,
+            Command::Add { .. } | Command::AddUrl { .. } => Pending::Add,
             Command::Remove { .. } => Pending::Remove,
             Command::SetLimits(_) => Pending::Limits,
             _ => Pending::Other,
@@ -481,6 +501,7 @@ impl Desktop {
             magnet: TextFieldState::new(),
             torrent: TextFieldState::new(),
             destination: TextFieldState::new(),
+            digest: TextFieldState::new(),
             public_bootstrap: false,
             focus: AddFocus::Magnet,
             error: String::new(),
@@ -499,7 +520,10 @@ impl Desktop {
 
     fn open_activation(&mut self, payload: String) {
         self.open_add();
-        if payload.starts_with("magnet:?") {
+        if payload.starts_with("magnet:?")
+            || payload.starts_with("http://")
+            || payload.starts_with("https://")
+        {
             if let Dialog::Add(add) = &mut self.dialog {
                 add.magnet = TextFieldState::with_text(payload);
                 add.focus = AddFocus::Destination;
@@ -540,26 +564,75 @@ impl Desktop {
         let Dialog::Add(add) = &self.dialog else {
             return;
         };
-        let magnet = add.magnet.text().trim().to_string();
+        let source = add.magnet.text().to_string();
         let destination = add.destination.text().trim().to_string();
+        let digest = add.digest.text().to_string();
         let public_magnet_bootstrap = add.public_bootstrap;
-        if let Err(error) = validate_magnet(&magnet) {
-            if let Dialog::Add(add) = &mut self.dialog {
-                add.error = error.into();
+        let source = match classify_source(&source) {
+            Ok(source) => source,
+            Err(error) => {
+                if let Dialog::Add(add) = &mut self.dialog {
+                    add.error = error;
+                }
+                return;
             }
-            return;
-        }
+        };
         if let Err(error) = validate_destination(&destination) {
             if let Dialog::Add(add) = &mut self.dialog {
                 add.error = error.into();
             }
             return;
         }
-        self.submit(Command::Add {
-            source: magnet,
-            destination: PathBuf::from(destination),
-            public_magnet_bootstrap,
-        });
+        let destination = PathBuf::from(destination);
+        match source {
+            AddSource::Magnet(magnet) => {
+                if !digest.trim().is_empty() {
+                    if let Dialog::Add(add) = &mut self.dialog {
+                        add.error = "a SHA-256 applies to a URL download, not a torrent".into();
+                    }
+                    return;
+                }
+                self.submit(Command::Add {
+                    source: magnet,
+                    destination,
+                    public_magnet_bootstrap,
+                });
+            }
+            AddSource::Urls(urls) => {
+                let sha256 = match parse_optional_sha256(&digest) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        if let Dialog::Add(add) = &mut self.dialog {
+                            add.error = error.into();
+                        }
+                        return;
+                    }
+                };
+                if sha256.is_some() && urls.len() > 1 {
+                    if let Dialog::Add(add) = &mut self.dialog {
+                        add.error = "a SHA-256 applies to one URL; add a batch without it".into();
+                    }
+                    return;
+                }
+                if self.inflight.is_some() {
+                    self.status = "the previous command is still running".into();
+                    return;
+                }
+                let last = urls.len() - 1;
+                for (index, url) in urls.into_iter().enumerate() {
+                    let command = Command::AddUrl {
+                        url,
+                        destination: destination.clone(),
+                        sha256,
+                    };
+                    if index == last {
+                        self.submit(command);
+                    } else if !self.submit_quiet(command) {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn confirm_limits(&mut self) {
@@ -700,7 +773,13 @@ impl Desktop {
             self.status = "select a torrent first".into();
             return;
         };
-        let bytes = if view.selected == Some(id) {
+        let bytes = if let Some(detail) = view
+            .url_detail
+            .as_ref()
+            .filter(|_| view.selected == Some(id))
+        {
+            detail.size.unwrap_or(detail.done)
+        } else if view.selected == Some(id) {
             affected_bytes(
                 &view
                     .files
@@ -752,6 +831,7 @@ impl Desktop {
         };
         self.dialog = Dialog::Settings(Box::new(SettingsDialog {
             allow_local: view.allow_local_trackers,
+            allow_local_urls: view.allow_local_urls,
             encryption: view.encryption,
             port_mapping: view.port_mapping,
             port: TextFieldState::with_text(bound_port.to_string()),
@@ -1019,7 +1099,7 @@ impl Desktop {
                     table_area.w,
                     s.px(24),
                 ),
-                "No jobs. Add a magnet or a .torrent file.",
+                "No jobs. Add a magnet, a .torrent file or a URL.",
                 *body,
                 MUTED,
                 Align::Left,
@@ -1071,7 +1151,7 @@ impl Desktop {
         if view.snapshot.jobs.is_empty() {
             ui.label_styled(
                 Rect::new(area.x, area.y + header_h + ui.px(8), area.w, header_h),
-                "No jobs. Add a magnet or a .torrent file.",
+                "No jobs. Add a magnet, a .torrent file or a URL.",
                 *body,
                 MUTED,
                 Align::Left,
@@ -1161,7 +1241,7 @@ impl Desktop {
             .selected
             .and_then(|id| view.snapshot.jobs.iter().find(|job| job.id == id));
         match self.tab {
-            0 => self.draw_details(ui, view, s, content, body, job),
+            0 => self.draw_details(ui, view, s, content, body, job, interactive),
             1 => self.draw_files(ui, view, s, content, body, small, interactive),
             2 => self.draw_peers(ui, view, s, content, body, small, interactive),
             _ => self.draw_trackers(ui, view, s, content, body, small, interactive),
@@ -1169,18 +1249,27 @@ impl Desktop {
     }
 
     fn draw_details(
-        &self,
+        &mut self,
         ui: &mut Ui<'_>,
         view: &SessionView,
         s: Scale,
         content: Rect,
         body: &TextStyle,
         job: Option<&TorrentRow>,
+        interactive: bool,
     ) {
         let Some(job) = job else {
-            ui.label_styled(content, "Select a torrent.", *body, MUTED, Align::Left);
+            ui.label_styled(content, "Select a download.", *body, MUTED, Align::Left);
             return;
         };
+        if let Some(detail) = view
+            .url_detail
+            .as_ref()
+            .filter(|_| view.selected == Some(job.id))
+        {
+            self.draw_url_details(ui, s, content, body, job, detail, interactive);
+            return;
+        }
         let ratio = if job.total_payload_downloaded == 0 {
             "—".to_string()
         } else {
@@ -1260,6 +1349,51 @@ impl Desktop {
         }
     }
 
+    /// Details of a URL download: sizes, connections, identity, digest and
+    /// the Retry and Cancel actions torrents do not have.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_url_details(
+        &mut self,
+        ui: &mut Ui<'_>,
+        s: Scale,
+        content: Rect,
+        body: &TextStyle,
+        job: &TorrentRow,
+        detail: &UrlDetail,
+        interactive: bool,
+    ) {
+        let mut retry = false;
+        let mut cancel = false;
+        if interactive {
+            retry = ui.button(Rect::new(content.x, content.y, s.px(90), s.px(26)), "Retry");
+            cancel = ui.button(
+                Rect::new(content.x + s.px(98), content.y, s.px(90), s.px(26)),
+                "Cancel",
+            );
+        }
+        let lines = url_detail_lines(job, detail);
+        let rowh = s.px(24);
+        let top = content.y + s.px(32);
+        for (index, line) in lines.iter().enumerate() {
+            let row = Rect::new(content.x, top + index as i32 * rowh, content.w, rowh);
+            if row.bottom() > content.bottom() {
+                break;
+            }
+            ui.label_styled(
+                row,
+                line,
+                *body,
+                if index == 0 { INK } else { MUTED },
+                Align::Left,
+            );
+        }
+        if retry {
+            self.submit(Command::Retry(job.id));
+        } else if cancel {
+            self.submit(Command::Cancel(job.id));
+        }
+    }
+
     fn draw_files(
         &mut self,
         ui: &mut Ui<'_>,
@@ -1272,6 +1406,16 @@ impl Desktop {
     ) {
         if let Some(message) = selection_message(self.selected, view.selected) {
             ui.label_styled(content, message, *body, MUTED, Align::Left);
+            return;
+        }
+        if view.url_detail.is_some() {
+            ui.label_styled(
+                content,
+                "A URL download is one file; see Details.",
+                *body,
+                MUTED,
+                Align::Left,
+            );
             return;
         }
         let header = s.px(32);
@@ -1452,7 +1596,11 @@ impl Desktop {
         if view.peers.is_empty() {
             ui.label_styled(
                 Rect::new(content.x, content.y + s.px(28), content.w, s.px(24)),
-                "No connected peers.",
+                if view.url_detail.is_some() {
+                    "A URL download has no peers; its connections are counted in Details."
+                } else {
+                    "No connected peers."
+                },
                 *body,
                 MUTED,
                 Align::Left,
@@ -1590,6 +1738,16 @@ impl Desktop {
     ) {
         if let Some(message) = selection_message(self.selected, view.selected) {
             ui.label_styled(content, message, *body, MUTED, Align::Left);
+            return;
+        }
+        if view.url_detail.is_some() {
+            ui.label_styled(
+                content,
+                "A URL download has no trackers.",
+                *body,
+                MUTED,
+                Align::Left,
+            );
             return;
         }
         let mut reannounce = false;
@@ -1796,14 +1954,14 @@ impl Desktop {
         }
         ui.label_styled(
             Rect::new(inner.x, inner.y, inner.w, s.px(24)),
-            "Add torrent",
+            "Add download",
             *body,
             INK,
             Align::Left,
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(32), inner.w, s.px(18)),
-            "Magnet",
+            "Magnet, or one or more http(s) URLs separated by spaces",
             *small,
             MUTED,
             Align::Left,
@@ -1812,20 +1970,24 @@ impl Desktop {
         let torrent_rect = Rect::new(inner.x, inner.y + s.px(106), inner.w - s.px(110), s.px(28));
         let destination_rect =
             Rect::new(inner.x, inner.y + s.px(162), inner.w - s.px(110), s.px(28));
+        let digest_rect = Rect::new(inner.x, inner.y + s.px(342), inner.w, s.px(28));
         if ui.input.take_click(magnet_rect) {
             add.focus = AddFocus::Magnet;
         } else if ui.input.take_click(torrent_rect) {
             add.focus = AddFocus::Torrent;
         } else if ui.input.take_click(destination_rect) {
             add.focus = AddFocus::Destination;
+        } else if ui.input.take_click(digest_rect) {
+            add.focus = AddFocus::Digest;
         }
         let magnet_focus = add.focus == AddFocus::Magnet;
         let torrent_focus = add.focus == AddFocus::Torrent;
         let dest_focus = add.focus == AddFocus::Destination;
+        let digest_focus = add.focus == AddFocus::Digest;
         ui.text_field(
             &mut add.magnet,
             magnet_rect,
-            "magnet:?xt=urn:btih:…",
+            "magnet:?xt=urn:btih:… or https://…",
             magnet_focus,
             false,
         );
@@ -1899,10 +2061,24 @@ impl Desktop {
         }
         ui.label_styled(
             Rect::new(inner.x + s.px(28), inner.y + s.px(286), inner.w - s.px(28), s.px(32)),
-            "Separate from the public tracker list. Unknown metadata does not prove the torrent is public.",
+            "Separate from the public tracker list. Unknown metadata does not prove the torrent is public. Not used for URLs.",
             *small,
             MUTED,
             Align::Left,
+        );
+        ui.label_styled(
+            Rect::new(inner.x, inner.y + s.px(322), inner.w, s.px(18)),
+            "SHA-256 of the file (optional, one URL only; checked before the job completes)",
+            *small,
+            MUTED,
+            Align::Left,
+        );
+        ui.text_field(
+            &mut add.digest,
+            digest_rect,
+            "64 hexadecimal digits",
+            digest_focus,
+            false,
         );
         let notice = if !add.error.is_empty() {
             add.error.clone()
@@ -1911,12 +2087,13 @@ impl Desktop {
                 .clipboard_error()
                 .or_else(|| add.torrent.clipboard_error())
                 .or_else(|| add.destination.clipboard_error())
+                .or_else(|| add.digest.clipboard_error())
                 .unwrap_or("")
                 .to_string()
         };
         if !notice.is_empty() {
             ui.label_styled(
-                Rect::new(inner.x, inner.y + s.px(324), inner.w, s.px(40)),
+                Rect::new(inner.x, inner.y + s.px(378), inner.w, s.px(40)),
                 &notice,
                 *small,
                 INK,
@@ -2136,14 +2313,22 @@ impl Desktop {
             dialog.allow_local = allow;
         }
         ui.label_styled(
-            Rect::new(inner.x, inner.y + s.px(68), inner.w, s.px(40)),
+            Rect::new(inner.x, inner.y + s.px(68), inner.w, s.px(36)),
             "Off by default. Applies to the next magnet. Automatically added public trackers still refuse loopback, link-local, and private addresses.",
             *small,
             MUTED,
             Align::Left,
         );
+        let mut allow_urls = dialog.allow_local_urls;
+        if ui.checkbox(
+            Rect::new(inner.x, inner.y + s.px(104), inner.w, s.px(28)),
+            &mut allow_urls,
+            "Allow local and private addresses for URL downloads (--allow-local-urls)",
+        ) {
+            dialog.allow_local_urls = allow_urls;
+        }
         ui.label_styled(
-            Rect::new(inner.x, inner.y + s.px(116), inner.w, s.px(44)),
+            Rect::new(inner.x, inner.y + s.px(136), inner.w, s.px(44)),
             &format!(
                 "Public tracker list: {} URL(s) from {}. An empty file adds nothing.",
                 view.public_tracker_count,
@@ -2154,11 +2339,11 @@ impl Desktop {
             Align::Left,
         );
         let reload = ui.button(
-            Rect::new(inner.x, inner.y + s.px(168), s.px(180), s.px(28)),
+            Rect::new(inner.x, inner.y + s.px(188), s.px(180), s.px(28)),
             "Reload tracker list",
         );
         ui.label_styled(
-            Rect::new(inner.x, inner.y + s.px(212), inner.w, s.px(20)),
+            Rect::new(inner.x, inner.y + s.px(232), inner.w, s.px(20)),
             "Listen port (TCP, IPv4 and IPv6). A change applies after a restart.",
             *small,
             MUTED,
@@ -2166,28 +2351,28 @@ impl Desktop {
         );
         ui.text_field(
             &mut dialog.port,
-            Rect::new(inner.x, inner.y + s.px(236), s.px(120), s.px(26)),
+            Rect::new(inner.x, inner.y + s.px(256), s.px(120), s.px(26)),
             "",
             true,
             false,
         );
         let mut port_mapping = dialog.port_mapping;
         if ui.checkbox(
-            Rect::new(inner.x, inner.y + s.px(270), inner.w, s.px(28)),
+            Rect::new(inner.x, inner.y + s.px(290), inner.w, s.px(28)),
             &mut port_mapping,
             "Map the listen port on my router (UPnP / NAT-PMP)",
         ) {
             dialog.port_mapping = port_mapping;
         }
         ui.label_styled(
-            Rect::new(inner.x, inner.y + s.px(302), inner.w, s.px(56)),
+            Rect::new(inner.x, inner.y + s.px(322), inner.w, s.px(56)),
             &settings_reachability(view),
             *small,
             MUTED,
             Align::Left,
         );
         let cycle = ui.button(
-            Rect::new(inner.x, inner.y + s.px(366), s.px(300), s.px(28)),
+            Rect::new(inner.x, inner.y + s.px(386), s.px(300), s.px(28)),
             match dialog.encryption {
                 PeerEncryption::PreferEncrypted => "Encryption: prefer encrypted",
                 PeerEncryption::RequireEncrypted => "Encryption: require encrypted",
@@ -2203,7 +2388,7 @@ impl Desktop {
         }
         if !dialog.error.is_empty() {
             ui.label_styled(
-                Rect::new(inner.x, inner.y + s.px(402), inner.w, s.px(20)),
+                Rect::new(inner.x, inner.y + s.px(422), inner.w, s.px(20)),
                 &dialog.error,
                 *small,
                 INK,
@@ -2224,6 +2409,7 @@ impl Desktop {
             "Close",
         );
         let allow = dialog.allow_local;
+        let allow_urls = dialog.allow_local_urls;
         let encryption = dialog.encryption;
         let port_mapping = dialog.port_mapping;
         let port_text = dialog.port.text().trim().to_string();
@@ -2259,6 +2445,11 @@ impl Desktop {
                         .client
                         .try_request(Request::SetPortMapping(port_mapping))
                         .is_err())
+                || (allow_urls != view.allow_local_urls
+                    && self
+                        .client
+                        .try_request(Request::AllowLocalUrls(allow_urls))
+                        .is_err())
             {
                 self.status = "command queue is full".into();
                 return;
@@ -2284,12 +2475,77 @@ fn selection_message(
     published: Option<TorrentId>,
 ) -> Option<&'static str> {
     if selected.is_none() {
-        Some("Select a torrent.")
+        Some("Select a download.")
     } else if published != selected {
-        Some("Loading torrent details…")
+        Some("Loading details…")
     } else {
         None
     }
+}
+
+/// The Details lines for a URL job. Unknown values are an em dash: an
+/// unknown size is never shown as zero.
+pub(crate) fn url_detail_lines(job: &TorrentRow, detail: &UrlDetail) -> Vec<String> {
+    let size = detail.size.map(format_bytes).unwrap_or_else(|| "—".into());
+    let percent = match detail.size {
+        Some(size) if size > 0 => format!("{}%", detail.done.saturating_mul(100) / size),
+        _ => "—".into(),
+    };
+    let parts = detail.parts.len();
+    let connections = if parts > 1 {
+        format!(
+            "Connections: {} active of {parts} parts (ranged)",
+            detail.connections
+        )
+    } else if detail.ranged {
+        format!("Connections: {} (ranged, one part)", detail.connections)
+    } else {
+        format!(
+            "Connections: {} (the server offers no ranges)",
+            detail.connections
+        )
+    };
+    let resume = match &detail.validator {
+        Some(validator) => format!("Resume identity: {validator}"),
+        None if detail.ranged => "Resume identity: none; a resume restarts from byte 0".into(),
+        None => "Resume: not possible; a retry restarts from byte 0".into(),
+    };
+    let file = match &detail.file {
+        Some(name) if matches!(job.state, JobState::Complete) => format!("File: {name}"),
+        Some(name) => format!("File: {name} (written as {name}.part until complete)"),
+        None => "File: — (named by the server's first response)".into(),
+    };
+    vec![
+        clean_label(&job.name, 160),
+        format!(
+            "State: {:?}    Size: {size}    Downloaded: {} ({percent})",
+            job.state,
+            format_bytes(detail.done)
+        ),
+        format!(
+            "Down: {}    ETA: {}",
+            rate_text(job.down_bps),
+            eta_text(job)
+        ),
+        connections,
+        format!("URL: {}", clean_label(&detail.url, 160)),
+        format!("Destination: {}", clean_label(&detail.destination, 160)),
+        file,
+        resume,
+        format!(
+            "SHA-256: {}",
+            detail.sha256.as_deref().unwrap_or("not requested")
+        ),
+        format!("Last error: {}", detail.error.as_deref().unwrap_or("—")),
+        detail
+            .note
+            .as_deref()
+            .map(|note| format!("Note: {note}"))
+            .unwrap_or_default(),
+    ]
+    .into_iter()
+    .filter(|line| !line.is_empty())
+    .collect()
 }
 
 fn current_file(files: &[FileRow]) -> &str {
@@ -2648,6 +2904,7 @@ mod tests {
         WorkerHandle::start(WorkerConfig {
             limits: Limits::default(),
             allow_local_trackers: false,
+            allow_local_urls: true,
             public_trackers: Vec::new(),
             public_tracker_path: session.join("public-trackers.txt"),
             geo_db_path: None,
@@ -2825,6 +3082,48 @@ mod tests {
         }
         app.on_exit();
         clipboard.restore().expect("clipboard restored");
+    }
+
+    #[test]
+    fn url_details_show_an_em_dash_for_an_unknown_size() {
+        use templartorrent_rbit_adapter::http::UrlDetail;
+        let job = templartorrent_core::model::TorrentRow {
+            id: templartorrent_core::model::TorrentId(1 << 63),
+            name: std::sync::Arc::from("stream"),
+            state: JobState::Downloading,
+            wanted_bytes: 0,
+            verified_bytes: 4096,
+            total_payload_downloaded: 4096,
+            total_payload_uploaded: 0,
+            down_bps: 0,
+            up_bps: 0,
+            connected_seeds: 0,
+            connected_peers: 1,
+            estimated_seeds: None,
+            estimated_peers: None,
+        };
+        let detail = UrlDetail {
+            url: "http://h.example/stream".into(),
+            destination: "/tmp/d".into(),
+            file: Some("stream".into()),
+            size: None,
+            done: 4096,
+            ranged: false,
+            validator: None,
+            parts: Vec::new(),
+            connections: 1,
+            sha256: None,
+            error: None,
+            note: None,
+            state: JobState::Downloading,
+        };
+        let lines = super::url_detail_lines(&job, &detail);
+        assert!(lines[1].contains("Size: —"), "{}", lines[1]);
+        assert!(lines[1].contains("(—)"), "{}", lines[1]);
+        assert!(lines.iter().any(|line| line.contains("no ranges")));
+        assert!(lines.iter().any(|line| line.contains("stream.part")));
+        let (progress, _) = super::progress_parts(&job);
+        assert_eq!(progress, "—");
     }
 
     #[test]

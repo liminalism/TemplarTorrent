@@ -179,6 +179,14 @@ impl Session {
         Ok(job.coordinator.sequence().verified_words().to_vec())
     }
 
+    /// The global payload budget, for spenders that live outside the session.
+    pub fn payload_budget(&self) -> templartorrent_core::budget::ByteBudget {
+        self.arbiter.budget().clone()
+    }
+    /// The shared download token bucket; see [`SessionArbiter::download_rate`].
+    pub fn download_rate(&self) -> templartorrent_core::bandwidth::SharedBucket {
+        self.arbiter.download_rate()
+    }
     pub fn reserve_control(&self, bytes: usize) -> Option<templartorrent_core::budget::Permit> {
         self.arbiter.budget().try_acquire(bytes)
     }

@@ -40,6 +40,7 @@ fn run(launch: Launch) -> Result<(), String> {
         font,
         geoip_db,
         allow_local_trackers,
+        allow_local_urls,
         payloads,
     } = launch
     else {
@@ -48,7 +49,9 @@ fn run(launch: Launch) -> Result<(), String> {
     };
     for payload in &payloads {
         if !valid_activation(payload) {
-            return Err("each argument must be one magnet or a .torrent path".into());
+            return Err(
+                "each argument must be one magnet, a .torrent path or an http(s) URL".into(),
+            );
         }
     }
     let activation =
@@ -69,6 +72,7 @@ fn run(launch: Launch) -> Result<(), String> {
     let client = WorkerHandle::start(WorkerConfig {
         limits: Limits::default(),
         allow_local_trackers,
+        allow_local_urls,
         public_trackers: load_public_trackers(&tracker_path),
         public_tracker_path: tracker_path,
         geo_db_path: geo::resolve_db_path(geoip_db.as_deref()),

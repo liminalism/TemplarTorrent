@@ -1,6 +1,87 @@
 akr 0.1
 project templartorrent
 
+record templartorrent.milestone.http-downloads/1 : milestone {
+    title "HTTP(S) file downloads in the same queue, proven on localhost fixtures"
+    state proposed
+    scope [
+        path "crates/templartorrent-core/**",
+        path "crates/templartorrent-engine/**",
+        path "crates/templartorrent-storage/**",
+        path "integration/**"
+    ]
+    intent """
+        Implement decision http-download-manager: URL jobs in the existing queue and Add dialog (one URL or a bounded batch, the folder browser, pause, resume, retry, cancel, the remove dialog with the data checkbox defaulting to keeping files), on the rustls transport with name checks, a redirect cap and address admission behind --allow-local-urls; ranged parallel parts reserved from the global payload budget and the shared download rate; resume only under a matching ETag or Last-Modified; a 30 s no-data cut per connection; temporary sibling, fsync, rename; em dash for unknown sizes; optional SHA-256 before completion; persistence through the session store with restore on launch. Torrent behaviour keeps working.
+        """
+    acceptance {
+        check client-wiring {
+            statement """
+                The worker accepts AddUrl, Pause, Resume, Retry, Cancel and Remove for URL jobs, merges them into the snapshot, saves .url records and restores them on launch; headless UI tests still pass
+                """
+            method command
+            command "cargo test -p templartorrent"
+        }
+        check crash-resume {
+            statement """
+                A job restored from a persisted record after an abrupt stop continues from offsets that never exceed the synced bytes and completes with matching bytes
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download crash"
+        }
+        check gates {
+            statement """
+                Formatting, all-target Clippy with warnings denied and the workspace test suite pass; unit, packet, privacy and storage tests ran after the transport change
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+        }
+        check identity-mismatch {
+            statement """
+                A resume whose ETag or Last-Modified no longer matches stops the job with a visible reason and keeps the partial file; a matching validator resumes from the persisted offset
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download identity"
+        }
+        check pause-resume {
+            statement """
+                Pause stops every connection and keeps the partial file; Resume continues from the recorded offsets and the final file matches the fixture
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download pause"
+        }
+        check ranged-and-plain-bodies {
+            statement """
+                A localhost server with Accept-Ranges yields a parallel multi-part download whose output matches the fixture bytes, and a server without ranges yields a single-connection download, including a chunked body of unknown size shown as an em dash
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download ranged plain"
+        }
+        check redirect-bound {
+            statement """
+                Up to 5 redirects are followed with each hop re-admitted; a sixth is refused with a visible reason, as are a redirect to a private address and an https-to-http downgrade
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download redirect"
+        }
+        check safe-deletion {
+            statement """
+                Remove with data deletes the final file and the temporary sibling through the no-follow path, refuses a symlink or a swapped inode, and never removes the destination folder
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download delete"
+        }
+        check shared-speed-limit {
+            statement """
+                With the session download limit set, a URL download spends from the same token bucket as peers and takes at least the time the limit implies, and its read buffers show in the global payload budget
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test http_download limit"
+        }
+    }
+    after [ @templartorrent.milestone.reachability ]
+    author "Claude"
+}
+
 record templartorrent.milestone.local-v1-transfer/1 : milestone {
     title "Deterministic localhost v1 transfer and seed"
     state completed

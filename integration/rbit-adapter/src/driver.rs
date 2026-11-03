@@ -574,6 +574,18 @@ impl Driver {
             "This job has no admitted seed slot"
         }
     }
+    /// The global payload budget every peer buffer is charged to. An HTTP
+    /// download reserves its read buffers here, so the Limits payload memory
+    /// setting covers both kinds of job.
+    pub fn payload_budget(&self) -> templartorrent_core::budget::ByteBudget {
+        self.session.payload_budget()
+    }
+    /// The session download token bucket as a shared handle, and the
+    /// monotonic origin its timestamps are measured from. Spenders outside
+    /// the driver must pass `origin.elapsed()` as `now_ns`, as the driver does.
+    pub fn download_rate(&self) -> (templartorrent_core::bandwidth::SharedBucket, Instant) {
+        (self.session.download_rate(), self.started)
+    }
     pub fn payload_stats(&self) -> templartorrent_engine::session::PayloadStats {
         self.session.payload_stats()
     }

@@ -109,6 +109,58 @@ pub(super) fn unlink_matched(
     Ok(())
 }
 
+/// Unlink one regular file under `root` by name, never following a symlink
+/// at any component, refusing a hardlinked or non-regular target. `Ok(false)`
+/// when nothing is at that name. Used for files a job owns outright (an HTTP
+/// download and its temporary sibling), where no handle-captured inode exists.
+pub(super) fn unlink_regular(root: &Path, path: &Path) -> Result<bool, StorageError> {
+    if path == root || !path.starts_with(root) {
+        return Err(StorageError::IdentityChanged {
+            path: path.display().to_string(),
+        });
+    }
+    let (dir, name) = open_parent(root, path)?;
+    let c_name = cstring(&name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(StorageError::Io(format!("{}: {error}", path.display())));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let path_text = path.display().to_string();
+    let mode = stat.st_mode & libc::S_IFMT;
+    if mode == libc::S_IFLNK {
+        return Err(StorageError::Symlink { path: path_text });
+    }
+    if mode != libc::S_IFREG {
+        return Err(StorageError::Io(format!(
+            "{path_text}: refusing to unlink a non-regular file"
+        )));
+    }
+    if stat.st_nlink > 1 {
+        return Err(StorageError::Hardlink { path: path_text });
+    }
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc != 0 {
+        return Err(StorageError::Io(format!(
+            "{path_text}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(true)
+}
+
 /// Remove empty directories that used to contain deleted files. Never removes
 /// `root`. A symlink or a non-empty directory is left in place.
 pub(super) fn prune_empty_parents(root: &Path, deleted: &[PathBuf]) {

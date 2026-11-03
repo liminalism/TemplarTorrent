@@ -2238,6 +2238,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "sha1",
+ "sha2",
  "templartorrent-core",
  "templartorrent-engine",
  "templartorrent-storage",

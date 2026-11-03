@@ -8,11 +8,16 @@ use templartorrent_core::{
 };
 
 pub const USAGE: &str = "\
-usage: templartorrent [--font FILE] [--geoip-db FILE] [--allow-local-trackers] [--] [MAGNET | FILE.torrent]...
+usage: templartorrent [--font FILE] [--geoip-db FILE] [--allow-local-trackers]
+                      [--allow-local-urls] [--] [MAGNET | FILE.torrent | URL]...
 
-A second launch forwards each magnet or .torrent path to the running instance
-and exits. The running instance opens the Add dialog; it does not start a
-transfer until Add is confirmed.
+A second launch forwards each magnet, .torrent path or http(s) URL to the
+running instance and exits. The running instance opens the Add dialog; it does
+not start a transfer until Add is confirmed.
+
+URL downloads refuse loopback, private, link-local and other local addresses
+unless --allow-local-urls (or the matching setting) is on, as
+--allow-local-trackers does for tracker URLs.
 
 Peer country lookup uses --geoip-db FILE, $TEMPLARTORRENT_GEOIP_DB, or
 ~/.local/share/templartorrent/GeoLite2-Country.mmdb. Without a database,
@@ -47,6 +52,7 @@ pub enum Launch {
         font: Option<PathBuf>,
         geoip_db: Option<PathBuf>,
         allow_local_trackers: bool,
+        allow_local_urls: bool,
         payloads: Vec<String>,
     },
 }
@@ -58,6 +64,7 @@ where
     let mut font = None;
     let mut geoip_db = None;
     let mut allow_local_trackers = false;
+    let mut allow_local_urls = false;
     let mut payloads = Vec::new();
     let mut positional = false;
     let mut args = args.into_iter();
@@ -72,6 +79,7 @@ where
             "--help" | "-h" => return Ok(Launch::Help),
             "--" => positional = true,
             "--allow-local-trackers" => allow_local_trackers = true,
+            "--allow-local-urls" => allow_local_urls = true,
             "--font" => {
                 let path = args.next().ok_or("missing path after --font")?;
                 font = Some(PathBuf::from(path));
@@ -94,6 +102,7 @@ where
         font,
         geoip_db,
         allow_local_trackers,
+        allow_local_urls,
         payloads,
     })
 }
@@ -211,6 +220,68 @@ pub fn validate_magnet(text: &str) -> Result<(), &'static str> {
         return Err("magnet must start with magnet:?");
     }
     Ok(())
+}
+
+/// What the Add dialog's source field holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddSource {
+    Magnet(String),
+    /// One URL or a batch of at most [`MAX_URL_BATCH`], each its own job.
+    Urls(Vec<String>),
+}
+
+pub const MAX_URL_BATCH: usize = templartorrent_rbit_adapter::http::MAX_BATCH;
+
+/// A magnet, or whitespace-separated http(s) URLs. Mixing the two, an
+/// unknown scheme, duplicates and more than the batch limit are refused.
+pub fn classify_source(text: &str) -> Result<AddSource, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("paste a magnet or an http(s) URL".into());
+    }
+    if text.starts_with("magnet:?") {
+        // A pasted magnet may carry an unencoded space in its name; a second
+        // link after whitespace is a batch, which magnets do not form.
+        let another = text.split_whitespace().skip(1).any(|token| {
+            ["magnet:?", "http://", "https://"]
+                .iter()
+                .any(|p| token.starts_with(p))
+        });
+        if another {
+            return Err("add magnets one at a time, separately from URLs".into());
+        }
+        return validate_magnet(text)
+            .map(|()| AddSource::Magnet(text.to_string()))
+            .map_err(str::to_string);
+    }
+    if text.len() > 64 * 1024 {
+        return Err("the URL list exceeds 64 KiB".into());
+    }
+    let mut urls: Vec<String> = Vec::new();
+    for token in text.split_whitespace() {
+        if token.starts_with("magnet:?") {
+            return Err("add magnets one at a time, separately from URLs".into());
+        }
+        let parsed = templartorrent_rbit_adapter::http::parse_url(token)
+            .map_err(|reason| format!("{token}: {reason}"))?;
+        if urls.contains(&parsed.url) {
+            continue;
+        }
+        urls.push(parsed.url);
+        if urls.len() > MAX_URL_BATCH {
+            return Err(format!("at most {MAX_URL_BATCH} URLs per Add"));
+        }
+    }
+    Ok(AddSource::Urls(urls))
+}
+
+/// Empty means no check; otherwise 64 hex digits.
+pub fn parse_optional_sha256(text: &str) -> Result<Option<[u8; 32]>, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    templartorrent_rbit_adapter::http::parse_sha256(text).map(Some)
 }
 
 pub fn validate_destination(text: &str) -> Result<(), &'static str> {
@@ -654,11 +725,13 @@ mod tests {
         match launch {
             Launch::Run {
                 allow_local_trackers,
+                allow_local_urls,
                 payloads,
                 font,
                 geoip_db,
             } => {
                 assert!(allow_local_trackers);
+                assert!(!allow_local_urls);
                 assert!(font.is_none());
                 assert!(geoip_db.is_none());
                 assert_eq!(
@@ -668,6 +741,54 @@ mod tests {
             }
             Launch::Help => panic!("help"),
         }
+    }
+
+    #[test]
+    fn sources_split_into_a_magnet_or_a_bounded_url_batch() {
+        assert_eq!(
+            classify_source("magnet:?xt=urn:btih:aa"),
+            Ok(AddSource::Magnet("magnet:?xt=urn:btih:aa".into()))
+        );
+        assert_eq!(
+            classify_source(
+                " https://a.example/f.iso\nhttp://b.example/g?x=1 https://a.example/f.iso "
+            ),
+            Ok(AddSource::Urls(vec![
+                "https://a.example/f.iso".into(),
+                "http://b.example/g?x=1".into()
+            ]))
+        );
+        assert!(classify_source("").is_err());
+        assert!(
+            classify_source("ftp://a.example/f")
+                .unwrap_err()
+                .contains("scheme")
+        );
+        assert!(
+            classify_source("magnet:?xt=urn:btih:aa http://b.example/g")
+                .unwrap_err()
+                .contains("one at a time")
+        );
+        let many: Vec<String> = (0..MAX_URL_BATCH + 1)
+            .map(|i| format!("http://h.example/{i}"))
+            .collect();
+        assert!(
+            classify_source(&many.join(" "))
+                .unwrap_err()
+                .contains("at most")
+        );
+        assert_eq!(parse_optional_sha256("  "), Ok(None));
+        assert!(parse_optional_sha256(&"0".repeat(64)).unwrap().is_some());
+        assert!(parse_optional_sha256("abc").is_err());
+        let launch =
+            parse_args(["--allow-local-urls".into(), "https://h.example/x".into()]).unwrap();
+        assert!(matches!(
+            launch,
+            Launch::Run {
+                allow_local_urls: true,
+                ..
+            }
+        ));
     }
 
     #[test]

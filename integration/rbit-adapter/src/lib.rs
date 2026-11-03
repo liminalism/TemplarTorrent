@@ -5,6 +5,7 @@
 pub mod announce;
 pub mod discovery;
 pub mod driver;
+pub mod http;
 pub mod metadata;
 pub mod pex;
 pub mod portmap;

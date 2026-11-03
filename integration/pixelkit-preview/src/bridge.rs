@@ -186,6 +186,9 @@ impl LiveBridge {
             Command::SetPeerPreference { .. } => {
                 Ack::rejected(seq, "peer preferences arrive with peer scoring")
             }
+            Command::AddUrl { .. } | Command::Retry(_) | Command::Cancel(_) => {
+                Ack::rejected(seq, "URL downloads live in the production client")
+            }
         }
     }
 }

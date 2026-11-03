@@ -237,6 +237,19 @@ impl JobFiles {
     }
 }
 
+/// Delete one file a job owns outright, by name under `root`: every directory
+/// component is opened `O_NOFOLLOW`, the target is stat'd without following,
+/// and a symlink, a non-regular file or a hardlinked file is refused. The
+/// root itself is never removed. `Ok(false)` when the name is absent.
+pub fn delete_owned_file(root: &Path, path: &Path) -> Result<bool, StorageError> {
+    if !root.is_absolute() {
+        return Err(StorageError::Io(
+            "storage root must be an absolute directory".into(),
+        ));
+    }
+    deletion::unlink_regular(root, path)
+}
+
 /// Direct single-owner file storage. Register each job with [`FileStore::add_job`].
 #[derive(Default)]
 pub struct FileStore {

@@ -10,8 +10,10 @@ rbit = "=0.2.2"
 templartorrent-core = { path = "../../crates/templartorrent-core" }
 templartorrent-engine = { path = "../../crates/templartorrent-engine" }
 templartorrent-storage = { path = "../../crates/templartorrent-storage" }
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
 sha1 = "0.10"
+# SHA-256 for user-supplied download digests; already in the graph through rbit.
+sha2 = "0.10"
 bytes = "1"
 # rustls 0.23.46 (2026-10-14). Default features are off so ring, logging,
 # post-quantum preference and brotli stay out. aws_lc_rs is the provider

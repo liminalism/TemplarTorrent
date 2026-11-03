@@ -5,8 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    commit git:cec513e521607ee52650776bfc099143dd6219c4
-    source_graph "sha256:8f4d9d6b6b5132e1eea9b73854020b7264b0c2ac152b73d08ee4632c7df1399a"
+    source_graph "sha256:649b34ab9d58bdb5cdd049e3e1f1cd9a79a0f924315b7209f778441abe877f90"
 }
 
 source ".akr/project.akr" {
@@ -15,8 +14,8 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/templartorrent/decisions.akr" {
-    hash "sha256:0cf02c363a257ef1f0ace689d7adc9c7e82082f4cdc63f9d96e70c61d3609f7e"
-    records 1
+    hash "sha256:7f5deadd6012227fd7cdb2bacf9f6142c870c0d0579466d9337d43fa67be77ba"
+    records 2
 }
 
 source ".akr/records/templartorrent/evidence.akr" {
@@ -25,8 +24,8 @@ source ".akr/records/templartorrent/evidence.akr" {
 }
 
 source ".akr/records/templartorrent/milestones.akr" {
-    hash "sha256:b1e0d30df936a72fc1497652975a82add1263e1411b29684499fecfa8e7c55e2"
-    records 11
+    hash "sha256:70a51d8482b88f573a09c6ee434a07781d4cc9c6d3f4a4a9d5181d03a975b666"
+    records 12
 }
 
 source ".akr/records/templartorrent/observations.akr" {
@@ -53,6 +52,12 @@ resolution @templartorrent.decision.fork-rbit-for-native-gate/1 {
     slot resolves
     to @templartorrent.question.ring-release-gate/2
     hash "sha256:497ea710d17cde4f90dfcbdc2d38e2bd3cf0a44823908b2b7678df1e98939eea"
+}
+
+resolution @templartorrent.milestone.http-downloads/1 {
+    slot after
+    to @templartorrent.milestone.reachability/1
+    hash "sha256:df12847c9e89d3cabc445d3cb572d444f53ccc82bfe436e212af8071cb2b0220"
 }
 
 resolution @templartorrent.milestone.native-source-gate/1 {
