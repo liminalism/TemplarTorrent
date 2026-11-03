@@ -195,7 +195,7 @@ record templartorrent.work.optimistic-unchoke/1 : work {
 
 record templartorrent.work.peer-id-client-fallback/1 : work {
     title "Name peers from their BEP 20 peer id when no extension handshake names them"
-    state proposed
+    state completed
     intent """
         Close the README's "peer-ID client fallback" gap: a peer that sends no extension handshake, or one without a v string, showed as Unknown in the Peers tab. Decode Azureus-style, Shadow-style, Mainline and the known fixed-prefix ids into a bounded clean label at connection time, keep the extension handshake's own name as the better source when it arrives, and never let the guess reach policy.
         """
@@ -206,6 +206,7 @@ record templartorrent.work.peer-id-client-fallback/1 : work {
                 """
             method command
             command "cargo test -p templartorrent-rbit-adapter --lib client_id"
+            verified_by [ @templartorrent.evidence.peer-id-client-fallback/1 ]
         }
         check wire {
             statement """
@@ -213,6 +214,7 @@ record templartorrent.work.peer-id-client-fallback/1 : work {
                 """
             method command
             command "cargo test -p templartorrent-rbit-adapter --test driver driver_peer_preference_narrows_retains_and_blocks"
+            verified_by [ @templartorrent.evidence.peer-id-client-fallback/1 ]
         }
     }
     author "Claude"

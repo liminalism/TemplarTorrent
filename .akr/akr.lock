@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:f3eed863d5c59892cc7a18dae92d684f580b6a2b4f168a3fdd83884ac39b0f2b"
+    source_graph "sha256:d8377524dbeb103c435b86477b0414cb244cb454ec33f1ced234fa26d4f5700b"
 }
 
 source ".akr/project.akr" {
@@ -19,8 +19,8 @@ source ".akr/records/templartorrent/decisions.akr" {
 }
 
 source ".akr/records/templartorrent/evidence.akr" {
-    hash "sha256:1d808da33ae6a30876eaf4161d038268ef04b0d7e8204237f8cf8763b7cd12e9"
-    records 95
+    hash "sha256:79ae5f09ae4b243998df450bccb919e6f70b23e426111c127c33afa678c5b87e"
+    records 96
 }
 
 source ".akr/records/templartorrent/milestones.akr" {
@@ -44,7 +44,7 @@ source ".akr/records/templartorrent/questions.akr" {
 }
 
 source ".akr/records/templartorrent/work.akr" {
-    hash "sha256:113e0dc7aedb5ca59de11a29064b02d8380a760f4e4403f22af9f8ce0602b13d"
+    hash "sha256:c823d11ba36217429eda6e7002b20aaa252b78dbb398981c0634fa23430530ba"
     records 22
 }
 
@@ -1010,6 +1010,11 @@ seal @templartorrent.evidence.optimistic-rotation/1 {
     hash "sha256:a62323b7ae58ea2f12e1a0922735d9f8e0d4cfdf5f29b3ea25fc51d00dc179da"
 }
 
+seal @templartorrent.evidence.peer-id-client-fallback/1 {
+    state verified
+    hash "sha256:8f2fb2eeb5ba36945b3a4dc5e6431668fcb5d5e284f90ceeafdbf79c332a81e4"
+}
+
 seal @templartorrent.evidence.peer-preference-client/1 {
     state verified
     hash "sha256:4f5b948fd3636fafe1f7d5892e85f75326f851a580b40fe6e0b06c0cf615e259"
@@ -1578,6 +1583,11 @@ seal @templartorrent.work.multi-lease-pipelining/1 {
 seal @templartorrent.work.optimistic-unchoke/1 {
     state completed
     hash "sha256:0656447331c050d09d8e1d16db03d7631543609d7c6898d0bbb748697f69cb3f"
+}
+
+seal @templartorrent.work.peer-id-client-fallback/1 {
+    state completed
+    hash "sha256:4b6e76c333bab8487f5ed92f172c7a3dcf3247b588f7e562af0face1d4d337b3"
 }
 
 seal @templartorrent.work.peer-preference/1 {
