@@ -295,6 +295,19 @@ record templartorrent.evidence.fuzz-targets-build/1 : evidence {
         """
 }
 
+record templartorrent.evidence.handle-relative-store/1 : evidence {
+    title "Commit 2937d34 on Linux 6.18 x86_64, rustc 1.99.0: the 12 storage tests passed, among them symlinks_are_refused extended to a symlink to a regular file at the final name (Symlink), a dangling symlink at the final name (Symlink, and the target was not created by O_CREAT), a symlinked parent directory (Symlink, nothing created in the link's target), a regular file where a directory should be (parent path is not a directory) and a missing a/b/c.bin chain created handle-relative; roundtrip, resume, identity, deletion and hardlink tests unchanged. Gates: fmt clean, Clippy on all workspace targets with warnings denied clean, workspace suite passed except the two environmental tests (no ::1, no display): adapter 67 unit, 35 of 36 driver, 12 http_download, 11 localhost, 8 mse, 3 multiblock, 9 parser; client 38 of 39; core 8 + 1 + 30; engine 1 + 10 + 23; storage 12. The forced-kill restart, power-loss and deletion tests all ran through the handle-relative opens."
+    state verified
+    result pass
+    method command
+    observed_at git:2937d34b9f32b0dcabd05f1ccf14e3d16b9329a0
+    command "cargo test -p templartorrent-storage && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+    summary """
+        Commit 2937d34 on Linux 6.18 x86_64, rustc 1.99.0: the 12 storage tests passed, among them symlinks_are_refused extended to a symlink to a regular file at the final name (Symlink), a dangling symlink at the final name (Symlink, and the target was not created by O_CREAT), a symlinked parent directory (Symlink, nothing created in the link's target), a regular file where a directory should be (parent path is not a directory) and a missing a/b/c.bin chain created handle-relative; roundtrip, resume, identity, deletion and hardlink tests unchanged. Gates: fmt clean, Clippy on all workspace targets with warnings denied clean, workspace suite passed except the two environmental tests (no ::1, no display): adapter 67 unit, 35 of 36 driver, 12 http_download, 11 localhost, 8 mse, 3 multiblock, 9 parser; client 38 of 39; core 8 + 1 + 30; engine 1 + 10 + 23; storage 12. The forced-kill restart, power-loss and deletion tests all ran through the handle-relative opens.
+        """
+    author "Claude"
+}
+
 record templartorrent.evidence.http-client-wiring/1 : evidence {
     title "Commit dfa95bf: cargo test -p templartorrent passed 38 of 39, the one failure being the pre-existing clipboard test that needs an X11 or Wayland display the container lacks"
     state verified
