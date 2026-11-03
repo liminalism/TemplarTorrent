@@ -747,6 +747,19 @@ record templartorrent.evidence.port-mapping/1 : evidence {
         """
 }
 
+record templartorrent.evidence.power-loss-batched-sync/1 : evidence {
+    title "Commit 357dbd7 on Linux 6.18 x86_64, rustc 1.99.0: the power-loss test passed in 0.6 s. Positive run: a 24-piece (16 KiB) two-file fixture into pre-sized zero files, checkpoint after at least 6 verified pieces (barrier set, bitmap of the verified set), transfer continued to 16 pieces, power lost: files rewritten in place to the shadow's durable image and their mtimes set back to the record's stamps; no lost piece was in the bitmap; the restart reported resume_scan note None and trusted equal to the bitmap's piece count, completed from a fresh fixture peer, and every file matched the fixture bytes. Negative control: the same run with the bit of one lost piece forged into the bitmap was trusted the same way and finished with that piece all zeros and the files not matching, so the harness detects a bitmap that names unsynced bytes. Gates at this change: cargo fmt --check clean, Clippy on all workspace targets with warnings denied clean, storage 12 tests, adapter 67 unit, 35 of 36 driver (the IPv6 test cannot bind ::1 in this container), 12 http_download, 11 localhost, 8 mse, 3 multiblock, 9 parser regressions."
+    state verified
+    result pass
+    method command
+    observed_at git:357dbd78cde235c60ed2f52565e0075df596c60b
+    command "cargo test -p templartorrent-rbit-adapter --test driver driver_resume_bitmap_survives_a_power_loss_after_the_sync"
+    summary """
+        Commit 357dbd7 on Linux 6.18 x86_64, rustc 1.99.0: the power-loss test passed in 0.6 s. Positive run: a 24-piece (16 KiB) two-file fixture into pre-sized zero files, checkpoint after at least 6 verified pieces (barrier set, bitmap of the verified set), transfer continued to 16 pieces, power lost: files rewritten in place to the shadow's durable image and their mtimes set back to the record's stamps; no lost piece was in the bitmap; the restart reported resume_scan note None and trusted equal to the bitmap's piece count, completed from a fresh fixture peer, and every file matched the fixture bytes. Negative control: the same run with the bit of one lost piece forged into the bitmap was trusted the same way and finished with that piece all zeros and the files not matching, so the harness detects a bitmap that names unsynced bytes. Gates at this change: cargo fmt --check clean, Clippy on all workspace targets with warnings denied clean, storage 12 tests, adapter 67 unit, 35 of 36 driver (the IPv6 test cannot bind ::1 in this container), 12 http_download, 11 localhost, 8 mse, 3 multiblock, 9 parser regressions.
+        """
+    author "Claude"
+}
+
 record templartorrent.evidence.preview-live-commands/1 : evidence {
     title "Ubuntu 26.04.1 x86_64 i7-13700H, rustc 1.99.0 (b940084d7 2026-09-28), uncommitted tree based on 72b01427. The preview live_commands filter passed 6 tests and filtered 4. LiveBridge still rejects data deletion, add, reannounce, and peer preference. No window was opened."
     state verified

@@ -354,7 +354,7 @@ record templartorrent.work.picker-buckets/1 : work {
 
 record templartorrent.work.power-loss-batched-sync/1 : work {
     title "Prove the batched sync against power loss with a fault-injected disk"
-    state proposed
+    state completed
     intent """
         Close the open gate on the batched write path (milestone loopback-throughput dropped the per-piece fdatasync): show that a resume bitmap written at a checkpoint names only pieces the checkpoint's sync made durable, so a power loss after the checkpoint cannot leave a trusted bit over bytes that never reached the disk. The forced-kill test could not show this because the page cache survives a killed process. Add a disk observer seam to the storage crate, a shadow that models durable versus volatile bytes, and a driver test that loses power after a checkpoint, restores the durable image with the checkpoint's mtimes, restarts from the record and completes with matching bytes; and a negative control that forges one lost piece into the bitmap and shows the resulting hole, proving the harness can tell.
         """
@@ -365,6 +365,7 @@ record templartorrent.work.power-loss-batched-sync/1 : work {
                 """
             method command
             command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p templartorrent-storage -p templartorrent-rbit-adapter --no-fail-fast"
+            verified_by [ @templartorrent.evidence.power-loss-batched-sync/1 ]
         }
         check power-loss {
             statement """
@@ -372,6 +373,7 @@ record templartorrent.work.power-loss-batched-sync/1 : work {
                 """
             method command
             command "cargo test -p templartorrent-rbit-adapter --test driver driver_resume_bitmap_survives_a_power_loss_after_the_sync"
+            verified_by [ @templartorrent.evidence.power-loss-batched-sync/1 ]
         }
     }
     part_of [ @templartorrent.milestone.loopback-throughput ]
