@@ -193,6 +193,31 @@ record templartorrent.work.optimistic-unchoke/1 : work {
     }
 }
 
+record templartorrent.work.peer-id-client-fallback/1 : work {
+    title "Name peers from their BEP 20 peer id when no extension handshake names them"
+    state proposed
+    intent """
+        Close the README's "peer-ID client fallback" gap: a peer that sends no extension handshake, or one without a v string, showed as Unknown in the Peers tab. Decode Azureus-style, Shadow-style, Mainline and the known fixed-prefix ids into a bounded clean label at connection time, keep the extension handshake's own name as the better source when it arrives, and never let the guess reach policy.
+        """
+    acceptance {
+        check decoder {
+            statement """
+                Unit tests cover Azureus codes with dotted versions, Shadow and Mainline forms, fixed prefixes, unknown ids and ids carrying control bytes
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --lib client_id"
+        }
+        check wire {
+            statement """
+                Over a real loopback wire, fixture peers with the id -TR4040- and no extension name show as Transmission 4.0.4.0 in peer_status
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver driver_peer_preference_narrows_retains_and_blocks"
+        }
+    }
+    author "Claude"
+}
+
 record templartorrent.work.peer-preference/1 : work {
     title "Local peer preference: Prefer/Normal/Avoid/Block through Driver, worker and Peers tab"
     state completed

@@ -184,7 +184,7 @@ impl Server {
                         observed.accepted.fetch_add(1, Ordering::SeqCst);
                         let fixture = fixture.clone(); let stats = observed.clone();
                         clients.spawn(async move {
-                            let Ok(mut conn) = PeerConnection::accept(stream, fixture.hash, [17; 20]).await else { return; };
+                            let Ok(mut conn) = PeerConnection::accept(stream, fixture.hash, FIXTURE_PEER_ID).await else { return; };
                             stats.active.fetch_add(1, Ordering::SeqCst);
                             let result = serve(&mut conn, &fixture, &stats, fault).await;
                             stats.active.fetch_sub(1, Ordering::SeqCst);
@@ -253,6 +253,10 @@ impl Leech {
         let _ = self.task.await;
     }
 }
+
+/// Fixture peers present an Azureus-style id and send no extension `v`
+/// name, so the Peers tab label has to come from BEP 20.
+const FIXTURE_PEER_ID: [u8; 20] = *b"-TR4040-fixture-peer";
 
 async fn serve(conn: &mut PeerConnection, fixture: &Fixture, stats: &Stats, fault: Fault) {
     let mut served = 0;
@@ -1667,6 +1671,12 @@ async fn driver_peer_preference_narrows_retains_and_blocks() {
         );
         let status = driver.peer_status(id);
         assert_eq!(status.len(), 2);
+        for row in &status {
+            assert_eq!(
+                row.client, "Transmission 4.0.4.0",
+                "no extension name was sent, so the peer id names the client"
+            );
+        }
         assert_eq!(
             status
                 .iter()

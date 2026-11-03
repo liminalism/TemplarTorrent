@@ -1077,6 +1077,9 @@ impl Driver {
             .torrent
             .piece_count();
         let encrypted = connection.is_encrypted();
+        // BEP 20: the peer id names the client until an extension handshake
+        // names it better.
+        let client = crate::peer_id_client(connection.peer_id.as_ref().map(rbit::PeerId::as_bytes));
         let (sender, receiver) = mpsc::channel(WIRE_CAP);
         let task = tokio::spawn(peer_actor(
             connection,
@@ -1096,7 +1099,7 @@ impl Driver {
                 interested: false,
                 choked: true,
                 remote_choked: true,
-                client: "Unknown".into(),
+                client,
                 uploads: VecDeque::new(),
                 uploading: false,
                 metadata_id: None,
@@ -1596,11 +1599,11 @@ impl Driver {
             return Ok(());
         }
         if extension == 0 {
-            if let Ok(handshake) = ExtensionHandshake::decode(payload) {
-                let name = crate::client_name(Some(&handshake));
-                if let Some(wire) = self.wires.get_mut(&peer) {
-                    wire.client = name;
-                }
+            if let Ok(handshake) = ExtensionHandshake::decode(payload)
+                && let Some(name) = crate::handshake_client(Some(&handshake))
+                && let Some(wire) = self.wires.get_mut(&peer)
+            {
+                wire.client = name;
             }
             let id = preflight::field(payload, b"m")
                 .and_then(|m| preflight::field(m, b"ut_metadata"))
