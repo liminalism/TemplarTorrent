@@ -130,6 +130,18 @@ record templartorrent.evidence.dht-announce/1 : evidence {
         """
 }
 
+record templartorrent.evidence.download-pipeline/1 : evidence {
+    title "Driver suite passes with the wider pipeline and ignored extra uploads"
+    state verified
+    result pass
+    method command
+    observed_at git:7593b7183178e07defe3a76eb458544c4536a3f4
+    command "cargo test -p templartorrent-rbit-adapter --test driver -- --test-threads=8"
+    summary """
+        Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0. 35 driver tests passed, 0 failed, in 3.05 s, on loopback fixtures only. Includes driver_peer_preference_narrows_retains_and_blocks and driver_seed_cancel_queue_flood_and_slot_reduction_quiesce_writers. No Internet.
+        """
+}
+
 record templartorrent.evidence.driver-seeding-metrics/1 : evidence {
     title "One release Linux i7-13700H/Rust 1.99.0 sample: second Driver resolved metadata and downloaded 196681 bytes from the listening Driver in 340301891 ns including final comparison/shutdown. Traced upload ownership peaked at 81920 B; sampled shared upload reservation 98368 B; sampled process RSS 5246976 B including both Drivers/fixture/Tokio. Initial seed download excluded; not app startup or an optimization comparison."
     state verified
@@ -435,6 +447,18 @@ record templartorrent.evidence.localhost-transfer/1 : evidence {
     command "cargo test --manifest-path integration/rbit-adapter/Cargo.toml --test localhost localhost_transfer"
     summary """
         Localhost v1 transfer completes over real rbit TCP: 4/4 pieces SHA1-verified against metainfo, final bytes equal 50KB owned fixture
+        """
+}
+
+record templartorrent.evidence.magnet-arguments/1 : evidence {
+    title "Encoded magnets parse and split arguments rejoin"
+    state verified
+    result pass
+    method command
+    observed_at git:7593b7183178e07defe3a76eb458544c4536a3f4
+    command "cargo test -p templartorrent --lib workflow::tests::split_magnet_arguments_rejoin -- --test-threads=8 && cargo test -p templartorrent-rbit-adapter --test parser_regressions magnet_accepts_encoded -- --test-threads=8"
+    summary """
+        Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0. split_magnet_arguments_rejoin passed (1 passed, 35 filtered). magnet_accepts_encoded_xt_dotted_keys_and_any_case passed (1 passed, 9 filtered). No Internet.
         """
 }
 
@@ -754,6 +778,18 @@ record templartorrent.evidence.rate-ranking-gates/1 : evidence {
     artifact "perf-results/2026-10-22-multi-lease/clippy.log"
     summary """
         Same host and tree: 158 workspace tests, formatting and Clippy with warnings denied clean.
+        """
+}
+
+record templartorrent.evidence.rate-sample-3s/1 : evidence {
+    title "Displayed payload rate stays put until a 3 second window elapses"
+    state verified
+    result pass
+    method command
+    observed_at git:7593b7183178e07defe3a76eb458544c4536a3f4
+    command "cargo test -p templartorrent --lib workflow::tests::smoothed_rates_wait_for_a_window_and_then_go_quiet -- --test-threads=8"
+    summary """
+        Linux 7.0.0-31-generic, i7-13700H, rustc 1.99.0. smoothed_rates_wait_for_a_window_and_then_go_quiet passed: 1 passed, 0 failed, 35 filtered out.
         """
 }
 

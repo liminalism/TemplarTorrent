@@ -9,7 +9,7 @@ use templartorrent_core::{
 };
 use templartorrent_engine::{
     event::PeerId,
-    peer::{PeerAction, PeerMessage},
+    peer::{DEFAULT_MAX_IN_FLIGHT, PeerAction, PeerMessage},
     session::{JobSpec, Session, SessionReport, piece_working_set},
     worker::{PieceSink, PieceVerifier, SinkError},
 };
@@ -105,7 +105,10 @@ fn multi_block_pipeline_refills_out_of_order_with_short_tail_and_file_promotion(
         let report = session.update(0, &Exact);
         assert!(report.errors.is_empty(), "{report:?}");
         let batch = requests(&report);
-        assert!(batch.len() <= 8, "pipeline must remain bounded");
+        assert!(
+            batch.len() <= DEFAULT_MAX_IN_FLIGHT,
+            "pipeline must remain bounded"
+        );
         for &(_, piece, begin, _) in &batch {
             assert!(seen.insert((piece, begin)), "received block re-requested");
             if piece_order.last() != Some(&piece) {
@@ -135,12 +138,12 @@ fn multi_block_pipeline_refills_out_of_order_with_short_tail_and_file_promotion(
         [1, 2]
     );
     assert_eq!(seen.len(), 33);
-    // The next piece is leased while the current one's last blocks land, so
-    // at most two piece working sets are reserved at once, never more.
+    // The pipeline can lease every piece of this three-piece fixture before
+    // the first block returns, so the peak may cover all three working sets.
     let working_set = piece_working_set(LENGTH as usize).unwrap();
     assert!(
-        peak >= working_set && peak <= 2 * working_set,
-        "peak {peak} outside one to two working sets of {working_set}"
+        peak >= working_set && peak <= 3 * working_set,
+        "peak {peak} outside one to three working sets of {working_set}"
     );
     let snap = session.snapshot();
     assert_eq!(snap.jobs[0].verified_bytes, 2 * LENGTH + 37);

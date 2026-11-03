@@ -38,6 +38,38 @@ fn metadata_message_string_length_near_usize_max_is_refused() {
 }
 
 #[test]
+fn magnet_accepts_encoded_xt_dotted_keys_and_any_case() {
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    let encoded =
+        format!("magnet:?xt=urn%3Abtih%3A{hash}&tr=http%3A%2F%2Ftracker.example%2Fannounce%2520x");
+    let magnet = magnet_of(&encoded);
+    assert_eq!(magnet.info_hash.to_hex(), hash);
+    assert_eq!(
+        magnet.trackers,
+        vec!["http://tracker.example/announce%20x".to_string()]
+    );
+
+    let dotted = format!("magnet:?xt.1=urn:btih:{hash}&tr.1=http://tracker.example/announce");
+    let magnet = magnet_of(&dotted);
+    assert_eq!(magnet.info_hash.to_hex(), hash);
+    assert_eq!(
+        magnet.trackers,
+        vec!["http://tracker.example/announce".to_string()]
+    );
+
+    let mixed = format!("<Magnet:?xt=urn:BTIH:{hash}>");
+    let magnet = magnet_of(&mixed);
+    assert_eq!(magnet.info_hash.to_hex(), hash);
+}
+
+fn magnet_of(uri: &str) -> rbit::MagnetLink {
+    match parse_magnet(uri).unwrap_or_else(|error| panic!("{uri}: {error}")) {
+        templartorrent_rbit_adapter::Source::Magnet(magnet) => magnet,
+        templartorrent_rbit_adapter::Source::Torrent(_) => panic!("torrent {uri}"),
+    }
+}
+
+#[test]
 fn magnet_btih_with_a_multibyte_char_is_refused() {
     // 40 bytes, so it reaches hex decoding, with a two-byte char at an odd
     // offset so a two-byte slice splits it.

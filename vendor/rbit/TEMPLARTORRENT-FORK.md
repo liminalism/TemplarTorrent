@@ -101,5 +101,11 @@ the Vuze/libtorrent MSE/PE spec):
   New `is_encrypted()`. The handshake code is shared, not changed.
 - `Cargo.toml`: dependency `num-bigint = "0.4"` (pure Rust).
 
-Nothing else is modified. Upgrading rbit means re-applying exactly these
-hunks, or checking that upstream fixed the same inputs.
+Magnet links, 2026-10-27: `src/metainfo/magnet.rs` trims the URI, strips one
+layer of quotes or angle brackets, accepts `magnet:?`, `urn:btih:` and
+`urn:btmh:1220` in any ASCII case, percent-decodes each query key and value
+once, and folds a dotted numeric suffix (`xt.1`) onto its base key. Pure v2
+magnets stay refused by the adapter.
+
+Upgrading rbit means re-applying exactly these hunks, or checking that
+upstream fixed the same inputs.

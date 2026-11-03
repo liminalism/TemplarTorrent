@@ -1020,3 +1020,205 @@ async fn real_gateway_probe() {
         None => {}
     }
 }
+
+#[test]
+fn route_follows_the_egress_through_a_vpn_tunnel() {
+    let hotel = Ipv4Addr::new(10, 10, 10, 1);
+    let lan = Ipv4Addr::new(10, 10, 10, 125);
+    let tunnel = Ipv4Addr::new(10, 2, 0, 2);
+    // Plain LAN: traffic leaves on the main default route.
+    assert_eq!(
+        pick_route(Some(hotel), Some(lan), Some(lan)),
+        Some(Route {
+            gateway: hotel,
+            local: lan
+        })
+    );
+    // Policy-routed VPN: the main table still names the hotel router.
+    assert_eq!(
+        pick_route(Some(hotel), Some(lan), Some(tunnel)),
+        Some(Route {
+            gateway: Ipv4Addr::new(10, 2, 0, 1),
+            local: tunnel
+        })
+    );
+    // A public egress or a .1 egress never invents a gateway.
+    assert_eq!(
+        pick_route(Some(hotel), Some(lan), Some(Ipv4Addr::new(203, 0, 113, 7))),
+        None
+    );
+    assert_eq!(
+        pick_route(None, None, Some(Ipv4Addr::new(10, 2, 0, 1))),
+        None
+    );
+    assert_eq!(
+        pick_route(None, None, Some(Ipv4Addr::new(100, 64, 3, 9))),
+        Some(Route {
+            gateway: Ipv4Addr::new(100, 64, 3, 1),
+            local: Ipv4Addr::new(100, 64, 3, 9)
+        })
+    );
+    assert_eq!(
+        pick_route(Some(hotel), Some(lan), None),
+        Some(Route {
+            gateway: hotel,
+            local: lan
+        })
+    );
+}
+
+/// A router that assigns its own external port, as Proton VPN's NAT-PMP
+/// does: the driver announces that port and also listens on it.
+#[tokio::test]
+async fn assigned_external_port_is_announced_and_listened_on() {
+    let assigned = {
+        let probe = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let answer: Answer = Arc::new(move |request: &[u8]| match request {
+        [0, 0] => Some(external_reply(Ipv4Addr::new(203, 0, 113, 7))),
+        [0, 1 | 2, ..] if request.len() == 12 => {
+            let mut reply = mapping_reply(request, 0, 60);
+            let asked = u32::from_be_bytes([request[8], request[9], request[10], request[11]]);
+            if asked != 0 {
+                reply[10..12].copy_from_slice(&assigned.to_be_bytes());
+            }
+            Some(reply)
+        }
+        _ => None,
+    });
+    let fixture = natpmp_fixture(answer, false).await;
+    let mut driver = crate::driver::Driver::new(Default::default()).unwrap();
+    let bound = driver.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    assert_ne!(bound.port(), assigned);
+    assert_eq!(driver.announced_port(), Some(bound.port()));
+    driver.set_port_mapping_config(natpmp_only(fixture.port));
+    driver.enable_port_mapping().unwrap();
+    let start = Instant::now();
+    while driver.announced_port() != Some(assigned) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            driver.port_mapping_status()
+        );
+        driver.step(Duration::from_millis(5)).await.unwrap();
+    }
+    driver.step(Duration::from_millis(5)).await.unwrap();
+    let reached = tokio::net::TcpStream::connect((LOOPBACK, assigned)).await;
+    assert!(reached.is_ok(), "the mapped port has a listener");
+    driver.shutdown().await;
+    assert!(
+        tokio::net::TcpStream::connect((LOOPBACK, assigned))
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn renewal_stays_inside_a_short_lifetime() {
+    let mapping = |lifetime| Mapping {
+        method: Method::NatPmp,
+        port: 1,
+        external: None,
+        lifetime: Some(lifetime),
+        upnp: None,
+    };
+    let config = Config::default();
+    assert_eq!(mapping(60).renew_after(&config), Duration::from_secs(45));
+    assert_eq!(
+        mapping(7200).renew_after(&config),
+        Duration::from_secs(3600)
+    );
+    assert_eq!(
+        mapping(10).renew_after(&config),
+        Duration::from_millis(7500)
+    );
+}
+
+/// With a mapping in place, a newly added job's first tracker announce
+/// carries the mapped port, not the listen port. (A mapping that appears
+/// after a job announced marks its trackers stale; they announce again when
+/// the 60 s manual cooldown allows, which a fast test cannot wait for.)
+#[tokio::test]
+async fn announces_carry_the_mapped_port() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let assigned = {
+        let probe = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let answer: Answer = Arc::new(move |request: &[u8]| match request {
+        [0, 0] => Some(external_reply(Ipv4Addr::new(203, 0, 113, 7))),
+        [0, 1 | 2, ..] if request.len() == 12 => {
+            let mut reply = mapping_reply(request, 0, 60);
+            reply[10..12].copy_from_slice(&assigned.to_be_bytes());
+            Some(reply)
+        }
+        _ => None,
+    });
+    let fixture = natpmp_fixture(answer, false).await;
+    // A tracker that records the port of every announce.
+    let tracker = TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+    let tracker_port = tracker.local_addr().unwrap().port();
+    let ports = Arc::new(Mutex::new(Vec::<u16>::new()));
+    let seen = Arc::clone(&ports);
+    let tracker_task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = tracker.accept().await {
+            let mut request = vec![0u8; 4096];
+            let n = stream.read(&mut request).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&request[..n]).to_string();
+            if let Some(port) = text
+                .split(['?', '&', ' '])
+                .find_map(|part| part.strip_prefix("port="))
+                .and_then(|value| value.parse().ok())
+            {
+                seen.lock().unwrap().push(port);
+            }
+            let body = b"d8:intervali1800e12:min intervali0e5:peers0:e";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+    let data = vec![7u8; 40_000];
+    let torrent = rbit::TorrentBuilder::new("mapped")
+        .version(rbit::TorrentVersion::V1)
+        .piece_length(16384)
+        .add_tracker(format!("http://127.0.0.1:{tracker_port}/announce"))
+        .add_file("a.bin", data)
+        .build()
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("tt-portmap-reannounce-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let mut driver = crate::driver::Driver::new(Default::default()).unwrap();
+    driver.set_allow_local_trackers(true);
+    let bound = driver.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    driver.set_port_mapping_config(natpmp_only(fixture.port));
+    driver.enable_port_mapping().unwrap();
+    let start = Instant::now();
+    while driver.announced_port() != Some(assigned) {
+        assert!(start.elapsed() < Duration::from_secs(5), "no mapping");
+        driver.step(Duration::from_millis(5)).await.unwrap();
+    }
+    driver
+        .add_torrent(&torrent, &root, crate::driver::ExistingData::Refuse)
+        .await
+        .unwrap();
+    while !ports.lock().unwrap().contains(&assigned) {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "trackers never heard the mapped port: {:?}",
+            ports.lock().unwrap()
+        );
+        driver.step(Duration::from_millis(5)).await.unwrap();
+    }
+    assert!(
+        !ports.lock().unwrap().contains(&bound.port()),
+        "the unreachable listen port was never announced"
+    );
+    driver.shutdown().await;
+    tracker_task.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}

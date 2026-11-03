@@ -47,7 +47,7 @@ pub fn valid_activation(text: &str) -> bool {
     {
         return false;
     }
-    if text.starts_with("magnet:?") {
+    if crate::workflow::normalize_magnet(text).is_ok() {
         return true;
     }
     Path::new(text)

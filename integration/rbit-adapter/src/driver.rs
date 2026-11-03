@@ -47,7 +47,8 @@ use tokio::{
 };
 
 const EVENT_CAP: usize = 64;
-const WIRE_CAP: usize = 32;
+/// Room for one full request pipeline plus interest, choke, cancel and have.
+const WIRE_CAP: usize = DEFAULT_MAX_IN_FLIGHT + 16;
 /// Sources a magnet's metadata resolution may try before the job exists.
 const CANDIDATE_CAP: usize = 32;
 /// Remembered peer candidates per job (DESIGN.md section 5: 2,048).
@@ -71,13 +72,17 @@ const PREFERENCE_CAP: usize = 256;
 /// Request pipeline for an avoided peer; it stays usable for pieces nobody
 /// else supplies but takes a smaller share.
 const AVOID_PIPELINE: usize = 2;
+/// Block requests accepted from one unchoked peer. A further request is
+/// ignored so a peer with a large queue is not disconnected. Advertised as
+/// BEP 10 `reqq` (how many requests the peer may send us).
+const UPLOAD_QUEUE: usize = 8;
 /// How often the optimistic upload slot moves to another interested peer.
 const OPTIMISTIC_INTERVAL_S: u64 = 30;
 /// How often regular upload slots are re-ranked by measured rates. Between
 /// evaluations the previous order holds, which is the hysteresis against churn.
 const CHOKE_INTERVAL_S: u64 = 10;
 /// Per-peer payload rates are sampled over this window and blended 3:1.
-const RATE_WINDOW: Duration = Duration::from_secs(2);
+const RATE_WINDOW: Duration = Duration::from_secs(3);
 /// Outstanding request stamps kept per peer. Older stamps drop first.
 const RTT_PENDING_CAP: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -170,6 +175,8 @@ pub struct PeerStatus {
     pub hash_failures: u32,
     /// Whether the wire negotiated MSE/PE RC4.
     pub encrypted: bool,
+    /// Whether the peer connected to our listener.
+    pub incoming: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +208,9 @@ struct Tracked {
     last_error: Option<String>,
     /// Whether this tracker has already accepted a `started` announce.
     started: bool,
+    /// The announced port changed since this tracker last heard from us;
+    /// it announces again as soon as its manual cooldown allows.
+    port_stale: bool,
 }
 struct Job {
     torrent: ValidatedV1,
@@ -298,12 +308,16 @@ struct Wire {
     rtt_us: Option<u64>,
     /// Attributed hash failures. They demote this peer and disconnect nobody.
     hash_failures: u32,
+    /// Remote BEP 10 `reqq` when the handshake carried a positive one.
+    /// Clamps our outgoing request pipeline. `None` keeps our own cap.
+    remote_reqq: Option<usize>,
     /// The peer's ut_pex id, when it offered one and the job is public.
     pex_id: Option<u8>,
     /// Addresses our last PEX message to this peer listed, and when.
     pex_sent: Vec<SocketAddr>,
     pex_at_s: u64,
     encrypted: bool,
+    incoming: bool,
 }
 struct WireCommand {
     message: Message,
@@ -366,6 +380,11 @@ struct Listener {
     address: SocketAddr,
     task: JoinHandle<()>,
     incoming: mpsc::Receiver<Incoming>,
+    sender: mpsc::Sender<Incoming>,
+    /// A second socket on the router's mapped port, when it differs from
+    /// ours: some gateways (Proton VPN's NAT-PMP) assign their own external
+    /// port and forward it to that same port number, not to the one asked.
+    mapped: Option<(u16, JoinHandle<()>)>,
 }
 
 #[derive(Debug, Default)]
@@ -394,6 +413,8 @@ pub struct Driver {
     listener: Option<Listener>,
     /// Router port mapping for the listen port; only after explicit opt-in.
     port_map: Option<crate::portmap::PortMapper>,
+    /// The port the last announces carried; a change re-announces.
+    last_announced_port: Option<u16>,
     port_map_config: crate::portmap::Config,
     upload_ownership: Arc<UploadOwnership>,
     allow_local_trackers: bool,
@@ -470,6 +491,7 @@ impl Driver {
             listener: None,
             port_map: None,
             port_map_config: crate::portmap::Config::default(),
+            last_announced_port: None,
             upload_ownership: Arc::default(),
             allow_local_trackers: false,
             public_trackers: Vec::new(),
@@ -665,31 +687,14 @@ impl Driver {
             .local_addr()
             .map_err(|_| DriverError("listener address unavailable"))?;
         let (sender, incoming) = mpsc::channel(8);
-        let keys = Arc::clone(&self.incoming_keys);
         self.refresh_incoming_keys();
-        let task = tokio::spawn(async move {
-            // Dropping the set with the listener task aborts every probe.
-            let mut probes = JoinSet::new();
-            while let Ok((stream, address)) = socket.accept().await {
-                while probes.try_join_next().is_some() {}
-                if probes.len() >= PROBE_CAP {
-                    continue;
-                }
-                let sender = sender.clone();
-                let keys = Arc::clone(&keys);
-                probes.spawn(async move {
-                    let probe = timeout(CONNECT_TIMEOUT, route_incoming(stream, address, &keys));
-                    if let Ok(Some(incoming)) = probe.await {
-                        // Queue full: the failed send drops the socket.
-                        let _ = sender.try_send(incoming);
-                    }
-                });
-            }
-        });
+        let task = accept_loop(socket, sender.clone(), Arc::clone(&self.incoming_keys));
         self.listener = Some(Listener {
             address,
             task,
             incoming,
+            sender,
+            mapped: None,
         });
         Ok(address)
     }
@@ -725,6 +730,71 @@ impl Driver {
     pub async fn disable_port_mapping(&mut self) {
         if let Some(mapper) = self.port_map.take() {
             mapper.stop(crate::portmap::STOP_BOUND).await;
+        }
+    }
+
+    /// The port peers should dial: the router's mapped external port while a
+    /// mapping holds, else our listen port. Trackers and the DHT get this.
+    pub fn announced_port(&self) -> Option<u16> {
+        let listen = self.listening_address()?.port();
+        match self.port_mapping_status() {
+            crate::portmap::Status::Mapped { port, .. } if port != 0 => Some(port),
+            _ => Some(listen),
+        }
+    }
+
+    /// A new announced port (a mapping appeared, changed or lapsed) is sent
+    /// at once: every job's DHT announce becomes due, and each tracker gets
+    /// a manual announce, still inside its minimum-interval cooldown.
+    fn reannounce_on_port_change(&mut self) {
+        let port = self.announced_port();
+        if port == self.last_announced_port {
+            return;
+        }
+        let first = self.last_announced_port.is_none();
+        self.last_announced_port = port;
+        if first || port.is_none() {
+            return;
+        }
+        for job in self.jobs.0.values_mut() {
+            job.dht_due_s = 0;
+            for tracker in &mut job.trackers {
+                tracker.port_stale = true;
+            }
+        }
+        self.refresh_due_trackers();
+    }
+
+    /// Keep a second listener on the mapped port while it differs from the
+    /// listen port, and close it when the mapping changes or lapses.
+    async fn maintain_mapped_listener(&mut self) {
+        let wanted = match (self.listening_address(), self.port_mapping_status()) {
+            (Some(listen), crate::portmap::Status::Mapped { port, .. })
+                if port != 0 && port != listen.port() =>
+            {
+                Some(SocketAddr::new(listen.ip(), port))
+            }
+            _ => None,
+        };
+        let Some(listener) = self.listener.as_mut() else {
+            return;
+        };
+        let current = listener.mapped.as_ref().map(|(port, _)| *port);
+        if current == wanted.map(|address| address.port()) {
+            return;
+        }
+        if let Some((_, task)) = listener.mapped.take() {
+            task.abort();
+        }
+        if let Some(address) = wanted
+            && let Ok(socket) = TcpListener::bind(address).await
+        {
+            let task = accept_loop(
+                socket,
+                listener.sender.clone(),
+                Arc::clone(&self.incoming_keys),
+            );
+            listener.mapped = Some((address.port(), task));
         }
     }
 
@@ -821,7 +891,14 @@ impl Driver {
                 address: incoming.address,
                 origin: PeerOrigin::UserProvided,
             };
-            let _ = self.attach(id, source, connection, Vec::new());
+            if self.attach(id, source, connection, Vec::new()).is_ok()
+                && let Some(wire) = self
+                    .wires
+                    .values_mut()
+                    .find(|wire| wire.torrent == id && wire.source.address == source.address)
+            {
+                wire.incoming = true;
+            }
         }
     }
 
@@ -1095,10 +1172,12 @@ impl Driver {
                 pending_rtt: Vec::new(),
                 rtt_us: None,
                 hash_failures: 0,
+                remote_reqq: None,
                 pex_id: None,
                 pex_sent: Vec::new(),
                 pex_at_s: 0,
                 encrypted,
+                incoming: false,
             },
         );
         let pipeline = pipeline_for(self.peer_preference(id, source.address));
@@ -1124,6 +1203,7 @@ impl Driver {
                 ExtensionHandshake::with_extensions(&[("ut_metadata", crate::metadata::OUR_MD_ID)])
             };
             handshake.metadata_size = Some(self.jobs.0[&id].torrent.meta.raw_info().len() as i64);
+            handshake.reqq = i64::try_from(UPLOAD_QUEUE).ok();
             self.queue(
                 peer,
                 Message::Extended {
@@ -1312,6 +1392,9 @@ impl Driver {
         if let Some(listener) = self.listener.take() {
             listener.task.abort();
             let _ = listener.task.await;
+            if let Some((_, task)) = listener.mapped {
+                task.abort();
+            }
         }
         let ids: Vec<_> = self.jobs.0.keys().copied().collect();
         for id in ids {
@@ -1494,10 +1577,12 @@ impl Driver {
                 }
                 let request = (index, begin, length);
                 if !wire.uploads.contains(&request) {
-                    if wire.uploads.len() + usize::from(wire.uploading) >= 8 {
-                        return Err(DriverError("upload request queue exceeded"));
+                    // A peer may advertise hundreds of outstanding requests.
+                    // Keeping eight and ignoring the rest leaves the download
+                    // connection up; disconnecting here stalls the transfer.
+                    if wire.uploads.len() + usize::from(wire.uploading) < UPLOAD_QUEUE {
+                        wire.uploads.push_back(request);
                     }
-                    wire.uploads.push_back(request);
                 }
                 Ok(())
             }
@@ -1584,12 +1669,15 @@ impl Driver {
             return Ok(());
         }
         if extension == 0 {
-            if let Ok(handshake) = ExtensionHandshake::decode(payload) {
-                let name = crate::client_name(Some(&handshake));
-                if let Some(wire) = self.wires.get_mut(&peer) {
-                    wire.client = name;
-                }
-            }
+            let remote_reqq = ExtensionHandshake::decode(payload)
+                .ok()
+                .and_then(|handshake| {
+                    let name = crate::client_name(Some(&handshake));
+                    if let Some(wire) = self.wires.get_mut(&peer) {
+                        wire.client = name;
+                    }
+                    admitted_reqq(handshake.reqq)
+                });
             let id = preflight::field(payload, b"m")
                 .and_then(|m| preflight::field(m, b"ut_metadata"))
                 .and_then(preflight::integer)
@@ -1608,6 +1696,9 @@ impl Driver {
             if let Some(wire) = self.wires.get_mut(&peer) {
                 wire.metadata_id = (id != 0).then_some(id);
                 wire.pex_id = pex.filter(|_| public);
+            }
+            if let Some(reqq) = remote_reqq {
+                self.apply_remote_reqq(peer, reqq);
             }
         } else if extension == OUR_MD_ID {
             let wire = self.wires.get(&peer).ok_or(DriverError("unknown peer"))?;
@@ -1992,6 +2083,8 @@ impl Driver {
             self.event(event, &mut report).await;
             self.pump(&mut report).await?;
         }
+        self.maintain_mapped_listener().await;
+        self.reannounce_on_port_change();
         self.collect_announces();
         self.refresh_due_trackers();
         self.collect_dht();
@@ -2032,6 +2125,7 @@ impl Driver {
                 rtt_us: wire.rtt_us,
                 hash_failures: wire.hash_failures,
                 encrypted: wire.encrypted,
+                incoming: wire.incoming,
             })
             .collect();
         rows.sort_by_key(|row| row.address);
@@ -2279,6 +2373,7 @@ impl Driver {
                 peers: None,
                 last_error: None,
                 started: false,
+                port_stale: false,
             });
         }
         // A private job without an original tracker can never admit a peer.
@@ -2387,10 +2482,12 @@ impl Driver {
         for peer in peers {
             if preference == PeerPreference::Block {
                 self.retire_peer(peer).await;
-            } else {
-                let _ = self
-                    .session
-                    .set_peer_pipeline(id, peer, pipeline_for(preference));
+            } else if let Some(remote_reqq) = self.wires.get(&peer).map(|wire| wire.remote_reqq) {
+                let _ = self.session.set_peer_pipeline(
+                    id,
+                    peer,
+                    clamp_pipeline(preference, remote_reqq),
+                );
             }
         }
         Ok(())
@@ -2410,6 +2507,20 @@ impl Driver {
             .iter()
             .find(|(_, wire)| wire.torrent == id && wire.source.address == address)
             .and_then(|(peer, _)| self.session.peer_pipeline(id, *peer).ok())
+    }
+
+    /// Clamp this peer's outgoing request pipeline to the `reqq` it advertised.
+    fn apply_remote_reqq(&mut self, peer: PeerId, reqq: usize) {
+        let Some(wire) = self.wires.get(&peer) else {
+            return;
+        };
+        let torrent = wire.torrent;
+        let address = wire.source.address;
+        let cap = clamp_pipeline(self.peer_preference(torrent, address), Some(reqq));
+        let _ = self.session.set_peer_pipeline(torrent, peer, cap);
+        if let Some(wire) = self.wires.get_mut(&peer) {
+            wire.remote_reqq = Some(reqq);
+        }
     }
 
     /// Regular slot order: manual preference, then fewer attributed hash
@@ -2521,8 +2632,7 @@ impl Driver {
             return Err(DriverError("pure v2 magnets are not supported"));
         };
         let port = self
-            .listening_address()
-            .map(|address| address.port())
+            .announced_port()
             .ok_or(DriverError("listening port is not configured"))?;
         let mut originals = Vec::new();
         for url in magnet.trackers.iter().take(crate::discovery::MAX_TRACKERS) {
@@ -2546,28 +2656,48 @@ impl Driver {
                 peers: None,
                 last_error: None,
                 started: false,
+                port_stale: false,
             });
         }
         let mut discovered = Vec::new();
         let mut announced = Vec::new();
         let peer_id = self.peer_id;
-        for mut tracker in originals {
+        // A magnet with several trackers used to announce them one after
+        // another, each allowed ten seconds, before the job existed.
+        let had_trackers = !magnet.trackers.is_empty();
+        let allow_local = self.allow_local_trackers;
+        let mut tasks = JoinSet::new();
+        for (index, tracker) in originals.into_iter().enumerate() {
             let url = tracker.url.clone();
-            match announce_detached(
-                &url,
-                self.allow_local_trackers,
-                crate::announce::AnnounceRequest {
-                    info_hash: &hash,
-                    peer_id: &peer_id,
-                    port,
-                    uploaded: 0,
-                    downloaded: 0,
-                    left: UNKNOWN_LEFT,
-                    event: rbit::TrackerEvent::Started,
-                },
-            )
-            .await
-            {
+            let info_hash = hash;
+            let announce_id = peer_id;
+            tasks.spawn(async move {
+                let result = announce_detached(
+                    &url,
+                    allow_local,
+                    crate::announce::AnnounceRequest {
+                        info_hash: &info_hash,
+                        peer_id: &announce_id,
+                        port,
+                        uploaded: 0,
+                        downloaded: 0,
+                        left: UNKNOWN_LEFT,
+                        event: rbit::TrackerEvent::Started,
+                    },
+                )
+                .await;
+                (index, tracker, result)
+            });
+        }
+        let mut finished = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(item) = joined {
+                finished.push(item);
+            }
+        }
+        finished.sort_by_key(|(index, _, _)| *index);
+        for (_, mut tracker, result) in finished {
+            match result {
                 Ok(response) => {
                     self.collect_peers(
                         &response,
@@ -2619,9 +2749,13 @@ impl Driver {
             }
         }
         if discovered.is_empty() {
-            return Err(DriverError(
-                "no admissible tracker peers or explicit sources",
-            ));
+            return Err(DriverError(if !had_trackers && !public_bootstrap {
+                "magnet has no trackers; enable public peer discovery"
+            } else if had_trackers && !public_bootstrap {
+                "no tracker peers; public peer discovery is off for this magnet"
+            } else {
+                "no admissible tracker peers or explicit sources"
+            }));
         }
         let id = self
             .add_magnet(uri, destination, existing, &discovered, public_bootstrap)
@@ -2755,6 +2889,7 @@ impl Driver {
                 peers: None,
                 last_error: None,
                 started: false,
+                port_stale: false,
             });
         }
         // A private job without an admissible tracker can never admit a peer.
@@ -2864,12 +2999,15 @@ impl Driver {
                 let Ok(schedule) = self.session.tracker_schedule(*id, index) else {
                     continue;
                 };
-                if !schedule.in_flight && now >= schedule.periodic_due_s {
-                    due.push((*id, index));
+                let stale = job.trackers[index].port_stale;
+                if !schedule.in_flight
+                    && (now >= schedule.periodic_due_s || (stale && now >= schedule.manual_due_s))
+                {
+                    due.push((*id, index, stale && now < schedule.periodic_due_s));
                 }
             }
         }
-        for (id, index) in due {
+        for (id, index, manual) in due {
             let running = self.snapshot().jobs.iter().any(|row| {
                 row.id == id
                     && matches!(
@@ -2880,7 +3018,7 @@ impl Driver {
             if !running {
                 continue;
             }
-            if let Ok(true) = self.session.begin_announce(id, index, now, false) {
+            if let Ok(true) = self.session.begin_announce(id, index, now, manual) {
                 let _ = self.spawn_announce(id, index);
             }
         }
@@ -2888,8 +3026,7 @@ impl Driver {
 
     fn spawn_announce(&mut self, id: TorrentId, index: usize) -> Result<()> {
         let port = self
-            .listening_address()
-            .map(|address| address.port())
+            .announced_port()
             .ok_or(DriverError("listening port is not configured"));
         let hash = self
             .jobs
@@ -2921,6 +3058,7 @@ impl Driver {
                 return Err(error);
             }
         };
+        tracker.port_stale = false;
         let event = if tracker.started {
             rbit::TrackerEvent::None
         } else {
@@ -3278,7 +3416,7 @@ impl Driver {
             }
         }
         // Announce our TCP listen port, which the DHT socket shares.
-        let port = self.listening_address().map(|address| address.port());
+        let port = self.announced_port();
         for (id, hash, interval) in due {
             if let Some(job) = self.jobs.0.get_mut(&id) {
                 job.dht_due_s = now + interval;
@@ -3555,6 +3693,7 @@ impl Driver {
                     peers: None,
                     last_error: None,
                     started: false,
+                    port_stale: false,
                 });
             }
         }
@@ -3565,6 +3704,9 @@ impl Drop for Driver {
     fn drop(&mut self) {
         if let Some(listener) = &self.listener {
             listener.task.abort();
+            if let Some((_, task)) = &listener.mapped {
+                task.abort();
+            }
         }
         for wire in self.wires.values() {
             wire.task.abort();
@@ -3611,6 +3753,20 @@ fn pipeline_for(preference: PeerPreference) -> usize {
         PeerPreference::Prefer | PeerPreference::Normal | PeerPreference::Block => {
             DEFAULT_MAX_IN_FLIGHT
         }
+    }
+}
+
+/// `reqq` is how many request messages the peer will queue. Missing or
+/// non-positive means we keep our own cap.
+fn admitted_reqq(reqq: Option<i64>) -> Option<usize> {
+    let reqq = reqq.filter(|value| *value > 0)?;
+    Some(usize::try_from(reqq).unwrap_or(usize::MAX))
+}
+
+fn clamp_pipeline(preference: PeerPreference, remote_reqq: Option<usize>) -> usize {
+    match remote_reqq {
+        Some(reqq) => pipeline_for(preference).min(reqq),
+        None => pipeline_for(preference),
     }
 }
 
@@ -3756,6 +3912,34 @@ fn prepare_destination(path: &Path, existing: ExistingData) -> Result<PathBuf> {
     std::fs::canonicalize(path).map_err(|_| DriverError("destination validation failed"))
 }
 
+/// Accept loop for one listening socket: each accepted connection gets its
+/// own bounded probe (plaintext prefix or MSE) and is routed by info hash.
+fn accept_loop(
+    socket: TcpListener,
+    sender: mpsc::Sender<Incoming>,
+    keys: Arc<Mutex<IncomingKeys>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Dropping the set with the listener task aborts every probe.
+        let mut probes = JoinSet::new();
+        while let Ok((stream, address)) = socket.accept().await {
+            while probes.try_join_next().is_some() {}
+            if probes.len() >= PROBE_CAP {
+                continue;
+            }
+            let sender = sender.clone();
+            let keys = Arc::clone(&keys);
+            probes.spawn(async move {
+                let probe = timeout(CONNECT_TIMEOUT, route_incoming(stream, address, &keys));
+                if let Ok(Some(incoming)) = probe.await {
+                    // Queue full: the failed send drops the socket.
+                    let _ = sender.try_send(incoming);
+                }
+            });
+        }
+    })
+}
+
 /// Open one outgoing peer wire. Each attempt is bounded by CONNECT_TIMEOUT.
 /// Under PreferEncrypted a failed or stalled MSE handshake is redialled once
 /// in plaintext; nothing of the BitTorrent handshake was sent before it.
@@ -3866,6 +4050,9 @@ async fn route_incoming(
     }
 }
 
+/// Read, write and event delivery stay independent. A full event channel must
+/// not stall a `Request`: inbound messages wait in `outbound` until the driver
+/// reserves a slot, and a command is taken only while that queue has room.
 async fn peer_actor(
     mut connection: PeerConnection,
     torrent: TorrentId,
@@ -3875,45 +4062,105 @@ async fn peer_actor(
     events: mpsc::Sender<WireEvent>,
 ) {
     let mut pending: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut outbound: VecDeque<WireEvent> = VecDeque::new();
     let result: std::result::Result<(), &'static str> = async {
         loop {
+            let room = outbound.len() < EVENT_CAP;
+            let have_outbound = !outbound.is_empty();
             tokio::select! {
-                command = commands.recv() => {
+                biased;
+                command = async {
+                    if room {
+                        commands.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
                     let Some(command) = command else { return Ok(()); };
                     let WireCommand { message, _permit, upload_bytes, _owned } = command;
                     match &message {
                         Message::Request { index, begin, length } => {
-                            if pending.len() >= 8 && !pending.contains_key(&(*index, *begin)) { return Err("wire request pipeline exceeded"); }
+                            if pending.len() >= DEFAULT_MAX_IN_FLIGHT
+                                && !pending.contains_key(&(*index, *begin))
+                            {
+                                return Err("wire request pipeline exceeded");
+                            }
                             pending.insert((*index, *begin), *length);
                         }
-                        Message::Cancel { index, begin, .. } => { pending.remove(&(*index, *begin)); }
+                        Message::Cancel { index, begin, .. } => {
+                            pending.remove(&(*index, *begin));
+                        }
                         _ => {}
                     }
-                    timeout(Duration::from_secs(5), connection.send(message)).await
-                        .map_err(|_| "peer send stalled")?.map_err(|_| "peer send failed")?;
+                    timeout(Duration::from_secs(5), connection.send(message))
+                        .await
+                        .map_err(|_| "peer send stalled")?
+                        .map_err(|_| "peer send failed")?;
                     if upload_bytes != 0 {
-                        events.send(WireEvent { torrent, peer, message: Ok(Message::KeepAlive), uploaded: upload_bytes })
-                            .await.map_err(|_| "driver closed")?;
+                        outbound.push_back(WireEvent {
+                            torrent,
+                            peer,
+                            message: Ok(Message::KeepAlive),
+                            uploaded: upload_bytes,
+                        });
                     }
                     drop(_permit);
                     drop(_owned);
                 }
-                message = connection.receive() => {
+                permit = async {
+                    if have_outbound {
+                        events.reserve().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    let permit = permit.map_err(|_| "driver closed")?;
+                    if let Some(event) = outbound.pop_front() {
+                        permit.send(event);
+                    }
+                }
+                message = async {
+                    if room {
+                        connection.receive().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
                     let message = message.map_err(|_| "peer disconnected")?;
                     match &message {
                         Message::Piece { index, begin, data } => {
-                            let Some(length) = pending.remove(&(*index, *begin)) else { continue; };
-                            if data.len() != length as usize || data.len() > 16384 { return Err("invalid peer block length"); }
+                            let Some(length) = pending.remove(&(*index, *begin)) else {
+                                continue;
+                            };
+                            if data.len() != length as usize || data.len() > 16384 {
+                                return Err("invalid peer block length");
+                            }
                         }
-                        Message::Bitfield(bits) if bits.len() != pieces.div_ceil(8) => return Err("invalid peer bitfield size"),
-                        Message::Port(_) | Message::Suggest { .. } | Message::AllowedFast { .. } | Message::Reject { .. } => continue,
+                        Message::Bitfield(bits) if bits.len() != pieces.div_ceil(8) => {
+                            return Err("invalid peer bitfield size");
+                        }
+                        Message::Port(_)
+                        | Message::Suggest { .. }
+                        | Message::AllowedFast { .. }
+                        | Message::Reject { .. } => continue,
                         _ => {}
                     }
-                    events.send(WireEvent { torrent, peer, message: Ok(message), uploaded: 0 }).await.map_err(|_| "driver closed")?;
+                    outbound.push_back(WireEvent {
+                        torrent,
+                        peer,
+                        message: Ok(message),
+                        uploaded: 0,
+                    });
                 }
             }
         }
-    }.await;
+    }
+    .await;
+    while let Some(event) = outbound.pop_front() {
+        if events.send(event).await.is_err() {
+            return;
+        }
+    }
     if let Err(error) = result {
         let _ = events
             .send(WireEvent {

@@ -568,28 +568,29 @@ async fn driver_seed_cancel_queue_flood_and_slot_reduction_quiesce_writers() {
         drop(conn);
         limits.upload_peer_slots = 1;
         seed.set_limits(limits.clone()).await.unwrap();
-        // A ninth queued request while the first is rate-stalled is rejected.
+        // Extra upload requests while the first is rate-stalled are ignored.
+        // At 1 kB/s a 16 KiB block cannot finish in this wait, and the peer
+        // must stay connected.
         drive_client(&mut seed, async {
             let mut conn = upload_peer(addr, fixture.hash).await;
             for begin in 0..9 {
-                if conn
-                    .send(Message::Request {
-                        index: 0,
-                        begin,
-                        length: 16384,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                conn.send(Message::Request {
+                    index: 0,
+                    begin,
+                    length: 16384,
+                })
+                .await
+                .unwrap();
             }
-            while let Ok(message) = conn.receive().await {
-                assert!(!matches!(message, Message::Piece { .. }));
-            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         })
         .await;
-        assert_eq!(seed.connection_count(), 0);
+        assert_eq!(
+            seed.connection_count(),
+            1,
+            "an extra upload request must not drop the peer"
+        );
+        assert_eq!(seed.snapshot().jobs[0].total_payload_uploaded, 16384);
         limits.seed_jobs = 0;
         seed.set_limits(limits).await.unwrap();
         assert_eq!(seed.snapshot().jobs[0].state, JobState::Complete);
@@ -1648,8 +1649,14 @@ async fn driver_peer_preference_narrows_retains_and_blocks() {
             .unwrap();
         driver.connect_peer(id, b.source).await.unwrap();
         assert_eq!(driver.connection_count(), 2);
-        assert_eq!(driver.peer_pipeline(id, a.source.address), Some(8));
-        assert_eq!(driver.peer_pipeline(id, b.source.address), Some(2));
+        let normal = driver.peer_pipeline(id, a.source.address);
+        let avoid = driver.peer_pipeline(id, b.source.address);
+        assert!(
+            normal.is_some_and(|cap| cap > 8),
+            "a normal peer pipelines more than 8 blocks, got {normal:?}"
+        );
+        assert_eq!(avoid, Some(2));
+        assert!(normal > avoid);
         let start = Instant::now();
         loop {
             assert!(
@@ -1688,7 +1695,12 @@ async fn driver_peer_preference_narrows_retains_and_blocks() {
             .set_peer_preference(id, b.source.address, PeerPreference::Prefer)
             .await
             .unwrap();
-        assert_eq!(driver.peer_pipeline(id, b.source.address), Some(8));
+        assert!(
+            driver
+                .peer_pipeline(id, b.source.address)
+                .is_some_and(|cap| cap > 8),
+            "prefer keeps the wider pipeline"
+        );
         driver
             .set_limits(Limits {
                 connections_total: 1,
@@ -1741,7 +1753,12 @@ async fn driver_peer_preference_narrows_retains_and_blocks() {
         let status = driver.peer_status(id);
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].preference, PeerPreference::Normal);
-        assert_eq!(driver.peer_pipeline(id, b.source.address), Some(8));
+        assert!(
+            driver
+                .peer_pipeline(id, b.source.address)
+                .is_some_and(|cap| cap > 8),
+            "lifting the block restores the wider pipeline"
+        );
         driver.shutdown().await;
         a.close().await;
         b.close().await;

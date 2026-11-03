@@ -22,8 +22,8 @@ use crate::persist::{SessionStore, UiState};
 use crate::worker::{FileRow, ListenState, Request, SessionView, TrackerView, WorkerHandle};
 use crate::workflow::{
     self, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, automatic_order, cooldown_text,
-    country_text, eta_text, format_bytes, move_file, preference_text, rank_label, rate_text,
-    rtt_text, speed_cap, validate_destination, validate_magnet,
+    country_text, eta_text, format_bytes, move_file, normalize_magnet, preference_text, rank_label,
+    rate_text, rtt_text, speed_cap, validate_destination,
 };
 use templartorrent_rbit_adapter::driver::PeerEncryption;
 
@@ -81,7 +81,9 @@ fn download_columns(px: impl Fn(i32) -> i32, width: i32) -> Vec<Column> {
         columns.push(Column::fixed("Peers", px(64), Align::Left));
     }
     if width >= px(420) {
-        columns.push(Column::fixed("State", px(96), Align::Left));
+        // Right-aligned like the rates before it, so a right-aligned Up
+        // value never runs into a left-aligned state name.
+        columns.push(Column::fixed("State", px(96), Align::Right));
     }
     columns
 }
@@ -232,6 +234,15 @@ enum Pending {
     Remove,
     Limits,
     Other,
+}
+
+/// What a click can change mid-frame: inspector tab, which dialog is
+/// open, and the selected job.
+#[derive(PartialEq)]
+struct FrameState {
+    tab: usize,
+    dialog: std::mem::Discriminant<Dialog>,
+    selected: Option<TorrentId>,
 }
 
 struct Desktop {
@@ -499,9 +510,9 @@ impl Desktop {
 
     fn open_activation(&mut self, payload: String) {
         self.open_add();
-        if payload.starts_with("magnet:?") {
+        if let Ok(magnet) = normalize_magnet(&payload) {
             if let Dialog::Add(add) = &mut self.dialog {
-                add.magnet = TextFieldState::with_text(payload);
+                add.magnet = TextFieldState::with_text(magnet);
                 add.focus = AddFocus::Destination;
             }
             return;
@@ -540,15 +551,17 @@ impl Desktop {
         let Dialog::Add(add) = &self.dialog else {
             return;
         };
-        let magnet = add.magnet.text().trim().to_string();
         let destination = add.destination.text().trim().to_string();
         let public_magnet_bootstrap = add.public_bootstrap;
-        if let Err(error) = validate_magnet(&magnet) {
-            if let Dialog::Add(add) = &mut self.dialog {
-                add.error = error.into();
+        let magnet = match normalize_magnet(add.magnet.text()) {
+            Ok(magnet) => magnet,
+            Err(error) => {
+                if let Dialog::Add(add) = &mut self.dialog {
+                    add.error = error.into();
+                }
+                return;
             }
-            return;
-        }
+        };
         if let Err(error) = validate_destination(&destination) {
             if let Dialog::Add(add) = &mut self.dialog {
                 add.error = error.into();
@@ -743,6 +756,14 @@ impl Desktop {
             focus: 0,
             error: String::new(),
         }));
+    }
+
+    fn frame_state(&self) -> FrameState {
+        FrameState {
+            tab: self.tab,
+            dialog: std::mem::discriminant(&self.dialog),
+            selected: self.selected,
+        }
     }
 
     fn open_settings(&mut self, view: &SessionView) {
@@ -1432,14 +1453,15 @@ impl Desktop {
         small: &TextStyle,
         interactive: bool,
     ) {
-        ui.label_styled(
-            Rect::new(content.x, content.y, content.w, s.px(22)),
-            &format!("Country database: {}", view.geo_status),
-            *small,
-            MUTED,
-            Align::Left,
-        );
+        let geo = format!("Country database: {}", view.geo_status);
         if let Some(message) = selection_message(self.selected, view.selected) {
+            ui.label_styled(
+                Rect::new(content.x, content.y, content.w, s.px(22)),
+                &geo,
+                *small,
+                MUTED,
+                Align::Left,
+            );
             ui.label_styled(
                 Rect::new(content.x, content.y + s.px(28), content.w, s.px(24)),
                 message,
@@ -1451,6 +1473,13 @@ impl Desktop {
         }
         if view.peers.is_empty() {
             ui.label_styled(
+                Rect::new(content.x, content.y, content.w, s.px(22)),
+                &geo,
+                *small,
+                MUTED,
+                Align::Left,
+            );
+            ui.label_styled(
                 Rect::new(content.x, content.y + s.px(28), content.w, s.px(24)),
                 "No connected peers.",
                 *body,
@@ -1459,6 +1488,9 @@ impl Desktop {
             );
             return;
         }
+        // One row of preference buttons with the country status beside
+        // them; the explanation only when it leaves room for four peers, so
+        // a short inspector still shows the list.
         let mut chosen = None;
         let mut x = content.x;
         for preference in [
@@ -1467,27 +1499,47 @@ impl Desktop {
             PeerPreference::Avoid,
             PeerPreference::Block,
         ] {
-            let rect = Rect::new(x, content.y + s.px(26), s.px(68), s.px(26));
+            let rect = Rect::new(x, content.y, s.px(68), s.px(26));
             if interactive && ui.button(rect, preference_text(preference)) {
                 chosen = Some(preference);
             }
             x += s.px(72);
         }
-        for (line, text) in PREFERENCE_NOTE.iter().enumerate() {
-            ui.label_styled(
-                Rect::new(
-                    content.x,
-                    content.y + s.px(56) + s.px(18) * line as i32,
-                    content.w,
-                    s.px(18),
-                ),
-                text,
-                *small,
-                MUTED,
-                Align::Left,
-            );
+        ui.label_styled(
+            Rect::new(
+                x + s.px(8),
+                content.y,
+                (content.x + content.w - x - s.px(8)).max(1),
+                s.px(26),
+            ),
+            &geo,
+            *small,
+            MUTED,
+            Align::Left,
+        );
+        let note_height = s.px(18) * PREFERENCE_NOTE.len() as i32;
+        let with_note = content.h >= s.px(32) + note_height + s.px(44) * 4;
+        if with_note {
+            for (line, text) in PREFERENCE_NOTE.iter().enumerate() {
+                ui.label_styled(
+                    Rect::new(
+                        content.x,
+                        content.y + s.px(30) + s.px(18) * line as i32,
+                        content.w,
+                        s.px(18),
+                    ),
+                    text,
+                    *small,
+                    MUTED,
+                    Align::Left,
+                );
+            }
         }
-        let top = s.px(96);
+        let top = if with_note {
+            s.px(32) + note_height + s.px(4)
+        } else {
+            s.px(32)
+        };
         let list = Rect::new(
             content.x,
             content.y + top,
@@ -2402,6 +2454,8 @@ pub struct App {
     kernel: RasterKernel,
     input: Input,
     desktop: Desktop,
+    /// Asks the host for another frame; see the end of `render`.
+    waker: Option<Waker>,
 }
 
 impl App {
@@ -2417,6 +2471,7 @@ impl App {
             kernel: RasterKernel::new(),
             input: Input::new(),
             desktop: Desktop::new(client, activator, ui, store),
+            waker: None,
         }
     }
 
@@ -2427,6 +2482,7 @@ impl App {
 
 impl PixelApp for App {
     fn attach(&mut self, waker: Waker) {
+        self.waker = Some(waker.clone());
         let wake = waker.clone();
         self.desktop.client.set_waker(Arc::new(move || wake.wake()));
         let activate = waker.clone();
@@ -2451,6 +2507,7 @@ impl PixelApp for App {
         }
         let width = buffer.width as i32;
         let height = buffer.height as i32;
+        let before = self.desktop.frame_state();
         let dialog = !matches!(self.desktop.dialog, Dialog::None);
         let mut ui = Ui::new(
             Painter::new(buffer),
@@ -2467,6 +2524,14 @@ impl PixelApp for App {
             self.desktop.draw_dialog(&mut ui, &view, s, width, height);
         }
         ui.input.end_frame();
+        // A click handled while this frame was drawn (a tab, a dialog, a
+        // selection) can leave widgets drawn earlier in the frame showing
+        // the old state. Without continuous redraws, ask for one more frame.
+        if self.desktop.frame_state() != before
+            && let Some(waker) = &self.waker
+        {
+            waker.wake();
+        }
     }
 
     fn poll_title(&mut self) -> Option<String> {

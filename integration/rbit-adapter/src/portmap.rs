@@ -270,14 +270,65 @@ pub struct Route {
     pub local: Ipv4Addr,
 }
 
+/// Our source address toward the Internet: a UDP socket connected to a
+/// documentation address (TEST-NET-2) selects the route; nothing is sent.
+fn egress_address() -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(198, 51, 100, 1), 9)).ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(address) if !address.ip().is_unspecified() => Some(*address.ip()),
+        _ => None,
+    }
+}
+
+/// The router to ask. Normally the main table's default gateway, when our
+/// Internet traffic actually leaves on its route. When it does not, the
+/// traffic goes through a tunnel the main table does not show (a VPN using
+/// policy routing or a point-to-point interface). Then the tunnel's `.1`
+/// address is the gateway, the convention of WireGuard VPNs that offer
+/// NAT-PMP port forwarding (Proton VPN's 10.2.0.1). That is only tried for
+/// a private or shared (100.64/10) tunnel address that is not itself `.1`.
+pub fn pick_route(
+    main_gateway: Option<Ipv4Addr>,
+    main_local: Option<Ipv4Addr>,
+    egress: Option<Ipv4Addr>,
+) -> Option<Route> {
+    match (main_gateway, main_local, egress) {
+        (Some(gateway), Some(local), Some(egress)) if local == egress => {
+            Some(Route { gateway, local })
+        }
+        (_, _, Some(egress)) if tunnel_address(egress) => {
+            let [a, b, c, _] = egress.octets();
+            Some(Route {
+                gateway: Ipv4Addr::new(a, b, c, 1),
+                local: egress,
+            })
+        }
+        (Some(gateway), Some(local), None) => Some(Route { gateway, local }),
+        _ => None,
+    }
+}
+
+fn tunnel_address(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    let shared = a == 100 && (64..128).contains(&b);
+    (ip.is_private() || shared) && ip.octets()[3] != 1
+}
+
 /// Gateway and our address on its route, after checking that `listen`
 /// accepts connections on that address. Sends nothing.
 pub fn resolve_route(config: &Config, listen: Option<SocketAddr>) -> Result<Route, &'static str> {
-    let gateway = config
-        .gateway
-        .or_else(default_gateway)
-        .ok_or("no IPv4 default gateway")?;
-    let local = local_address(gateway)?;
+    let Route { gateway, local } = match config.gateway {
+        Some(gateway) => Route {
+            gateway,
+            local: local_address(gateway)?,
+        },
+        None => {
+            let main = default_gateway();
+            let main_local = main.and_then(|gateway| local_address(gateway).ok());
+            pick_route(main, main_local, egress_address()).ok_or("no IPv4 default gateway")?
+        }
+    };
     if let Some(listen) = listen {
         let reachable = match listen.ip() {
             ip if ip.is_unspecified() => true,
@@ -1025,8 +1076,11 @@ impl Mapping {
     /// Half the granted lifetime; permanent leases are re-asserted every
     /// half hour in case the router restarted.
     fn renew_after(&self, config: &Config) -> Duration {
-        let seconds = self.lifetime.unwrap_or(3600) / 2;
-        Duration::from_secs(u64::from(seconds)).max(config.min_renew)
+        let lifetime = Duration::from_secs(u64::from(self.lifetime.unwrap_or(3600)));
+        // The floor keeps a tiny grant from spinning, but never reaches the
+        // expiry itself: Proton VPN grants 60 s, which a 60 s floor would
+        // let lapse every cycle.
+        (lifetime / 2).max(config.min_renew.min(lifetime * 3 / 4))
     }
 }
 
