@@ -56,6 +56,13 @@ async fn internet_smoke() {
             driver.enable_dht(address.port()).await.is_ok()
         );
     }
+    // Opt-in: map the listen port on the default gateway (NAT-PMP/UPnP).
+    if std::env::var_os("TT_INTERNET_PORTMAP").is_some() {
+        println!(
+            "TT_SMOKE portmap_enabled={}",
+            driver.enable_port_mapping().is_ok()
+        );
+    }
     let start = Instant::now();
     let added = driver
         .add_torrent(&bytes, &dest, ExistingData::Refuse)
@@ -130,7 +137,7 @@ async fn internet_smoke() {
                 .filter_map(|t| t.last_error.clone())
                 .collect();
             println!(
-                "TT_SMOKE t_s={} state={:?} verified={} wanted={} peers={} unchoked_us={} encrypted={} down_bps={} verified_rate_bps={:.0} connections={} trackers_ok={}/{} tracker_errors={:?} pool_tracker_dht_pex_other={:?} dht_nodes={:?} dht_announced={} leases_inflight_blocked_pickable={:?} payload={:?} hash_failures={} peer_errors={:?} rss={} slow_steps={} steps={}",
+                "TT_SMOKE t_s={} state={:?} verified={} wanted={} peers={} unchoked_us={} encrypted={} incoming={} up_bps={} down_bps={} verified_rate_bps={:.0} connections={} trackers_ok={}/{} tracker_errors={:?} pool_tracker_dht_pex_other={:?} dht_nodes={:?} dht_announced={} portmap=\"{}\" announced_port_differs={} leases_inflight_blocked_pickable={:?} payload={:?} hash_failures={} peer_errors={:?} rss={} slow_steps={} steps={}",
                 start.elapsed().as_secs(),
                 row.state,
                 row.verified_bytes,
@@ -138,6 +145,8 @@ async fn internet_smoke() {
                 peers.len(),
                 peers.iter().filter(|peer| !peer.remote_choked).count(),
                 peers.iter().filter(|peer| peer.encrypted).count(),
+                peers.iter().filter(|peer| peer.incoming).count(),
+                peers.iter().map(|peer| peer.up_bps).sum::<u64>(),
                 down,
                 rate,
                 driver.connection_count(),
@@ -147,6 +156,8 @@ async fn internet_smoke() {
                 driver.candidate_counts(id),
                 driver.dht_nodes(),
                 driver.dht_announced(),
+                driver.port_mapping_status().describe(),
+                driver.announced_port() != driver.listening_address().map(|a| a.port()),
                 driver.lease_stats(id),
                 {
                     let stats = driver.payload_stats();

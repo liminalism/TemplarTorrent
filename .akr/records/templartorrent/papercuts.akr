@@ -46,6 +46,18 @@ record templartorrent.papercut.capturing-the-templartorrent-window-on-display/1 
     created_at 2026-10-17
 }
 
+record templartorrent.papercut.cargo-test-manifest-path-vendor-rbit-cargo-toml/1 : papercut {
+    title "cargo test --manifest-path vendor/rbit/Cargo.toml --lib fails to…"
+    state verified
+    statement """
+        cargo test --manifest-path vendor/rbit/Cargo.toml --lib fails to compile tracker tests because HttpTracker is behind the http-client feature, and it writes a gitignored vendor/rbit/Cargo.lock plus vendor/rbit/target. The workspace patch build does not do this. Run rbit's own suite with --features http-client from a copy, not against the vendored manifest.
+        """
+    observed_at git:7593b7183178e07defe3a76eb458544c4536a3f4
+    about "cargo"
+    author "grok"
+    created_at 2026-10-27
+}
+
 record templartorrent.papercut.committing-the-resume-bitmap-failed-with-author/1 : papercut {
     title "Committing the resume bitmap failed with \"Author identity unknown\"…"
     state verified

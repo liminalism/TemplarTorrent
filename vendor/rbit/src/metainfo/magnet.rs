@@ -87,13 +87,12 @@ impl MagnetLink {
     /// assert!(magnet.info_hash.is_v1());
     /// ```
     pub fn parse(uri: &str) -> Result<Self, MetainfoError> {
-        if !uri.starts_with("magnet:?") {
+        let uri = strip_wrappers(uri.trim()).trim();
+        let Some(query) = strip_prefix_ignore_ascii_case(uri, "magnet:?") else {
             return Err(MetainfoError::InvalidMagnetLink(
                 "missing magnet:? prefix".into(),
             ));
-        }
-
-        let query = &uri[8..];
+        };
         let params = parse_query_string(query);
 
         let xt_values = params
@@ -105,7 +104,7 @@ impl MagnetLink {
         let mut v2_hash: Option<InfoHashV2> = None;
 
         for xt in xt_values {
-            if let Some(hash) = xt.strip_prefix("urn:btih:") {
+            if let Some(hash) = strip_prefix_ignore_ascii_case(xt, "urn:btih:") {
                 // v1 info hash (SHA1, 20 bytes)
                 if hash.len() == 40 {
                     // Hex encoded
@@ -127,7 +126,7 @@ impl MagnetLink {
                         "invalid btih hash length".into(),
                     ));
                 }
-            } else if let Some(hash) = xt.strip_prefix("urn:btmh:1220") {
+            } else if let Some(hash) = strip_prefix_ignore_ascii_case(xt, "urn:btmh:1220") {
                 // v2 info hash (SHA256, 32 bytes)
                 // The "1220" prefix is multihash: 0x12 = SHA256, 0x20 = 32 bytes
                 if hash.len() != 64 {
@@ -152,25 +151,14 @@ impl MagnetLink {
             }
         };
 
-        let display_name = params
-            .get("dn")
-            .and_then(|v| v.first())
-            .map(|s| url_decode(s));
+        // Keys and values were percent-decoded once while the query was split.
+        let display_name = params.get("dn").and_then(|v| v.first()).cloned();
 
-        let trackers = params
-            .get("tr")
-            .map(|v| v.iter().map(|s| url_decode(s)).collect())
-            .unwrap_or_default();
+        let trackers = params.get("tr").cloned().unwrap_or_default();
 
-        let web_seeds = params
-            .get("ws")
-            .map(|v| v.iter().map(|s| url_decode(s)).collect())
-            .unwrap_or_default();
+        let web_seeds = params.get("ws").cloned().unwrap_or_default();
 
-        let peer_addresses = params
-            .get("x.pe")
-            .map(|v| v.iter().map(|s| url_decode(s)).collect())
-            .unwrap_or_default();
+        let peer_addresses = params.get("x.pe").cloned().unwrap_or_default();
 
         Ok(Self {
             info_hash,
@@ -248,13 +236,49 @@ fn parse_query_string(query: &str) -> HashMap<String, Vec<String>> {
     for part in query.split('&') {
         if let Some((key, value)) = part.split_once('=') {
             params
-                .entry(key.to_string())
+                .entry(canonical_key(key))
                 .or_default()
-                .push(value.to_string());
+                .push(url_decode(value));
         }
     }
 
     params
+}
+
+/// One layer of quotes or angle brackets, as pasted from a browser or a shell.
+fn strip_wrappers(uri: &str) -> &str {
+    let bytes = uri.as_bytes();
+    if bytes.len() >= 2 {
+        let (open, close) = (bytes[0], bytes[bytes.len() - 1]);
+        if (open == b'"' && close == b'"')
+            || (open == b'\'' && close == b'\'')
+            || (open == b'<' && close == b'>')
+        {
+            return &uri[1..uri.len() - 1];
+        }
+    }
+    uri
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let bytes = value.as_bytes();
+    let prefix = prefix.as_bytes();
+    if bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&value[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Lowercase the key, percent-decode it once, and fold `xt.1` onto `xt`.
+fn canonical_key(key: &str) -> String {
+    let decoded = url_decode(key).to_ascii_lowercase();
+    if let Some((head, tail)) = decoded.rsplit_once('.') {
+        if !head.is_empty() && !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit()) {
+            return head.to_string();
+        }
+    }
+    decoded
 }
 
 fn url_decode(s: &str) -> String {

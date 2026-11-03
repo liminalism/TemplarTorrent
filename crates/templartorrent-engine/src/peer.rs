@@ -8,8 +8,10 @@ use templartorrent_core::model::TorrentId;
 
 use crate::{event::PeerId, lease::Lease};
 
-/// Default cap on simultaneously requested blocks per peer (reqq bound).
-pub const DEFAULT_MAX_IN_FLIGHT: usize = 8;
+/// Outgoing block requests kept in flight for one peer. A remote BEP 10
+/// `reqq`, when the peer sends one, clamps this further. It is not the
+/// upload queue this client advertises.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {

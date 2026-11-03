@@ -40,6 +40,49 @@ record templartorrent.work.complete-piece-assembly/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.download-refinement/1 : work {
+    title "Smooth downloads, open real magnets, sample speed every 3 seconds"
+    state completed
+    scope [
+        path "crates/templartorrent-engine/**",
+        path "integration/rbit-adapter/**",
+        path "integration/templartorrent/**",
+        path "vendor/rbit/src/metainfo/magnet.rs"
+    ]
+    intent """
+        Fix stop-start downloads caused by an 8-block request pipeline and by disconnecting a peer that queues more upload requests than that, accept real magnet links (encoded xt, dotted keys, case, and arguments split on &), and recompute the displayed payload rate every 3 seconds.
+        """
+    note """
+        Refinement of the existing transfer, magnet add, and rate display. No new product surface.
+        """
+    acceptance {
+        check magnet {
+            statement """
+                A percent-encoded or dotted-key magnet parses, and command arguments split on & rejoin into one magnet.
+                """
+            method command
+            command "cargo test -p templartorrent --lib workflow::tests::split_magnet_arguments_rejoin -- --test-threads=8 && cargo test -p templartorrent-rbit-adapter --test parser_regressions magnet_accepts_encoded -- --test-threads=8"
+            verified_by [ @templartorrent.evidence.magnet-arguments/1 ]
+        }
+        check pipeline {
+            statement """
+                A normal peer pipelines more than 8 blocks, an avoided peer stays at 2, and an extra upload request does not drop the connection.
+                """
+            method command
+            command "cargo test -p templartorrent-rbit-adapter --test driver -- --test-threads=8"
+            verified_by [ @templartorrent.evidence.download-pipeline/1 ]
+        }
+        check rate-window {
+            statement """
+                Job payload rates stay unchanged until 3 seconds of samples have accumulated, then update, and a quiet 3 second window clears them.
+                """
+            method command
+            command "cargo test -p templartorrent --lib workflow::tests::smoothed_rates_wait_for_a_window_and_then_go_quiet -- --test-threads=8"
+            verified_by [ @templartorrent.evidence.rate-sample-3s/1 ]
+        }
+    }
+}
+
 record templartorrent.work.driver-seeding/1 : work {
     title "Verified bounded Linux driver seeding"
     state completed

@@ -70,9 +70,7 @@ where
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if positional {
-            if !arg.is_empty() {
-                payloads.push(arg);
-            }
+            push_payload(&mut payloads, arg);
             continue;
         }
         match arg.as_str() {
@@ -91,13 +89,20 @@ where
             other if other.starts_with('-') => {
                 return Err(format!("unknown argument {other}"));
             }
-            other => {
-                if !other.is_empty() {
-                    payloads.push(other.to_string());
-                }
-            }
+            other => push_payload(&mut payloads, other.to_string()),
         }
     }
+    let payloads = payloads
+        .into_iter()
+        .filter_map(|payload| {
+            let trimmed = payload.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(normalize_magnet(&trimmed).unwrap_or(trimmed))
+            }
+        })
+        .collect();
     Ok(Launch::Run {
         font,
         geoip_db,
@@ -105,6 +110,81 @@ where
         allow_local_urls,
         payloads,
     })
+}
+
+/// A shell splits an unquoted magnet on `&`. Continuation arguments
+/// (`dn=`, `tr=`, `xt.1=` and the other magnet parameters) join back onto
+/// the magnet they belong to. A flag, another magnet, or a `.torrent` path
+/// starts its own payload.
+fn push_payload(payloads: &mut Vec<String>, arg: String) {
+    if arg.is_empty() {
+        return;
+    }
+    if let Some(last) = payloads.last_mut()
+        && is_magnet_prefix(last)
+        && is_magnet_continuation(&arg)
+    {
+        last.push('&');
+        last.push_str(&arg);
+        return;
+    }
+    payloads.push(arg);
+}
+
+fn is_magnet_prefix(text: &str) -> bool {
+    let text = text.trim();
+    text.len() >= 7 && text.as_bytes()[..7].eq_ignore_ascii_case(b"magnet:")
+}
+
+/// One layer of quotes or angle brackets, then a `magnet:` prefix. The
+/// canonical form is [`normalize_magnet`].
+fn looks_like_magnet(text: &str) -> bool {
+    let mut text = text.trim();
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 {
+        let (open, close) = (bytes[0], bytes[bytes.len() - 1]);
+        if (open == b'"' && close == b'"')
+            || (open == b'\'' && close == b'\'')
+            || (open == b'<' && close == b'>')
+        {
+            text = text[1..text.len() - 1].trim();
+        }
+    }
+    is_magnet_prefix(text)
+}
+
+fn is_magnet_continuation(arg: &str) -> bool {
+    if arg.starts_with('-') || is_magnet_prefix(arg) {
+        return false;
+    }
+    if Path::new(arg)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"))
+    {
+        return false;
+    }
+    let Some((key, _)) = arg.split_once('=') else {
+        return false;
+    };
+    if key.is_empty() {
+        return false;
+    }
+    matches!(
+        magnet_param_base(key).to_ascii_lowercase().as_str(),
+        "xt" | "dn" | "tr" | "ws" | "as" | "xs" | "kt" | "mt" | "x.pe" | "xl"
+    )
+}
+
+fn magnet_param_base(key: &str) -> &str {
+    if let Some((head, tail)) = key.rsplit_once('.')
+        && !head.is_empty()
+        && !tail.is_empty()
+        && tail.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return head;
+    }
+    key
 }
 
 pub fn resolve_font(explicit: Option<&Path>) -> Result<PathBuf, String> {
@@ -205,8 +285,23 @@ pub fn load_public_trackers(path: &Path) -> Vec<String> {
         .collect()
 }
 
-pub fn validate_magnet(text: &str) -> Result<(), &'static str> {
-    let text = text.trim();
+/// Trim, drop one layer of quotes or angle brackets, and canonicalize the
+/// `magnet:?` prefix. The query is left for the magnet parser.
+pub fn normalize_magnet(text: &str) -> Result<String, &'static str> {
+    let mut text = text.trim();
+    if text.is_empty() {
+        return Err("magnet is empty");
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 {
+        let (open, close) = (bytes[0], bytes[bytes.len() - 1]);
+        if (open == b'"' && close == b'"')
+            || (open == b'\'' && close == b'\'')
+            || (open == b'<' && close == b'>')
+        {
+            text = text[1..text.len() - 1].trim();
+        }
+    }
     if text.is_empty() {
         return Err("magnet is empty");
     }
@@ -216,10 +311,16 @@ pub fn validate_magnet(text: &str) -> Result<(), &'static str> {
     if text.contains(['\n', '\r', '\0']) {
         return Err("magnet must be one line");
     }
-    if !text.starts_with("magnet:?") {
+    if text.len() < 8 || !text.as_bytes()[..8].eq_ignore_ascii_case(b"magnet:?") {
         return Err("magnet must start with magnet:?");
     }
-    Ok(())
+    let mut canonical = String::from("magnet:?");
+    canonical.push_str(&text[8..]);
+    Ok(canonical)
+}
+
+pub fn validate_magnet(text: &str) -> Result<(), &'static str> {
+    normalize_magnet(text).map(|_| ())
 }
 
 /// What the Add dialog's source field holds.
@@ -239,19 +340,18 @@ pub fn classify_source(text: &str) -> Result<AddSource, String> {
     if text.is_empty() {
         return Err("paste a magnet or an http(s) URL".into());
     }
-    if text.starts_with("magnet:?") {
+    if looks_like_magnet(text) {
         // A pasted magnet may carry an unencoded space in its name; a second
         // link after whitespace is a batch, which magnets do not form.
         let another = text.split_whitespace().skip(1).any(|token| {
-            ["magnet:?", "http://", "https://"]
-                .iter()
-                .any(|p| token.starts_with(p))
+            is_magnet_prefix(token) || token.starts_with("http://") || token.starts_with("https://")
         });
         if another {
             return Err("add magnets one at a time, separately from URLs".into());
         }
-        return validate_magnet(text)
-            .map(|()| AddSource::Magnet(text.to_string()))
+        // Quoted, bracketed and differently cased prefixes become `magnet:?`.
+        return normalize_magnet(text)
+            .map(AddSource::Magnet)
             .map_err(str::to_string);
     }
     if text.len() > 64 * 1024 {
@@ -538,8 +638,12 @@ pub fn app_title(jobs: &[TorrentRow]) -> String {
     title
 }
 
-/// Smoothed payload rate carried between driver steps. `window_ms` is the time
-/// since the baselines moved. A quiet window clears a stale rate once.
+/// How often the displayed payload rate is recomputed.
+pub const RATE_SAMPLE_MS: u64 = 3_000;
+
+/// Smoothed payload rate carried between driver steps. Bytes accumulate until
+/// [`RATE_SAMPLE_MS`] elapses, then each direction is blended from its delta.
+/// A direction with no bytes in that window drops to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RateCarry {
     pub downloaded: u64,
@@ -552,21 +656,24 @@ pub struct RateCarry {
 pub fn advance_rate(previous: RateCarry, downloaded: u64, uploaded: u64, dt_ms: u64) -> RateCarry {
     let mut next = previous;
     next.window_ms = next.window_ms.saturating_add(dt_ms);
+    if next.window_ms < RATE_SAMPLE_MS {
+        return next;
+    }
     let down_delta = downloaded.saturating_sub(previous.downloaded);
     let up_delta = uploaded.saturating_sub(previous.uploaded);
-    if down_delta > 0 || up_delta > 0 {
-        if next.window_ms >= 250 {
-            next.down_bps = blend_rate(previous.down_bps, per_second(down_delta, next.window_ms));
-            next.up_bps = blend_rate(previous.up_bps, per_second(up_delta, next.window_ms));
-            next.downloaded = downloaded;
-            next.uploaded = uploaded;
-            next.window_ms = 0;
-        }
-    } else if next.window_ms >= 2_000 && (next.down_bps != 0 || next.up_bps != 0) {
-        next.down_bps = 0;
-        next.up_bps = 0;
-        next.window_ms = 0;
-    }
+    next.down_bps = if down_delta == 0 {
+        0
+    } else {
+        blend_rate(previous.down_bps, per_second(down_delta, next.window_ms))
+    };
+    next.up_bps = if up_delta == 0 {
+        0
+    } else {
+        blend_rate(previous.up_bps, per_second(up_delta, next.window_ms))
+    };
+    next.downloaded = downloaded;
+    next.uploaded = uploaded;
+    next.window_ms = 0;
     next
 }
 
@@ -642,6 +749,11 @@ mod tests {
         assert!(validate_magnet("").is_err());
         assert!(validate_magnet("https://example").is_err());
         assert!(validate_magnet("magnet:?xt=urn:btih:aa").is_ok());
+        assert!(validate_magnet("Magnet:?xt=urn:btih:aa").is_ok());
+        assert_eq!(
+            normalize_magnet("\"Magnet:?xt=urn:btih:aa\"").unwrap(),
+            "magnet:?xt=urn:btih:aa"
+        );
         assert!(validate_magnet(&format!("magnet:?{}", "a".repeat(20_000))).is_err());
         assert!(validate_destination("").is_err());
         assert!(validate_destination("/tmp/shows").is_ok());
@@ -674,16 +786,47 @@ mod tests {
         assert_eq!(held.down_bps, 0);
         assert_eq!(held.downloaded, 0);
         assert_eq!(held.window_ms, 100);
-        let rated = advance_rate(held, 1_000, 50, 400);
-        assert_eq!(rated.down_bps, 2_000);
-        assert_eq!(rated.up_bps, 100);
+        let still = advance_rate(held, 1_000, 50, 2_000);
+        assert_eq!(still.down_bps, 0);
+        assert_eq!(still.up_bps, 0);
+        assert_eq!(still.downloaded, 0);
+        assert_eq!(still.window_ms, 2_100);
+        let rated = advance_rate(still, 1_000, 50, 900);
+        assert_eq!(rated.down_bps, 333);
+        assert_eq!(rated.up_bps, 16);
         assert_eq!(rated.downloaded, 1_000);
+        assert_eq!(rated.uploaded, 50);
         assert_eq!(rated.window_ms, 0);
-        let blended = advance_rate(rated, 3_000, 50, 1_000);
-        assert_eq!(blended.down_bps, (2_000 * 3 + 2_000) / 4);
-        let quiet = advance_rate(blended, 3_000, 50, 2_000);
+        let blended = advance_rate(rated, 4_000, 50, 3_000);
+        assert_eq!(blended.down_bps, (333 * 3 + 1_000) / 4);
+        assert_eq!(blended.up_bps, 0);
+        let quiet = advance_rate(blended, 4_000, 50, 3_000);
         assert_eq!(quiet.down_bps, 0);
         assert_eq!(quiet.up_bps, 0);
+    }
+
+    #[test]
+    fn split_magnet_arguments_rejoin() {
+        let launch = parse_args([
+            "magnet:?xt=urn:btih:abc".into(),
+            "dn=Name".into(),
+            "tr=http://tracker.example/announce".into(),
+            "file.torrent".into(),
+        ])
+        .unwrap();
+        match launch {
+            Launch::Run { payloads, .. } => {
+                assert_eq!(
+                    payloads,
+                    vec![
+                        "magnet:?xt=urn:btih:abc&dn=Name&tr=http://tracker.example/announce"
+                            .to_string(),
+                        "file.torrent".to_string(),
+                    ]
+                );
+            }
+            Launch::Help => panic!("help"),
+        }
     }
 
     #[test]
@@ -737,6 +880,10 @@ mod tests {
     fn sources_split_into_a_magnet_or_a_bounded_url_batch() {
         assert_eq!(
             classify_source("magnet:?xt=urn:btih:aa"),
+            Ok(AddSource::Magnet("magnet:?xt=urn:btih:aa".into()))
+        );
+        assert_eq!(
+            classify_source("\"Magnet:?xt=urn:btih:aa\""),
             Ok(AddSource::Magnet("magnet:?xt=urn:btih:aa".into()))
         );
         assert_eq!(
