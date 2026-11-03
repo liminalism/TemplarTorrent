@@ -70,6 +70,8 @@ Remaining boundaries:
 
 **supersedes** `@templartorrent.observation.complete-piece-status/15` · **verified_by** `@templartorrent.evidence.dht-announce/1`, `@templartorrent.evidence.formats-hybrid-many-files/1`, `@templartorrent.evidence.internet-ubuntu-download/1`, `@templartorrent.evidence.ipv6-loopback-path/1`, `@templartorrent.evidence.mse-tests-and-real-peers/1`, `@templartorrent.evidence.port-mapping/1`, `@templartorrent.evidence.public-swarm-gates/1`, `@templartorrent.evidence.reachability-gates/1`
 
+> **Stale** — `watches "crates/**"` was matched by `81e1bcea`, which touched `crates/templartorrent-engine/src/peer.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#linux-client-downloads-a-public-65-gb-iso-from-the-internet-swarm-remaining-boundaries).
+
 ### One Internet run stalled with 25 unchoking peers; not reproduced
 
 `verified` · `@templartorrent.observation.internet-download-stall/3` · scope `path "crates/templartorrent-engine/**"`, `path "integration/rbit-adapter/**"`
@@ -78,7 +80,7 @@ Remaining boundaries:
 
 **supersedes** `@templartorrent.observation.internet-download-stall/2`
 
-> **Stale** — `watches "integration/rbit-adapter/src/driver.rs"` was matched by `1ba08ab2`, which touched `integration/rbit-adapter/src/driver.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#one-internet-run-stalled-with-25-unchoking-peers-not-reproduced).
+> **Stale** — `watches "crates/templartorrent-engine/src/**"` was matched by `81e1bcea`, which touched `crates/templartorrent-engine/src/peer.rs`. See [REVIEW-REQUIRED.md](REVIEW-REQUIRED.md#one-internet-run-stalled-with-25-unchoking-peers-not-reproduced).
 
 ## Assessments
 
