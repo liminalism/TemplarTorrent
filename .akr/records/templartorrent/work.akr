@@ -512,7 +512,7 @@ record templartorrent.work.seam-hardening/1 : work {
 
 record templartorrent.work.sequence-group-detection/1 : work {
     title "Detect sequence groups for the automatic file order; unrelated files stay rarest-first"
-    state proposed
+    state completed
     intent """
         Close the sequence-group detection gap of DESIGN.md section 4. The automatic order treated every torrent as a sequence in natural name order. Now grouping::automatic finds one name template differing in one or two numeric runs (S01E01, Disc 1/01, part1, .part01.rar, .r00), orders members outer run first with ties by the natural comparator and wire index, schedules sidecars after their member, and otherwise claims nothing: one tier of equally ranked files, which the picker takes rarest-first. The Sequence carries tiers (files sharing a rank), the session, driver, job record and persistence carry tier starts, the UI's Automatic order asks the driver for the detected order, and shared ranks are labelled.
         """
@@ -523,6 +523,7 @@ record templartorrent.work.sequence-group-detection/1 : work {
                 """
             method command
             command "cargo test -p templartorrent-core --lib grouping"
+            verified_by [ @templartorrent.evidence.sequence-group-detection/1 ]
         }
         check gates {
             statement """
@@ -530,6 +531,7 @@ record templartorrent.work.sequence-group-detection/1 : work {
                 """
             method command
             command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+            verified_by [ @templartorrent.evidence.sequence-group-detection/1 ]
         }
         check ranks {
             statement """
@@ -537,6 +539,7 @@ record templartorrent.work.sequence-group-detection/1 : work {
                 """
             method command
             command "cargo test -p templartorrent-core --test policies automatic_order_uses_tiers"
+            verified_by [ @templartorrent.evidence.sequence-group-detection/1 ]
         }
     }
     author "Claude"

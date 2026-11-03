@@ -923,6 +923,19 @@ record templartorrent.evidence.resume-workspace-gates/1 : evidence {
         """
 }
 
+record templartorrent.evidence.sequence-group-detection/1 : evidence {
+    title "Commit d7df45b on Linux 6.18 x86_64, rustc 1.99.0: the five grouping unit tests passed (episodes across seasons and widths order S01E01, S01E2, S01E10, S02E01; disc and track runs nest with a .cue sidecar after its track and the cover last while titled tracks with differing text runs claim no sequence; .partN.rar and .rNN volumes and partN files order numerically with the digit-free x.rar trailing; unrelated names, dates with three varying runs, two equal clusters and a lone file fall back to one tier; duplicates keep wire order; pads and a sample trail behind the episodes and the subtitle follows its episode). The policies test passed: three unrelated files share rank 0 in one tier in natural order, a series has strict ranks and piece ranks, verifying episode 1 promotes its subtitle to rank 0, set_tiers with two files in the first tier gives both rank 0 and the verified file's tier no rank, bad starts are refused, set_order is strict again and set_automatic returns to the detected order. Gates: fmt clean, Clippy on all workspace targets with warnings denied clean, the workspace suite passed everything except the two environmental tests (no ::1, no display), the preview workspace with its new SetFileOrderAutomatic arm and the fuzz workspace with the record's tiers line both compile; the persist tests round-trip a record with tiers 0,2 and refuse tiers not starting at 0 or pointing outside the order."
+    state verified
+    result pass
+    method command
+    observed_at git:d7df45b54cd7e2efd03d0ab9a76fd86b9cd01d93
+    command "cargo test -p templartorrent-core --lib grouping && cargo test -p templartorrent-core --test policies automatic_order_uses_tiers && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+    summary """
+        Commit d7df45b on Linux 6.18 x86_64, rustc 1.99.0: the five grouping unit tests passed (episodes across seasons and widths order S01E01, S01E2, S01E10, S02E01; disc and track runs nest with a .cue sidecar after its track and the cover last while titled tracks with differing text runs claim no sequence; .partN.rar and .rNN volumes and partN files order numerically with the digit-free x.rar trailing; unrelated names, dates with three varying runs, two equal clusters and a lone file fall back to one tier; duplicates keep wire order; pads and a sample trail behind the episodes and the subtitle follows its episode). The policies test passed: three unrelated files share rank 0 in one tier in natural order, a series has strict ranks and piece ranks, verifying episode 1 promotes its subtitle to rank 0, set_tiers with two files in the first tier gives both rank 0 and the verified file's tier no rank, bad starts are refused, set_order is strict again and set_automatic returns to the detected order. Gates: fmt clean, Clippy on all workspace targets with warnings denied clean, the workspace suite passed everything except the two environmental tests (no ::1, no display), the preview workspace with its new SetFileOrderAutomatic arm and the fuzz workspace with the record's tiers line both compile; the persist tests round-trip a record with tiers 0,2 and refuse tiers not starting at 0 or pointing outside the order.
+        """
+    author "Claude"
+}
+
 record templartorrent.evidence.slot-order/1 : evidence {
     title "Slot order unit tests passed on commit 9b0874f"
     state verified
