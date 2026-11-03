@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:f3ef0d12b320ebd02883b70e41f7a658205bdd08f42646507c56f84f19252853"
+    source_graph "sha256:ace1782d16b3f19b5075dcb1089fd79d2f2cc8ab1b95dbadedc6d903fd9c1153"
 }
 
 source ".akr/project.akr" {
@@ -44,8 +44,8 @@ source ".akr/records/templartorrent/questions.akr" {
 }
 
 source ".akr/records/templartorrent/work.akr" {
-    hash "sha256:11ed472b1306593c5559b532d1e98b75d3afd11b314d6a91c2ecc27270682e40"
-    records 24
+    hash "sha256:59ae2a5b547d69c789e19ffd8a43bbd70520015254dc6dc7ee79388c80396da3"
+    records 25
 }
 
 resolution @templartorrent.decision.fork-rbit-for-native-gate/1 {
@@ -670,6 +670,12 @@ resolution @templartorrent.work.file-storage/1 {
     slot part_of
     to @templartorrent.milestone.native-app-wiring/1
     hash "sha256:f6b628dbd63c5fc2e7f2bd174100c7c269f93175cfd5710338a6d806c6108b4c"
+}
+
+resolution @templartorrent.work.handle-relative-store/1 {
+    slot part_of
+    to @templartorrent.milestone.safety-and-peer-policy/1
+    hash "sha256:c12cba20929909c69e98cea361e63b8c57efd6d184ef4f5dfb223fcd571072c7"
 }
 
 resolution @templartorrent.work.https-rustls/1 {

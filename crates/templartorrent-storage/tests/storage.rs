@@ -318,11 +318,54 @@ fn symlinks_are_refused() {
         "symlinked file accepted"
     );
     std::fs::remove_file(root.path().join("a.bin")).unwrap();
+    // A dangling link at the final name: O_CREAT | O_NOFOLLOW must not
+    // create the target.
+    std::os::unix::fs::symlink(
+        root.path().join("never-made.bin"),
+        root.path().join("a.bin"),
+    )
+    .unwrap();
+    let mut store = FileStore::new();
+    assert!(matches!(
+        store.add_job(ID, root.path(), &[(vec!["a.bin".to_string()], 3000)], 1024),
+        Err(StorageError::Symlink { .. })
+    ));
+    assert!(!root.path().join("never-made.bin").exists());
+    std::fs::remove_file(root.path().join("a.bin")).unwrap();
     let outside = TempRoot::new("symlink-outside");
     std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
     let mut store = FileStore::new();
+    let result = store.add_job(ID, root.path(), &two_files(), 1024);
     assert!(
-        store.add_job(ID, root.path(), &two_files(), 1024).is_err(),
-        "symlinked parent accepted"
+        matches!(result, Err(StorageError::Symlink { .. })),
+        "symlinked parent accepted: {result:?}"
     );
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "nothing was created through the link"
+    );
+    // A regular file where a directory should be is named as such.
+    std::fs::remove_file(root.path().join("sub")).unwrap();
+    std::fs::write(root.path().join("sub"), b"not a dir").unwrap();
+    let mut store = FileStore::new();
+    let error = store
+        .add_job(ID, root.path(), &two_files(), 1024)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    // A missing chain of directories is created, handle-relative.
+    let deep = TempRoot::new("deep");
+    let mut store = FileStore::new();
+    store
+        .add_job(
+            ID,
+            deep.path(),
+            &[(
+                vec!["a".to_string(), "b".to_string(), "c.bin".to_string()],
+                16,
+            )],
+            16,
+        )
+        .unwrap();
+    assert!(deep.path().join("a/b/c.bin").is_file());
 }

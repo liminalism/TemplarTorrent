@@ -89,6 +89,32 @@ record templartorrent.work.file-storage/1 : work {
     part_of [ @templartorrent.milestone.native-app-wiring ]
 }
 
+record templartorrent.work.handle-relative-store/1 : work {
+    title "Open payload files handle-relative with O_NOFOLLOW at every level"
+    state proposed
+    intent """
+        Close the FileStore hardening gap of DESIGN.md section 3: payload files were probed with symlink_metadata and then created or opened by path, leaving a window in which a symlink planted between the check and the open would be followed. Open every directory component from its parent's descriptor with O_NOFOLLOW | O_DIRECTORY (creating it with mkdirat when absent) and the file with openat O_RDWR | O_CREAT | O_NOFOLLOW on that descriptor, then confirm by fstat that the handle is a regular file. Reads, writes and the resume identity continue to use the handles, never paths. Windows reparse handling stays optional and out of scope.
+        """
+    acceptance {
+        check gates {
+            statement """
+                Adapter and client suites still transfer, resume and delete through the handle-relative store; format and Clippy with warnings denied pass
+                """
+            method command
+            command "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets --no-fail-fast"
+        }
+        check no-follow {
+            statement """
+                Storage tests: a symlink at the final name, a symlinked directory component, and a symlink to a regular file are refused as Symlink; a file where a directory should be is refused; a missing directory chain is created and pre-existing files still resume
+                """
+            method command
+            command "cargo test -p templartorrent-storage"
+        }
+    }
+    part_of [ @templartorrent.milestone.safety-and-peer-policy ]
+    author "Claude"
+}
+
 record templartorrent.work.https-rustls/1 : work {
     title "HTTPS tracker announces through rustls 0.23.46"
     state completed
