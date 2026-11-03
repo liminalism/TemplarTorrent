@@ -75,6 +75,9 @@ pub struct Sequence {
     total: u64,
     piece_length: u64,
     order: Vec<usize>,
+    /// Positions in `order` where a tier starts; files in one tier share a
+    /// rank. A strict order has one tier per file.
+    tier_starts: Vec<usize>,
     ranks: Vec<u32>,
     piece_ranks: Vec<u32>,
     verified: Vec<u64>,
@@ -106,8 +109,7 @@ impl Sequence {
             return Err(SequenceError::TooManyPieces);
         }
         let count = usize::try_from(count).map_err(|_| SequenceError::TooManyPieces)?;
-        let mut order: Vec<_> = (0..files.len()).collect();
-        order.sort_by(|&a, &b| natural_cmp(&files[a].path, &files[b].path).then(a.cmp(&b)));
+        let automatic = Self::detect(&files);
         let mut out = Self {
             ranks: vec![SKIP; files.len()],
             file_verified_bytes: vec![0; files.len()],
@@ -115,7 +117,8 @@ impl Sequence {
             offsets,
             total,
             piece_length,
-            order,
+            order: automatic.order(),
+            tier_starts: automatic.starts(),
             piece_ranks: vec![SKIP; count],
             verified: vec![0; count.div_ceil(64)],
             generation: 0,
@@ -123,11 +126,63 @@ impl Sequence {
         out.rebuild();
         Ok(out)
     }
+    /// Sequence-group detection over the file names; files not wanted at
+    /// this point (pad files at construction) trail.
+    fn detect(files: &[FileSpec]) -> crate::grouping::Automatic {
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        let eligible: Vec<bool> = files.iter().map(|file| file.wanted).collect();
+        crate::grouping::automatic(&paths, &eligible)
+    }
     pub fn files(&self) -> &[FileSpec] {
         &self.files
     }
+    /// Files in rank order; ties are separated by [`Sequence::tier_starts`].
     pub fn order(&self) -> &[usize] {
         &self.order
+    }
+    /// Positions in [`Sequence::order`] where a tier begins. One per file
+    /// means a strict order.
+    pub fn tier_starts(&self) -> &[usize] {
+        &self.tier_starts
+    }
+    /// Back to the detected order: a clear sequence in strict tiers, or one
+    /// tier that leaves the picker rarest-first.
+    pub fn set_automatic(&mut self) {
+        let automatic = Self::detect(&self.files);
+        self.order = automatic.order();
+        self.tier_starts = automatic.starts();
+        self.rebuild();
+    }
+    /// A permutation with explicit tier starts, as saved by a session record.
+    pub fn set_tiers(
+        &mut self,
+        order: Vec<usize>,
+        starts: Vec<usize>,
+    ) -> Result<(), SequenceError> {
+        if order.len() != self.files.len() {
+            return Err(SequenceError::InvalidOrder);
+        }
+        let mut seen = vec![false; self.files.len()];
+        for &i in &order {
+            if i >= seen.len() || seen[i] {
+                return Err(SequenceError::InvalidOrder);
+            }
+            seen[i] = true;
+        }
+        if !order.is_empty() {
+            if starts.first() != Some(&0) || starts.iter().any(|start| *start >= order.len()) {
+                return Err(SequenceError::InvalidOrder);
+            }
+            if starts.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(SequenceError::InvalidOrder);
+            }
+        } else if !starts.is_empty() {
+            return Err(SequenceError::InvalidOrder);
+        }
+        self.order = order;
+        self.tier_starts = starts;
+        self.rebuild();
+        Ok(())
     }
     pub fn file_ranks(&self) -> &[u32] {
         &self.ranks
@@ -173,6 +228,7 @@ impl Sequence {
             }
             seen[i] = true;
         }
+        self.tier_starts = (0..order.len()).collect();
         self.order = order;
         self.rebuild();
         Ok(())
@@ -233,9 +289,20 @@ impl Sequence {
         self.ranks.fill(SKIP);
         self.piece_ranks.fill(SKIP);
         let mut next = 0u32;
-        for &i in &self.order {
-            if self.files[i].wanted && self.file_verified_bytes[i] < self.files[i].length {
-                self.ranks[i] = next;
+        for (tier, &start) in self.tier_starts.iter().enumerate() {
+            let end = self
+                .tier_starts
+                .get(tier + 1)
+                .copied()
+                .unwrap_or(self.order.len());
+            let mut active = false;
+            for &i in &self.order[start..end] {
+                if self.files[i].wanted && self.file_verified_bytes[i] < self.files[i].length {
+                    self.ranks[i] = next;
+                    active = true;
+                }
+            }
+            if active {
                 next += 1;
             }
         }

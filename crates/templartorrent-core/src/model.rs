@@ -124,6 +124,8 @@ pub enum Command {
         id: TorrentId,
         file_indices: Vec<usize>,
     },
+    /// Back to the detected automatic order (DESIGN.md section 4).
+    SetFileOrderAutomatic(TorrentId),
     SetFileWanted {
         id: TorrentId,
         file_index: usize,

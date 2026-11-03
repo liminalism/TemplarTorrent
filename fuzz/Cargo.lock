@@ -1011,6 +1011,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "liminalkit-raster"
+version = "0.1.0"
+source = "git+https://github.com/liminalism/liminalkit#19c5cd393ad6ee802170a789fd3fd1e4ff84bcdf"
+dependencies = [
+ "wide",
+]
+
+[[package]]
+name = "liminalkit-shell"
+version = "0.1.0"
+source = "git+https://github.com/liminalism/liminalkit#19c5cd393ad6ee802170a789fd3fd1e4ff84bcdf"
+dependencies = [
+ "arboard",
+ "liminalkit-raster",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "zeroize",
+]
+
+[[package]]
+name = "liminalkit-text"
+version = "0.1.0"
+source = "git+https://github.com/liminalism/liminalkit#19c5cd393ad6ee802170a789fd3fd1e4ff84bcdf"
+dependencies = [
+ "liminalkit-raster",
+]
+
+[[package]]
+name = "liminalkit-ui"
+version = "0.1.0"
+source = "git+https://github.com/liminalism/liminalkit#19c5cd393ad6ee802170a789fd3fd1e4ff84bcdf"
+dependencies = [
+ "liminalkit-raster",
+ "liminalkit-shell",
+ "liminalkit-text",
+ "unicode-segmentation",
+ "zeroize",
+]
+
+[[package]]
+name = "liminalkit-windowing"
+version = "0.1.0"
+source = "git+https://github.com/liminalism/liminalkit#19c5cd393ad6ee802170a789fd3fd1e4ff84bcdf"
+dependencies = [
+ "liminalkit-raster",
+ "liminalkit-shell",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1584,57 +1635,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pixelkit-raster"
-version = "0.1.0"
-source = "git+https://github.com/liminalism/pixelkit?rev=614c9c6e84ce3cd0bc6c81988f636b493b30a497#614c9c6e84ce3cd0bc6c81988f636b493b30a497"
-dependencies = [
- "wide",
-]
-
-[[package]]
-name = "pixelkit-shell"
-version = "0.1.0"
-source = "git+https://github.com/liminalism/pixelkit?rev=614c9c6e84ce3cd0bc6c81988f636b493b30a497#614c9c6e84ce3cd0bc6c81988f636b493b30a497"
-dependencies = [
- "arboard",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "pixelkit-raster",
- "zeroize",
-]
-
-[[package]]
-name = "pixelkit-text"
-version = "0.1.0"
-source = "git+https://github.com/liminalism/pixelkit?rev=614c9c6e84ce3cd0bc6c81988f636b493b30a497#614c9c6e84ce3cd0bc6c81988f636b493b30a497"
-dependencies = [
- "pixelkit-raster",
-]
-
-[[package]]
-name = "pixelkit-ui"
-version = "0.1.0"
-source = "git+https://github.com/liminalism/pixelkit?rev=614c9c6e84ce3cd0bc6c81988f636b493b30a497#614c9c6e84ce3cd0bc6c81988f636b493b30a497"
-dependencies = [
- "pixelkit-raster",
- "pixelkit-shell",
- "pixelkit-text",
- "unicode-segmentation",
- "zeroize",
-]
-
-[[package]]
-name = "pixelkit-windowing"
-version = "0.1.0"
-source = "git+https://github.com/liminalism/pixelkit?rev=614c9c6e84ce3cd0bc6c81988f636b493b30a497#614c9c6e84ce3cd0bc6c81988f636b493b30a497"
-dependencies = [
- "pixelkit-raster",
- "pixelkit-shell",
- "softbuffer",
- "winit",
-]
-
-[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2180,12 +2180,12 @@ name = "templartorrent"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "liminalkit-raster",
+ "liminalkit-shell",
+ "liminalkit-text",
+ "liminalkit-ui",
+ "liminalkit-windowing",
  "maxminddb",
- "pixelkit-raster",
- "pixelkit-shell",
- "pixelkit-text",
- "pixelkit-ui",
- "pixelkit-windowing",
  "templartorrent-core",
  "templartorrent-rbit-adapter",
  "templartorrent-storage",

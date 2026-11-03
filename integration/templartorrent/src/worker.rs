@@ -811,6 +811,7 @@ fn persist_after(
         Command::Pause(id)
         | Command::Resume(id)
         | Command::SetFileOrder { id, .. }
+        | Command::SetFileOrderAutomatic(id)
         | Command::SetFileWanted { id, .. }
         | Command::SetPeerPreference { id, .. } => save_job(driver, store, *id),
         Command::Remove { .. } => match removed {
@@ -1294,6 +1295,7 @@ async fn run_command(
         Command::SetFileOrder { id, file_indices } => {
             driver.set_file_order(*id, file_indices.clone())
         }
+        Command::SetFileOrderAutomatic(id) => driver.set_file_order_automatic(*id),
         Command::SetFileWanted {
             id,
             file_index,
@@ -1619,6 +1621,7 @@ mod tests {
                 public_bootstrap: false,
                 wanted: vec![true, true],
                 order: vec![1, 0],
+                tiers: Vec::new(),
                 trackers: Vec::new(),
                 preferences: vec![("10.0.0.9".parse().unwrap(), PeerPreference::Block)],
             })
@@ -1725,6 +1728,7 @@ mod tests {
                 public_bootstrap: false,
                 wanted: vec![true, true],
                 order: vec![1, 0],
+                tiers: Vec::new(),
                 trackers: Vec::new(),
                 preferences: Vec::new(),
             })

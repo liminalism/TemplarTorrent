@@ -299,3 +299,64 @@ fn title_and_remote_labels_are_bounded() {
     assert_eq!(window_title(&[row.clone(), row]), "2 jobs — TemplarTorrent");
     assert_eq!(clean_label("x\n\u{202e}y", 10), "xy");
 }
+
+/// DESIGN.md section 4: a clear sequence gets strict ranks; unrelated names
+/// share one rank so the picker goes rarest-first; saved tiers round-trip;
+/// a manual order is strict again; a finished tier promotes the next.
+#[test]
+fn automatic_order_uses_tiers_for_unclear_sets_and_strict_ranks_for_sequences() {
+    let spec = |name: &str, length: u64| FileSpec {
+        path: name.to_string(),
+        length,
+        wanted: true,
+    };
+    let unrelated = Sequence::new(
+        vec![
+            spec("setup.exe", 16),
+            spec("readme.pdf", 16),
+            spec("data.bin", 16),
+        ],
+        16,
+        1024,
+    )
+    .unwrap();
+    assert_eq!(unrelated.file_ranks(), &[0, 0, 0], "one tier, rarest-first");
+    assert_eq!(unrelated.tier_starts(), &[0]);
+    assert_eq!(unrelated.order(), &[2, 1, 0], "natural within the tier");
+
+    let mut series = Sequence::new(
+        vec![
+            spec("Show.S01E02.mkv", 16),
+            spec("Show.S01E01.mkv", 16),
+            spec("Show.S01E01.srt", 16),
+            spec("Show.S01E10.mkv", 16),
+        ],
+        16,
+        1024,
+    )
+    .unwrap();
+    assert_eq!(series.order(), &[1, 2, 0, 3]);
+    assert_eq!(series.tier_starts(), &[0, 1, 2, 3]);
+    assert_eq!(series.file_ranks(), &[2, 0, 1, 3]);
+    assert_eq!(series.piece_ranks(), &[2, 0, 1, 3]);
+    // Episode 1 verifies: its subtitle becomes first and the rest move up.
+    assert!(series.mark_verified(1).unwrap());
+    assert_eq!(series.file_ranks(), &[1, SKIP, 0, 2]);
+
+    // A saved record with two files sharing the first tier.
+    series.set_tiers(vec![0, 3, 1, 2], vec![0, 2, 3]).unwrap();
+    // The verified file's tier is inactive and takes no rank.
+    assert_eq!(series.file_ranks(), &[0, SKIP, 1, 0]);
+    assert_eq!(series.tier_starts(), &[0, 2, 3]);
+    assert!(series.set_tiers(vec![0, 3, 1, 2], vec![1, 2]).is_err());
+    assert!(series.set_tiers(vec![0, 3, 1, 2], vec![0, 4]).is_err());
+    assert!(series.set_tiers(vec![0, 3, 1], vec![0]).is_err());
+    // A manual order is strict.
+    series.set_order(vec![3, 0, 2, 1]).unwrap();
+    assert_eq!(series.tier_starts(), &[0, 1, 2, 3]);
+    assert_eq!(series.file_ranks(), &[1, SKIP, 2, 0]);
+    // Back to automatic.
+    series.set_automatic();
+    assert_eq!(series.order(), &[1, 2, 0, 3]);
+    assert_eq!(series.file_ranks(), &[1, SKIP, 0, 2]);
+}

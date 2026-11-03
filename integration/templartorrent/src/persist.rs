@@ -343,6 +343,10 @@ pub fn encode_record(record: &JobRecord) -> String {
         let order: Vec<String> = record.order.iter().map(|index| index.to_string()).collect();
         out.push_str(&format!("order {}\n", order.join(",")));
     }
+    if !record.tiers.is_empty() {
+        let tiers: Vec<String> = record.tiers.iter().map(|start| start.to_string()).collect();
+        out.push_str(&format!("tiers {}\n", tiers.join(",")));
+    }
     for (url, original) in &record.trackers {
         let origin = if *original { "original" } else { "added" };
         out.push_str(&format!("tracker {origin} {url}\n"));
@@ -367,6 +371,7 @@ pub fn decode_record(
     let mut public_bootstrap = false;
     let mut wanted = Vec::new();
     let mut order = Vec::new();
+    let mut tiers = Vec::new();
     let mut trackers = Vec::new();
     let mut preferences = Vec::new();
     for line in lines {
@@ -412,6 +417,21 @@ pub fn decode_record(
                     return Err("too many files in order".into());
                 }
             }
+            "tiers" => {
+                tiers = value
+                    .split(',')
+                    .map(|part| {
+                        part.parse::<usize>()
+                            .map_err(|_| "tiers must be numeric".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if tiers.len() > MAX_FILES
+                    || tiers.first() != Some(&0)
+                    || tiers.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err("tiers must be ascending positions starting at 0".into());
+                }
+            }
             "tracker" => {
                 let (origin, url) = value
                     .split_once(' ')
@@ -451,6 +471,9 @@ pub fn decode_record(
             other => return Err(format!("unknown field {other}")),
         }
     }
+    if tiers.iter().any(|start| *start >= order.len()) {
+        return Err("tiers point outside the order".into());
+    }
     Ok(JobRecord {
         info_hash,
         torrent,
@@ -459,6 +482,7 @@ pub fn decode_record(
         public_bootstrap,
         wanted,
         order,
+        tiers,
         trackers,
         preferences,
     })
@@ -1030,6 +1054,7 @@ mod tests {
             public_bootstrap: true,
             wanted: vec![true, false, true],
             order: vec![2, 0, 1],
+            tiers: vec![0, 2],
             trackers: vec![
                 ("http://tracker.example/announce?passkey=abc".into(), true),
                 ("udp://open.example:6969/announce".into(), false),
@@ -1066,6 +1091,8 @@ mod tests {
             (base.replace("paused 1", "paused yes"), "flag"),
             (base.replace("wanted 101", "wanted 1x1"), "0 or 1"),
             (base.replace("order 2,0,1", "order 2,a"), "numeric"),
+            (base.replace("tiers 0,2", "tiers 1,2"), "starting at 0"),
+            (base.replace("tiers 0,2", "tiers 0,3"), "outside"),
             (
                 base.replace("tracker original", "tracker guessed"),
                 "origin",

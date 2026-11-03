@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:a2eb286fef01c89157d66b7ecfbb3492a4ac9faad155651210720ec1e5f600d0"
+    source_graph "sha256:9dbf87da00ae0d0e4cdaf66a75ba6d8c1bcf59adf3c2f75132b311a3c83a92f4"
 }
 
 source ".akr/project.akr" {
@@ -44,8 +44,8 @@ source ".akr/records/templartorrent/questions.akr" {
 }
 
 source ".akr/records/templartorrent/work.akr" {
-    hash "sha256:e999daf577cd7ccca2bae956771f5bc9364658c61d2cbc04d720e9c5187a8b3d"
-    records 23
+    hash "sha256:5e0b58262815853a65409c88afa3755e0ab0c5f56558038c1dd74bf5a8412afc"
+    records 24
 }
 
 resolution @templartorrent.decision.fork-rbit-for-native-gate/1 {

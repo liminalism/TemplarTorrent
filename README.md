@@ -138,7 +138,7 @@ terms; check them before redistributing any database file.
 
 | Area | Working | Still open |
 |---|---|---|
-| Torrent formats | v1, hybrid through the v1 view with BEP 47 pad files never written, up to 4096 files, natural-order file promotion | Sequence-group detection; pure v2 (refused with a reason) |
+| Torrent formats | v1, hybrid through the v1 view with BEP 47 pad files never written, up to 4096 files, sequence-group detection (episodes, discs and tracks, parts, archive volumes) with strict ranks for a clear group and rarest-first for everything else, sidecars after their member | Pure v2 (refused with a reason) |
 | Discovery | HTTP(S) and UDP announces per address family, DHT get_peers and announce_peer, PEX, MSE/PE with plaintext fallback, dual-stack listen port, opt-in NAT-PMP/UPnP on the default gateway | Port mapping on a real router (loopback fixtures only), uTP, BEP 19 webseeds |
 | Engine | Magnet and .torrent transfers, BEP-9 metadata from up to four peers, hashing, seeding, global budget and rate authority, a fault-injected power-loss test of the batched sync | Rate limits charging real socket buffers and I/O |
 | File downloads | Ranged parallel parts on the shared budget and rate, redirect cap, address admission, resume identity, idle cut, SHA-256, atomic placement, persistence and restore, proven on loopback fixtures | Request headers for browser-captured downloads; an Internet transfer of user-named content |

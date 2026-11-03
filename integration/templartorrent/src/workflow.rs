@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use templartorrent_core::{
     model::{JobState, Limits, PeerPreference, TorrentRow, clean_label},
-    sequence::{SKIP, natural_cmp},
+    sequence::SKIP,
 };
 
 pub const USAGE: &str = "\
@@ -438,14 +438,6 @@ pub fn move_file(ranks: &[u32], index: usize, earlier: bool) -> Option<Vec<usize
     Some(order)
 }
 
-pub fn automatic_order(paths: &[impl AsRef<str>]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..paths.len()).collect();
-    order.sort_by(|&left, &right| {
-        natural_cmp(paths[left].as_ref(), paths[right].as_ref()).then(left.cmp(&right))
-    });
-    order
-}
-
 pub fn rate_text(bytes_per_second: u64) -> String {
     if bytes_per_second == 0 {
         "—".into()
@@ -667,8 +659,6 @@ mod tests {
         let ranks = [1, 0, SKIP];
         assert_eq!(move_file(&ranks, 1, true), None);
         assert_eq!(move_file(&ranks, 0, true), Some(vec![0, 1, 2]));
-        let paths = ["Episode 2", "Episode 10", "Episode 1"];
-        assert_eq!(automatic_order(&paths), vec![2, 0, 1]);
     }
 
     #[test]

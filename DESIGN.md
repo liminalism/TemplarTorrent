@@ -245,9 +245,16 @@ clips are ambiguous. Unrelated files use ordinary rarest-first rather than claim
 a filename guess is certain. Padding is not a user-downloadable file; small sidecar
 files can be scheduled after their associated primary file under a documented rule.
 
-The reference natural comparator is allocation-free and handles arbitrarily long
-ASCII numeric runs, but group inference and full locale/Unicode collation are not
-implemented. This is deliberate: the scalar policy is the correctness baseline.
+The natural comparator is allocation-free and handles arbitrarily long ASCII
+numeric runs; full locale/Unicode collation is not implemented. Group inference
+lives in `templartorrent-core::grouping` (3 November 2026): files that share one
+name template differing in one or two numeric runs form the sequence, ordered
+outer run first; sidecars (subtitles, checksums, notes) whose stem begins with a
+member's follow that member in their own tier; three or more varying runs
+(dates), two templates of equal size, or fewer than two members mean no claim,
+and every file shares one tier so the picker stays rarest-first. A tier is a set
+of files with one rank; the user's manual order is always strict, and
+"Automatic order" returns to the detected tiers. Pad files trail.
 
 ### Scheduler definition
 

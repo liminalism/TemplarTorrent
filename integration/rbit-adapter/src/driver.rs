@@ -244,6 +244,9 @@ pub struct JobRecord {
     pub public_bootstrap: bool,
     pub wanted: Vec<bool>,
     pub order: Vec<usize>,
+    /// Positions in `order` where a tier of equally ranked files starts;
+    /// empty means a strict order (or, with an empty order, the automatic one).
+    pub tiers: Vec<usize>,
     /// `(url, original)`; added trackers are re-derived from the public list.
     pub trackers: Vec<(String, bool)>,
     pub preferences: Vec<(IpAddr, PeerPreference)>,
@@ -257,6 +260,7 @@ impl fmt::Debug for JobRecord {
             .field("public_bootstrap", &self.public_bootstrap)
             .field("wanted", &self.wanted)
             .field("order", &self.order)
+            .field("tiers", &self.tiers)
             .field("trackers", &self.trackers.len())
             .field("preferences", &self.preferences.len())
             .finish_non_exhaustive()
@@ -644,6 +648,22 @@ impl Driver {
         self.session
             .set_order(id, order)
             .map_err(|_| DriverError("file order rejected"))
+    }
+    /// Back to the detected order (DESIGN.md section 4): a clear sequence in
+    /// strict tiers, or one tier that leaves the picker rarest-first.
+    pub fn set_file_order_automatic(&mut self, id: TorrentId) -> Result<()> {
+        if !self.jobs.0.contains_key(&id) {
+            return Err(DriverError("unknown job"));
+        }
+        self.session
+            .set_order_automatic(id)
+            .map_err(|_| DriverError("file order rejected"))
+    }
+    /// Tier starts within the current file order; one per file is strict.
+    pub fn file_tier_starts(&self, id: TorrentId) -> Result<Vec<usize>> {
+        self.session
+            .file_tier_starts(id)
+            .map_err(|_| DriverError("unknown job"))
     }
     pub fn file_layout(&self, id: TorrentId) -> Result<Vec<(String, u64)>> {
         // Layout only until the session's selected-file telemetry seam is wired.
@@ -2081,6 +2101,10 @@ impl Driver {
             .session
             .file_order(id)
             .map_err(|_| DriverError("unknown job"))?;
+        let tiers = self
+            .session
+            .file_tier_starts(id)
+            .map_err(|_| DriverError("unknown job"))?;
         let job = self.jobs.0.get(&id).ok_or(DriverError("unknown job"))?;
         let info_hash = job.torrent.hash();
         let raw = job.torrent.meta.raw_info();
@@ -2102,6 +2126,7 @@ impl Driver {
             public_bootstrap: job.bootstrap,
             wanted: progress.iter().map(|file| file.wanted).collect(),
             order,
+            tiers,
             trackers: job
                 .trackers
                 .iter()
@@ -2263,8 +2288,16 @@ impl Driver {
         } else if !record.wanted.is_empty() {
             last_error = Some("saved file selection was invalid");
         }
-        if !record.order.is_empty() && self.session.set_order(id, record.order.clone()).is_err() {
-            last_error = Some("saved file order was invalid");
+        if !record.order.is_empty() {
+            let applied = if record.tiers.is_empty() {
+                self.session.set_order(id, record.order.clone())
+            } else {
+                self.session
+                    .set_tiers(id, record.order.clone(), record.tiers.clone())
+            };
+            if applied.is_err() {
+                last_error = Some("saved file order was invalid");
+            }
         }
         let private = torrent.is_private();
         let mut trackers: Vec<Tracked> = Vec::new();

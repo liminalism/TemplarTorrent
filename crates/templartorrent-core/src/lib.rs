@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 pub mod bandwidth;
 pub mod budget;
+pub mod grouping;
 pub mod model;
 pub mod paths;
 pub mod picker;

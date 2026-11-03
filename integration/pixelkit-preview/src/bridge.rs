@@ -169,6 +169,9 @@ impl LiveBridge {
             Command::SetFileOrder { id, file_indices } => {
                 ack_result(seq, self.session.set_order(id, file_indices))
             }
+            Command::SetFileOrderAutomatic(id) => {
+                ack_result(seq, self.session.set_order_automatic(id))
+            }
             Command::SetFileWanted {
                 id,
                 file_index,

@@ -21,10 +21,9 @@ use crate::activate::Activator;
 use crate::persist::{SessionStore, UiState};
 use crate::worker::{FileRow, ListenState, Request, SessionView, TrackerView, WorkerHandle};
 use crate::workflow::{
-    self, AddSource, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, automatic_order,
-    classify_source, cooldown_text, country_text, eta_text, format_bytes, move_file,
-    parse_optional_sha256, preference_text, rank_label, rate_text, rtt_text, speed_cap,
-    validate_destination,
+    self, AddSource, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, classify_source,
+    cooldown_text, country_text, eta_text, format_bytes, move_file, parse_optional_sha256,
+    preference_text, rank_label, rate_text, rtt_text, speed_cap, validate_destination,
 };
 use templartorrent_rbit_adapter::driver::PeerEncryption;
 use templartorrent_rbit_adapter::http::UrlDetail;
@@ -1488,7 +1487,22 @@ impl Desktop {
                 INK,
                 Align::Left,
             );
-            let rank = rank_label(file.rank, file.wanted, file.verified_bytes, file.length);
+            // Files of one tier share a rank: the picker takes them rarest-first.
+            let shared = file.wanted
+                && file.verified_bytes < file.length
+                && files
+                    .iter()
+                    .filter(|other| {
+                        other.rank == file.rank
+                            && other.wanted
+                            && other.verified_bytes < other.length
+                    })
+                    .count()
+                    > 1;
+            let mut rank = rank_label(file.rank, file.wanted, file.verified_bytes, file.length);
+            if shared {
+                rank.push_str(" (shared)");
+            }
             ui.label_styled(
                 Rect::new(rect.x + rect.w / 2, rect.y, rect.w / 4, rect.h),
                 &rank,
@@ -1549,21 +1563,11 @@ impl Desktop {
         });
     }
 
-    fn restore_order(&mut self, view: &SessionView) {
+    fn restore_order(&mut self, _view: &SessionView) {
         let Some(id) = self.selected else {
             return;
         };
-        let order = automatic_order(
-            &view
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-        );
-        self.submit(Command::SetFileOrder {
-            id,
-            file_indices: order,
-        });
+        self.submit(Command::SetFileOrderAutomatic(id));
     }
 
     fn draw_peers(
@@ -2947,6 +2951,7 @@ mod tests {
                 public_bootstrap: false,
                 wanted: vec![true, true],
                 order: vec![1, 0],
+                tiers: Vec::new(),
                 trackers: Vec::new(),
                 preferences: Vec::new(),
             })
