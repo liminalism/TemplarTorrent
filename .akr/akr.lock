@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:ac7e131241e25c7716e885831015d81966c9d29f02fd7979d3bf3b1640b5b7ed"
+    source_graph "sha256:d59db4117e558940e0463ecab53b37b85fdcba806e4f7dce8a3e2326234d2e21"
 }
 
 source ".akr/project.akr" {
@@ -34,8 +34,8 @@ source ".akr/records/templartorrent/observations.akr" {
 }
 
 source ".akr/records/templartorrent/papercuts.akr" {
-    hash "sha256:970b7c657c5c68078a0968e5c9d9668ba335f9046d10bea11d5dfbb81724b061"
-    records 25
+    hash "sha256:745b3c8d39253b2ec7a9c328d71710fb52cbe6e17f3222616f41126317f5c48c"
+    records 26
 }
 
 source ".akr/records/templartorrent/questions.akr" {
@@ -1490,6 +1490,11 @@ seal @templartorrent.papercut.cargo-test-manifest-path-vendor-rbit-cargo-toml/1 
 seal @templartorrent.papercut.committing-the-resume-bitmap-failed-with-author/1 {
     state verified
     hash "sha256:d0ec324573afa0af185e119d32447bc8296633a645913a8a55932b1248c04f40"
+}
+
+seal @templartorrent.papercut.git-merge-no-commit-refused-to-start-before/1 {
+    state verified
+    hash "sha256:7587da5eaa4f204f891dcc5244715d637ee8213154e6f46822a49d6960a46043"
 }
 
 seal @templartorrent.papercut.in-integration-rbit-adapter-tests-driver-rs-the/1 {
