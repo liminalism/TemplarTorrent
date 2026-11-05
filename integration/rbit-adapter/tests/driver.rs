@@ -143,6 +143,8 @@ struct Stats {
     /// TCP connections accepted, including ones whose handshake failed.
     accepted: AtomicUsize,
     corrupted: AtomicBool,
+    /// Opens the metadata gate of a [`Fault::gate_metadata`] server.
+    metadata_open: AtomicBool,
 }
 #[derive(Clone, Copy, Default)]
 struct Fault {
@@ -154,6 +156,8 @@ struct Fault {
     delay_ms: u64,
     control_flood: bool,
     hold_metadata: bool,
+    /// Hold each metadata answer until `Stats::metadata_open` is set.
+    gate_metadata: bool,
     disconnect_after: Option<usize>,
 }
 struct Server {
@@ -312,6 +316,9 @@ async fn serve(conn: &mut PeerConnection, fixture: &Fixture, stats: &Stats, faul
                 if fault.hold_metadata {
                     std::future::pending::<()>().await;
                 }
+                while fault.gate_metadata && !stats.metadata_open.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
                 if conn
                     .send(Message::Extended {
                         id: OUR_MD_ID,
@@ -373,13 +380,19 @@ async fn serve(conn: &mut PeerConnection, fixture: &Fixture, stats: &Stats, faul
     }
 }
 
+/// A fresh driver with its own peer id. Two drivers that share an id are one
+/// client as far as the wire can tell, and refuse each other as a
+/// self-connection (see `driver_refuses_a_connection_to_itself`).
 fn driver() -> Driver {
+    static NEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let mut peer_id = [23; 20];
+    peer_id[19] = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Driver::with_peer_id(
         Limits {
             payload_budget_bytes: 6 * PIECE,
             ..Limits::default()
         },
-        [23; 20],
+        peer_id,
     )
     .unwrap()
 }
@@ -1954,6 +1967,69 @@ async fn driver_moves_payload_over_ipv6_and_a_dual_stack_listener() {
     .unwrap();
 }
 
+/// A tracker or DHT reply can list this client's own address. Dialing it
+/// must not become a peer: the remote end answers with our own peer id.
+/// Two drivers sharing one peer id stand in for "this client" on both ends,
+/// so the dialing side and the accepting side are both exercised.
+#[tokio::test]
+async fn driver_refuses_a_connection_to_itself() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(74, false);
+        let server = Server::start(fixture.clone(), Fault::default()).await;
+        let own_id = [52; 20];
+        let mut seed = Driver::with_peer_id(Limits::default(), own_id).unwrap();
+        seed.set_allow_local_trackers(true);
+        let listen = seed.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let id = seed
+            .add_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .await
+            .unwrap();
+        while seed.snapshot().jobs[0].state != JobState::Seeding {
+            seed.step(Duration::from_millis(5)).await.unwrap();
+        }
+        let before = seed.peer_status(id).len();
+        let target = Root::new();
+        let magnet = fixture.magnet();
+        let path = target.job();
+        let twin = tokio::spawn(async move {
+            let mut twin = Driver::with_peer_id(Limits::default(), own_id).unwrap();
+            let source = PeerSource {
+                address: listen,
+                origin: PeerOrigin::UserProvided,
+            };
+            let result = twin
+                .add_magnet(&magnet, &path, ExistingData::Refuse, &[source], true)
+                .await;
+            twin.shutdown().await;
+            result.map(|_| ()).map_err(|error| error.0)
+        });
+        while !twin.is_finished() {
+            seed.step(Duration::from_millis(5)).await.unwrap();
+        }
+        let result = twin.await.unwrap();
+        assert!(result.is_err(), "the twin never gains itself as a peer");
+        for _ in 0..20 {
+            seed.step(Duration::from_millis(5)).await.unwrap();
+        }
+        assert_eq!(
+            seed.peer_status(id).len(),
+            before,
+            "the accepting side never lists itself as a peer"
+        );
+        seed.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
 /// More files than the old 128-file gate: 300 small files across piece
 /// boundaries, transferred and verified over loopback.
 #[tokio::test]
@@ -2934,7 +3010,7 @@ impl Shadow {
         for (path, image) in &state.durable {
             let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
             file.set_len(image.len() as u64).unwrap();
-            std::os::unix::fs::FileExt::write_all_at(&file, image, 0).unwrap();
+            std::io::Write::write_all(&mut &file, image).unwrap();
             file.sync_all().unwrap();
         }
     }
@@ -3129,6 +3205,234 @@ async fn driver_resume_bitmap_survives_a_power_loss_after_the_sync() {
             !power_loss_run(&fixture, true).await,
             "a forged bit over a lost piece corrupts the file; the harness can tell"
         );
+    })
+    .await
+    .unwrap();
+}
+
+/// Step until `done` holds, collecting every installed magnet.
+async fn step_until(
+    driver: &mut Driver,
+    resolved: &mut Vec<templartorrent_core::model::TorrentId>,
+    mut done: impl FnMut(&mut Driver) -> bool,
+) {
+    let start = Instant::now();
+    while !done(driver) {
+        assert!(start.elapsed() < DEADLINE, "step deadline exceeded");
+        let report = driver.step(Duration::from_millis(5)).await.unwrap();
+        resolved.extend(report.resolved);
+    }
+}
+
+#[tokio::test]
+async fn driver_started_magnet_is_listed_before_metadata_then_completes() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(83, false);
+        let server = Server::start(
+            fixture.clone(),
+            Fault {
+                gate_metadata: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut driver = driver();
+        let uri = format!("{}&dn=Owned%20Series", fixture.magnet());
+        // Not awaited: the job exists before any peer has been contacted.
+        let id = driver
+            .start_magnet(
+                &uri,
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .unwrap();
+        let rows = driver.snapshot();
+        assert_eq!(rows.jobs.len(), 1);
+        let row = &rows.jobs[0];
+        assert_eq!(row.id, id);
+        assert_eq!(row.state, JobState::Metadata);
+        assert_eq!(&*row.name, "Owned Series");
+        assert_eq!((row.wanted_bytes, row.verified_bytes), (0, 0));
+        assert_eq!(row.eta_seconds(), None);
+        assert!(driver.awaiting_metadata(id));
+        assert_eq!(driver.info_hash(id), Some(fixture.hash));
+        assert_eq!(driver.last_error(id), None);
+        assert!(driver.file_progress(id).is_err());
+        // No payload directory exists before the metadata does.
+        assert!(!root.job().exists());
+        // The duplicate is refused while the first is still fetching.
+        assert_eq!(
+            driver
+                .start_magnet(
+                    &uri,
+                    &root.job(),
+                    ExistingData::Refuse,
+                    &[server.source],
+                    false
+                )
+                .unwrap_err()
+                .0,
+            "torrent already exists"
+        );
+
+        // The peer has been asked for metadata and is holding its answer.
+        let mut resolved = Vec::new();
+        step_until(&mut driver, &mut resolved, |_| {
+            server.stats.metadata.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        let row = driver.snapshot().jobs[0].clone();
+        assert_eq!(row.state, JobState::Metadata);
+        assert_eq!(row.connected_peers, 1);
+        assert!(resolved.is_empty());
+        // Other commands run while the magnet waits.
+        driver
+            .set_limits(Limits {
+                download_kb_s: 512,
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        driver
+            .set_limits(Limits {
+                payload_budget_bytes: 6 * PIECE,
+                ..Limits::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Metadata);
+
+        server.stats.metadata_open.store(true, Ordering::SeqCst);
+        step_until(&mut driver, &mut resolved, |driver| {
+            !driver.awaiting_metadata(id)
+        })
+        .await;
+        assert_eq!(resolved, vec![id]);
+        let rows = driver.snapshot();
+        assert_eq!(rows.jobs.len(), 1);
+        let row = &rows.jobs[0];
+        // Same id and place: the row became the job.
+        assert_eq!(row.id, id);
+        assert_eq!(row.state, JobState::Downloading);
+        assert_eq!(row.wanted_bytes, fixture.data.len() as u64);
+        assert_eq!(&*row.name, "owned-series");
+        assert_eq!(complete(&mut driver).await, 0);
+        fixture.assert_files(&root.job());
+        // A completed job has a persistable record under the same id.
+        assert_eq!(driver.export_job(id).unwrap().info_hash, fixture.hash);
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_started_magnet_can_be_paused_and_removed_while_fetching() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(89, false);
+        let server = Server::start(
+            fixture.clone(),
+            Fault {
+                hold_metadata: true,
+                ..Fault::default()
+            },
+        )
+        .await;
+        let mut driver = driver();
+        let id = driver
+            .start_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[server.source],
+                false,
+            )
+            .unwrap();
+        // Without `dn` the row is named by its info hash.
+        let hex: String = fixture.hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(&*driver.snapshot().jobs[0].name, hex.as_str());
+        let mut resolved = Vec::new();
+        step_until(&mut driver, &mut resolved, |_| {
+            server.stats.metadata.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        assert_eq!(driver.snapshot().jobs[0].connected_peers, 1);
+
+        // Pause drops the exchange; resume starts it again.
+        driver.pause(id).await.unwrap();
+        let row = driver.snapshot().jobs[0].clone();
+        assert_eq!(row.state, JobState::Paused);
+        assert_eq!(row.connected_peers, 0);
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        driver.resume(id).await.unwrap();
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Metadata);
+        step_until(&mut driver, &mut resolved, |_| {
+            server.stats.metadata.load(Ordering::SeqCst) > 1
+        })
+        .await;
+
+        // Remove cancels it: no row, connection, permit or directory remains.
+        driver.remove(id, true).await.unwrap();
+        assert!(driver.snapshot().jobs.is_empty());
+        assert!(!driver.awaiting_metadata(id));
+        assert_eq!(driver.metadata_reserved_bytes(), 0);
+        assert_eq!(driver.connection_count(), 0);
+        assert!(!root.job().exists());
+        assert!(resolved.is_empty());
+        assert!(driver.remove(id, false).await.is_err());
+        driver.shutdown().await;
+        server.close().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn driver_started_magnet_failure_is_shown_on_its_row_and_retried_by_resume() {
+    timeout(DEADLINE, async {
+        let root = Root::new();
+        let fixture = Fixture::new(97, false);
+        // A port with nothing listening: every metadata attempt fails.
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let mut driver = driver();
+        let id = driver
+            .start_magnet(
+                &fixture.magnet(),
+                &root.job(),
+                ExistingData::Refuse,
+                &[PeerSource {
+                    address: closed,
+                    origin: PeerOrigin::OriginalTracker(1),
+                }],
+                false,
+            )
+            .unwrap();
+        let mut resolved = Vec::new();
+        step_until(&mut driver, &mut resolved, |driver| {
+            driver.snapshot().jobs[0].state == JobState::Error
+        })
+        .await;
+        assert_eq!(
+            driver.last_error(id),
+            Some("no permitted peer supplied valid metadata")
+        );
+        assert!(driver.awaiting_metadata(id));
+        assert!(!root.job().exists());
+        driver.resume(id).await.unwrap();
+        assert_eq!(driver.snapshot().jobs[0].state, JobState::Metadata);
+        assert_eq!(driver.last_error(id), None);
+        driver.remove(id, false).await.unwrap();
+        assert!(driver.snapshot().jobs.is_empty());
+        driver.shutdown().await;
     })
     .await
     .unwrap();

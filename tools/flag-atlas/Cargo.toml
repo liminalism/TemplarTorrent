@@ -1,0 +1,16 @@
+# Development-only converter: renders lipis/flag-icons 4x3 SVGs into the PNG
+# atlas the client embeds. Not a member of the root workspace and not linked
+# by any shipped crate, so resvg never enters the release dependency graph.
+# See README in integration/templartorrent/assets/flags/.
+[package]
+name = "flag-atlas"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+resvg = { version = "0.49", default-features = false }
+
+# Its own workspace, so the root workspace neither builds nor locks it.
+[workspace]

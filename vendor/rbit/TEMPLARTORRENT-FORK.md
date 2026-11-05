@@ -109,3 +109,9 @@ magnets stay refused by the adapter.
 
 Upgrading rbit means re-applying exactly these hunks, or checking that
 upstream fixed the same inputs.
+
+Windows, 2026-11-05: `src/dht/server.rs` ended the DHT receive loop on any
+`recv_from` error. On Windows an ICMP port-unreachable caused by an earlier
+query to an offline node arrives as `WSAECONNRESET` on the next read of the
+unconnected socket (and an oversized datagram as `WSAEMSGSIZE`), so the first
+dead node stopped the whole DHT. Those two errors are now logged and skipped.

@@ -287,6 +287,31 @@ impl Session {
     }
 
     pub fn add(&mut self, spec: JobSpec) -> Result<TorrentId, EngineError> {
+        self.insert(None, spec)
+    }
+
+    /// Take the next id without creating a job, so a caller can show a row
+    /// for work that becomes a job later (a magnet still fetching metadata)
+    /// and keep the same id once [`Session::add_reserved`] admits it.
+    pub fn reserve_id(&mut self) -> TorrentId {
+        let id = TorrentId(self.next_torrent);
+        self.next_torrent += 1;
+        id
+    }
+
+    /// Admit a job under an id from [`Session::reserve_id`].
+    pub fn add_reserved(&mut self, id: TorrentId, spec: JobSpec) -> Result<TorrentId, EngineError> {
+        if id.0 == 0 || id.0 >= self.next_torrent || self.jobs.iter().any(|job| job.id == id) {
+            return Err(EngineError::UnknownJob);
+        }
+        self.insert(Some(id), spec)
+    }
+
+    fn insert(
+        &mut self,
+        reserved: Option<TorrentId>,
+        spec: JobSpec,
+    ) -> Result<TorrentId, EngineError> {
         if self.jobs.len() >= MAX_JOBS {
             return Err(EngineError::TooManyJobs);
         }
@@ -301,8 +326,7 @@ impl Session {
                 "piece assembly working set exceeds payload budget",
             ));
         }
-        let id = TorrentId(self.next_torrent);
-        self.next_torrent += 1;
+        let id = reserved.unwrap_or_else(|| self.reserve_id());
         let state = if sequence.piece_ranks().iter().all(|rank| *rank == SKIP) {
             JobState::Seeding
         } else {

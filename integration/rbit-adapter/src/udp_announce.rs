@@ -419,6 +419,11 @@ impl Exchange<'_> {
                     tokio::time::timeout_at(attempt_end, self.socket.recv(&mut self.buffer)).await;
                 let n = match received {
                     Err(_) => break,
+                    // Windows reports a datagram longer than the buffer as
+                    // WSAEMSGSIZE after filling the buffer with its start;
+                    // Linux truncates silently. Both keep the first
+                    // MAX_REPLY_BYTES, which is all the parser reads.
+                    Ok(Err(error)) if is_truncated_datagram(&error) => self.buffer.len(),
                     Ok(Err(error)) => return Err(io_reason(error)),
                     Ok(Ok(n)) => n,
                 };
@@ -438,6 +443,11 @@ impl Exchange<'_> {
             wait = wait.saturating_mul(2);
         }
     }
+}
+
+/// WSAEMSGSIZE: the datagram was larger than the buffer (Windows only).
+fn is_truncated_datagram(error: &std::io::Error) -> bool {
+    cfg!(windows) && error.raw_os_error() == Some(10040)
 }
 
 fn io_reason(error: std::io::Error) -> Cow<'static, str> {

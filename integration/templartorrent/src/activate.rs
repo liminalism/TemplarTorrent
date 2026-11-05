@@ -1,12 +1,10 @@
 //! Owner-only single-instance activation. A second process forwards one
 //! length-prefixed magnet or `.torrent` path and exits. Nothing is passed to
 //! a shell.
+//! The transport differs by platform: see `activate_sys.rs`.
 #![allow(unsafe_code)]
 
-use std::fs::Permissions;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -22,7 +20,7 @@ type WakeSlot = Arc<Mutex<Option<WakeHook>>>;
 #[derive(Debug)]
 pub enum Activation {
     Primary {
-        listener: UnixListener,
+        listener: Listener,
         path: PathBuf,
         payloads: Vec<String>,
     },
@@ -59,33 +57,28 @@ pub fn valid_activation(text: &str) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"))
 }
 
-pub fn default_runtime_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("templartorrent");
-    }
-    std::env::temp_dir().join(format!("templartorrent-{}", uid()))
-}
+#[path = "activate_sys.rs"]
+mod sys;
 
-fn uid() -> u32 {
-    unsafe { libc::getuid() }
-}
+use sys::Stream;
+pub use sys::{ENDPOINT, Listener, default_runtime_dir};
 
 pub fn activate(dir: &Path, payloads: &[String]) -> io::Result<Activation> {
     for payload in payloads {
         if !valid_activation(payload) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "activation must be one magnet or a .torrent path",
+                crate::text::t("activate.invalid_payload"),
             ));
         }
     }
     std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, Permissions::from_mode(0o700))?;
-    let path = dir.join("instance.sock");
+    sys::prepare_dir(dir)?;
+    let path = dir.join(sys::ENDPOINT);
     if is_symlink(&path) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "activation socket path is a symlink",
+            crate::text::t("activate.socket_symlink"),
         ));
     }
     if path.exists() {
@@ -95,22 +88,19 @@ pub fn activate(dir: &Path, payloads: &[String]) -> io::Result<Activation> {
                 if is_symlink(&path) {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
-                        "activation socket path is a symlink",
+                        crate::text::t("activate.socket_symlink"),
                     ));
                 }
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
-    match UnixListener::bind(&path) {
-        Ok(listener) => {
-            std::fs::set_permissions(&path, Permissions::from_mode(0o600))?;
-            Ok(Activation::Primary {
-                listener,
-                path,
-                payloads: payloads.to_vec(),
-            })
-        }
+    match sys::bind(&path) {
+        Ok(listener) => Ok(Activation::Primary {
+            listener,
+            path,
+            payloads: payloads.to_vec(),
+        }),
         Err(error) => {
             if forward_all(&path, payloads).is_ok() {
                 Ok(Activation::Forwarded)
@@ -121,7 +111,7 @@ pub fn activate(dir: &Path, payloads: &[String]) -> io::Result<Activation> {
     }
 }
 
-pub fn spawn(listener: UnixListener, path: PathBuf) -> Activator {
+pub fn spawn(listener: Listener, path: PathBuf) -> Activator {
     let (tx, rx) = std::sync::mpsc::sync_channel(8);
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -167,16 +157,11 @@ impl Drop for Activator {
     }
 }
 
-pub fn serve(
-    listener: UnixListener,
-    tx: SyncSender<String>,
-    stop: Arc<AtomicBool>,
-    waker: WakeSlot,
-) {
+pub fn serve(listener: Listener, tx: SyncSender<String>, stop: Arc<AtomicBool>, waker: WakeSlot) {
     let _ = listener.set_nonblocking(true);
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _)) => accept_one(stream, &tx, &waker),
+            Ok((stream, _)) => accept_one(&listener, stream, &tx, &waker),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
             }
@@ -185,10 +170,18 @@ pub fn serve(
     }
 }
 
-fn accept_one(mut stream: UnixStream, tx: &SyncSender<String>, waker: &Mutex<Option<WakeHook>>) {
+fn accept_one(
+    listener: &Listener,
+    mut stream: Stream,
+    tx: &SyncSender<String>,
+    waker: &Mutex<Option<WakeHook>>,
+) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    if !sys::authenticate(listener, &mut stream) {
+        return;
+    }
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).is_err() {
         return;
@@ -222,7 +215,7 @@ fn accept_one(mut stream: UnixStream, tx: &SyncSender<String>, waker: &Mutex<Opt
 
 fn forward_all(path: &Path, payloads: &[String]) -> io::Result<()> {
     if payloads.is_empty() {
-        UnixStream::connect(path).map(|_| ())
+        sys::connect(path).map(|_| ())
     } else {
         for payload in payloads {
             forward_one(path, payload)?;
@@ -232,11 +225,15 @@ fn forward_all(path: &Path, payloads: &[String]) -> io::Result<()> {
 }
 
 fn forward_one(path: &Path, payload: &str) -> io::Result<()> {
-    let mut stream = UnixStream::connect(path)?;
+    let mut stream = sys::connect(path)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "activation is too large"))?;
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::text::t("activate.too_large"),
+        )
+    })?;
     stream.write_all(&len.to_le_bytes())?;
     stream.write_all(payload.as_bytes())?;
     let mut reply_byte = [0u8; 1];
@@ -246,12 +243,12 @@ fn forward_one(path: &Path, payload: &str) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "the running instance rejected the activation",
+            crate::text::t("activate.rejected"),
         ))
     }
 }
 
-fn reply(stream: &mut UnixStream, byte: u8) -> io::Result<()> {
+fn reply(stream: &mut Stream, byte: u8) -> io::Result<()> {
     stream.write_all(&[byte])
 }
 
@@ -282,8 +279,14 @@ mod tests {
             panic!("the first process should own the socket");
         };
         assert_eq!(payloads, vec![first.to_string()]);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "socket must be owner-only, mode {mode:o}");
+        #[cfg(not(unix))]
+        let _ = &path;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "socket must be owner-only, mode {mode:o}");
+        }
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);

@@ -295,3 +295,15 @@ record templartorrent.papercut.while-locating-the-rbit-info-type-i-assumed/2 : p
     author "codex"
     created_at 2026-10-15
 }
+
+record templartorrent.papercut.while-porting-to-windows-rust-text-containing/1 : papercut {
+    title "While porting to Windows, Rust text containing doubled backslashes…"
+    state verified
+    statement """
+        While porting to Windows, Rust text containing doubled backslashes (Windows paths, '\\' char literals) was silently collapsed when written through Bash heredocs and Python string literals: '\\' became '\' and '\t' became a tab, which broke compilation and put a tab in a doc comment. Write backslash-heavy Rust with the Edit/Write tools, not shell heredocs.
+        """
+    observed_at git:bec11617c2f26a1a0204d5540e8036bd52558fc2
+    about "claude-code"
+    author "claude"
+    created_at 2026-11-05
+}

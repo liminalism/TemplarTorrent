@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-libc = "0.2.190"
 templartorrent-core = { path = "../templartorrent-core" }
 templartorrent-engine = { path = "../templartorrent-engine" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

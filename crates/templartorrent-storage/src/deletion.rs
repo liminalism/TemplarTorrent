@@ -410,3 +410,66 @@ fn owned(fd: i32, path: &Path) -> Result<OwnedFd, StorageError> {
 fn cstring(name: &OsStr) -> Result<CString, StorageError> {
     CString::new(name.as_bytes()).map_err(|_| StorageError::Io("path contains NUL".into()))
 }
+
+/// Device, inode and link count of an open handle.
+pub(super) fn handle_identity(file: &std::fs::File) -> std::io::Result<super::Identity> {
+    let meta = file.metadata()?;
+    Ok(super::Identity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        nlink: meta.nlink(),
+    })
+}
+
+/// Device and inode of `meta` taken from a no-follow path probe.
+pub(super) fn probed_identity(
+    _path: &Path,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<super::Identity> {
+    Ok(super::Identity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        nlink: meta.nlink(),
+    })
+}
+
+/// Modification time as (seconds, nanoseconds) since the Unix epoch.
+pub(super) fn mtime(meta: &std::fs::Metadata) -> (i64, i64) {
+    (meta.mtime(), meta.mtime_nsec())
+}
+
+/// Payload handles this process may hold: the soft `RLIMIT_NOFILE`.
+pub(super) fn open_file_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+    if ok { limit.rlim_cur } else { 1024 }
+}
+
+/// Raise the soft open-file limit to the hard limit, capped at 65,536.
+pub(super) fn raise_open_file_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read and write only the given struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return 1024;
+        }
+        let wanted = limit.rlim_max.min(65_536);
+        if wanted > limit.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: wanted,
+                rlim_max: limit.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                return wanted;
+            }
+        }
+        limit.rlim_cur
+    }
+}

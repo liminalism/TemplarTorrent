@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Already in the graph through tokio; sets IPV6_V6ONLY off on Windows.
+socket2 = "0.6.5"
 rbit = "=0.2.2"
 templartorrent-core = { path = "../../crates/templartorrent-core" }
 templartorrent-engine = { path = "../../crates/templartorrent-engine" }

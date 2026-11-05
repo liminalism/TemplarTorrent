@@ -1,17 +1,32 @@
 //! Optional offline IP-to-country lookup for the Peers tab.
 //!
-//! Resolution is local and lazy: the user-supplied MaxMind DB (GeoLite2
-//! Country or City) is opened on the first lookup, never at startup, and at
-//! most [`GEO_CACHE_CAP`] results are cached, including misses. An absent or
-//! unreadable database yields `--` without blocking downloads. No database is
-//! bundled with this tree; see `--geoip-db` in [`crate::workflow::USAGE`].
+//! Resolution is local and lazy: the database is opened on the first lookup,
+//! never at startup, and at most [`GEO_CACHE_CAP`] results are cached,
+//! including misses. A user-supplied MaxMind DB (GeoLite2 Country or City,
+//! via `--geoip-db`, the environment or the data directory) wins; otherwise
+//! the bundled DB-IP Country Lite database ([`BUNDLED_EDITION`], CC BY 4.0,
+//! see `assets/geo/README.md`) is read straight from the binary. An
+//! unreadable user database yields `--` without blocking downloads.
 //!
 //! Local, private and reserved addresses are never misrepresented as a
 //! country. No online lookup, reverse DNS or telemetry is performed.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+
+/// DB-IP Country Lite, inflated by `build.rs` from `assets/geo/`.
+static BUNDLED_DB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dbip-country-lite.mmdb"));
+
+/// Edition of the bundled database, shown in the Peers tab.
+pub const BUNDLED_EDITION: &str = "2026-11";
+
+/// Attribution DB-IP's CC BY 4.0 license requires wherever its data shows.
+pub const BUNDLED_ATTRIBUTION: &str = "IP Geolocation by DB-IP (db-ip.com)";
+
+/// Largest user-supplied database file read into memory.
+const MAX_USER_DB_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum cached IP-to-country results, including misses.
 pub const GEO_CACHE_CAP: usize = 4096;
@@ -27,9 +42,7 @@ pub fn default_candidates() -> Vec<PathBuf> {
 }
 
 fn data_home() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+    crate::workflow::data_home()
 }
 
 fn candidates_for(data_home: Option<PathBuf>) -> Vec<PathBuf> {
@@ -72,6 +85,20 @@ fn select_db_path(
         return Some(path.to_path_buf());
     }
     fallback.map(Path::to_path_buf)
+}
+
+fn read_user_db(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(MAX_USER_DB_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_USER_DB_BYTES {
+        return Err(crate::text::t("geo.too_large").into());
+    }
+    Ok(bytes)
 }
 
 /// True only for globally routable unicast addresses. Everything else —
@@ -141,7 +168,7 @@ pub fn iso_code_to_bytes(iso: &str) -> Option<[u8; 2]> {
 
 pub struct GeoDb {
     path: Option<PathBuf>,
-    reader: Option<maxminddb::Reader<Vec<u8>>>,
+    reader: Option<maxminddb::Reader<Cow<'static, [u8]>>>,
     attempted: bool,
     load_error: Option<String>,
     cache: HashMap<IpAddr, Option<[u8; 2]>>,
@@ -150,7 +177,8 @@ pub struct GeoDb {
 
 impl GeoDb {
     /// Record the database path without opening it. The file is read on
-    /// the first [`GeoDb::lookup`], after the window is already up.
+    /// the first [`GeoDb::lookup`], after the window is already up. `None`
+    /// selects the bundled DB-IP database.
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
@@ -164,22 +192,27 @@ impl GeoDb {
 
     /// One-line database state for the Peers tab header.
     pub fn status_text(&self) -> String {
+        use crate::text::{t, tf};
         let file = self
             .path
             .as_ref()
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
-            .unwrap_or("country database");
-        if self.reader.is_some() {
-            return format!("{file} loaded");
-        }
+            .unwrap_or(t("geo.unnamed_file"));
         match (&self.path, &self.load_error) {
+            (None, _) => tf(
+                "geo.bundled",
+                &[
+                    ("edition", &BUNDLED_EDITION),
+                    ("attribution", &BUNDLED_ATTRIBUTION),
+                ],
+            ),
+            (Some(_), _) if self.reader.is_some() => tf("geo.loaded", &[("file", &file)]),
             (Some(_), Some(error)) => {
                 let short: String = error.chars().take(72).collect();
-                format!("{file} failed: {short}")
+                tf("geo.failed", &[("file", &file), ("detail", &short)])
             }
-            (Some(_), None) => format!("{file} configured"),
-            (None, _) => "not loaded — pass --geoip-db FILE".into(),
+            (Some(_), None) => tf("geo.configured", &[("file", &file)]),
         }
     }
 
@@ -215,14 +248,18 @@ impl GeoDb {
         iso_code_to_bytes(iso)
     }
 
-    fn ensure_loaded(&mut self) -> Option<&maxminddb::Reader<Vec<u8>>> {
+    fn ensure_loaded(&mut self) -> Option<&maxminddb::Reader<Cow<'static, [u8]>>> {
         if self.reader.is_none() && !self.attempted {
             self.attempted = true;
-            if let Some(path) = &self.path {
-                match maxminddb::Reader::open_readfile(path) {
-                    Ok(reader) => self.reader = Some(reader),
-                    Err(error) => self.load_error = Some(error.to_string()),
-                }
+            let source = match &self.path {
+                Some(path) => read_user_db(path).map(Cow::Owned),
+                None => Ok(Cow::Borrowed(BUNDLED_DB)),
+            };
+            match source.and_then(|bytes| {
+                maxminddb::Reader::from_source(bytes).map_err(|error| error.to_string())
+            }) {
+                Ok(reader) => self.reader = Some(reader),
+                Err(error) => self.load_error = Some(error),
             }
         }
         self.reader.as_ref()
@@ -293,18 +330,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_database_reports_failure_without_blocking() {
+    fn bundled_database_resolves_public_addresses_and_credits_db_ip() {
         let mut db = GeoDb::new(None);
-        assert_eq!(db.lookup(ip("8.8.8.8")), None);
+        assert_eq!(db.lookup(ip("8.8.8.8")), Some(*b"US"));
+        // Deutsche Telekom's IPv4 and IPv6 (2003::/19) ranges. Avoid anycast
+        // addresses such as Google's IPv6 DNS, which databases place apart.
+        assert_eq!(db.lookup(ip("80.156.0.1")), Some(*b"DE"));
+        assert_eq!(db.lookup(ip("2003::1")), Some(*b"DE"));
+        assert_eq!(db.lookup(ip("192.168.1.10")), None, "private stays --");
         assert!(
-            db.status_text().contains("not loaded"),
+            db.status_text().contains(BUNDLED_ATTRIBUTION),
             "{}",
             db.status_text()
         );
+    }
+
+    /// The failure line for `file`, with the error the database recorded.
+    fn failed(db: &GeoDb, file: &str) -> String {
+        let error = db.load_error.as_deref().expect("a load error");
+        let short: String = error.chars().take(72).collect();
+        crate::text::tf("geo.failed", &[("file", &file), ("detail", &short)])
+    }
+
+    #[test]
+    fn missing_database_reports_failure_without_blocking() {
         let missing = PathBuf::from("/nonexistent/GeoLite2-Country.mmdb");
         let mut db = GeoDb::new(Some(missing));
         assert_eq!(db.lookup(ip("8.8.8.8")), None);
-        assert!(db.status_text().contains("failed"), "{}", db.status_text());
+        assert_eq!(db.status_text(), failed(&db, "GeoLite2-Country.mmdb"));
         // A corrupt file is a failure, not a panic.
         let dir = std::env::temp_dir().join(format!("tt-geo-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -312,13 +365,14 @@ mod tests {
         std::fs::write(&junk, b"not a maxmind database").unwrap();
         let mut db = GeoDb::new(Some(junk.clone()));
         assert_eq!(db.lookup(ip("8.8.8.8")), None);
-        assert!(db.status_text().contains("failed"), "{}", db.status_text());
+        assert_eq!(db.status_text(), failed(&db, "junk.mmdb"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cache_counts_misses_and_stays_bounded() {
-        let mut db = GeoDb::new(None);
+        // A database that fails to load answers every lookup with a miss.
+        let mut db = GeoDb::new(Some(PathBuf::from("/nonexistent/x.mmdb")));
         // 9.0.0.0/8 is public space, so every miss exercises the cache path.
         for n in 0..GEO_CACHE_CAP + 64 {
             let address = IpAddr::from([9, (n >> 8) as u8, n as u8, 1]);

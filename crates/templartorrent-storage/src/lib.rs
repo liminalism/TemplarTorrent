@@ -23,6 +23,10 @@
 //! `O_NOFOLLOW`, inode identity taken from the still-open handle, hardlink
 //! refusal, and no removal of the destination directory itself. Reads and
 //! writes go through the handles opened at set-up, never through paths.
+//! On Windows (`deletion_windows.rs`) the same checks use reparse-point-aware
+//! opens, volume serial + file index identity, and delete-on-close through a
+//! handle whose identity was checked, see that module for the residual
+//! differences.
 
 #![deny(unsafe_code)]
 
@@ -30,7 +34,6 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -41,51 +44,37 @@ use templartorrent_core::{
 };
 use templartorrent_engine::worker::{PieceReader, PieceSink, SinkError};
 
+#[cfg(unix)]
+mod deletion;
+#[cfg(windows)]
+#[path = "deletion_windows.rs"]
 mod deletion;
 
 /// Descriptors kept free for sockets, the display connection and reads.
 const FD_RESERVE: u64 = 512;
 
 /// Payload handles this process may hold across all jobs: the soft
-/// `RLIMIT_NOFILE` less [`FD_RESERVE`]. Each real torrent file keeps one
-/// handle open for the job's life (deletion and resume identity rely on it).
+/// `RLIMIT_NOFILE` less [`FD_RESERVE`] on Unix; on Windows, where kernel
+/// handles are not capped by a small per-process limit, a fixed 65,536 less
+/// the reserve. Each real torrent file keeps one handle open for the job's
+/// life (deletion and resume identity rely on it).
 pub fn handle_budget() -> u64 {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit only writes the struct it is given.
-    #[allow(unsafe_code)]
-    let ok = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
-    let soft = if ok { limit.rlim_cur } else { 1024 };
-    soft.saturating_sub(FD_RESERVE)
+    deletion::open_file_limit().saturating_sub(FD_RESERVE)
 }
 
 /// Raise the soft open-file limit to the hard limit, capped at 65,536, as
 /// Transmission and qBittorrent do. Returns the soft limit in effect after.
+/// On Windows there is nothing to raise and the fixed budget is returned.
 pub fn raise_open_file_limit() -> u64 {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit/setrlimit read and write only the given struct.
-    #[allow(unsafe_code)]
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            return 1024;
-        }
-        let wanted = limit.rlim_max.min(65_536);
-        if wanted > limit.rlim_cur {
-            let raised = libc::rlimit {
-                rlim_cur: wanted,
-                rlim_max: limit.rlim_max,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
-                return wanted;
-            }
-        }
-        limit.rlim_cur
-    }
+    deletion::raise_open_file_limit()
+}
+
+/// Device (volume), inode (file index) and hard-link count of one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    dev: u64,
+    ino: u64,
+    nlink: u64,
 }
 
 /// Same bound as the engine; actual admission also requires enough session
@@ -509,6 +498,7 @@ fn stamp_handle(file: &StoredFile) -> Result<FileStamp, StorageError> {
     let live = handle
         .metadata()
         .map_err(|error| io_error(&file.path, error))?;
+    let live_id = deletion::handle_identity(handle).map_err(|error| io_error(&file.path, error))?;
     let on_path = match probe(&file.path)? {
         Some(meta) if meta.is_file() => meta,
         Some(_) => {
@@ -523,17 +513,20 @@ fn stamp_handle(file: &StoredFile) -> Result<FileStamp, StorageError> {
             });
         }
     };
-    if on_path.dev() != live.dev() || on_path.ino() != live.ino() {
+    let path_id = deletion::probed_identity(&file.path, &on_path)
+        .map_err(|error| io_error(&file.path, error))?;
+    if path_id.dev != live_id.dev || path_id.ino != live_id.ino {
         return Err(StorageError::IdentityChanged {
             path: file.path.display().to_string(),
         });
     }
+    let (mtime_sec, mtime_nsec) = deletion::mtime(&live);
     Ok(FileStamp {
-        dev: live.dev(),
-        ino: live.ino(),
+        dev: live_id.dev,
+        ino: live_id.ino,
         size: live.len(),
-        mtime_sec: live.mtime(),
-        mtime_nsec: live.mtime_nsec(),
+        mtime_sec,
+        mtime_nsec,
     })
 }
 

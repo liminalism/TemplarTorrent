@@ -94,3 +94,90 @@ impl RemovalIntent {
         })
     }
 }
+
+/// Windows verbatim path prefixes, spelled with escapes so no tool in the
+/// chain can collapse the doubled backslashes.
+const VERBATIM_UNC: &str = "\\\\?\\UNC\\";
+const VERBATIM: &str = "\\\\?\\";
+
+/// `std::fs::canonicalize`, minus the Windows verbatim prefix where dropping
+/// it names the same file: a verbatim drive path becomes `C:` form and a
+/// verbatim UNC path becomes a plain UNC path, when the result is short
+/// enough for the legacy path limit and every component is one the Win32
+/// path parser keeps unchanged. The plain form compares equal to the paths
+/// users type and the UI shows. Unix output is untouched.
+pub fn canonical_dir(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    Ok(strip_verbatim(canonical))
+}
+
+fn strip_verbatim(path: std::path::PathBuf) -> std::path::PathBuf {
+    if !cfg!(windows) {
+        return path;
+    }
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    // `plain` is the legacy form; `body` is the part made of components.
+    let (plain, body) = if let Some(rest) = text.strip_prefix(VERBATIM_UNC) {
+        (format!("\\\\{rest}"), rest)
+    } else if let Some(rest) = text.strip_prefix(VERBATIM) {
+        let drive = rest.as_bytes();
+        if drive.len() < 3 || !drive[0].is_ascii_alphabetic() || &drive[1..3] != b":\\" {
+            return path;
+        }
+        (rest.to_string(), &rest[3..])
+    } else {
+        return path;
+    };
+    // MAX_PATH less room for a file name below the directory.
+    if plain.len() >= 248 {
+        return path;
+    }
+    let safe = body
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .all(|part| validate_component(part).is_ok());
+    if safe {
+        std::path::PathBuf::from(plain)
+    } else {
+        path
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefix_is_dropped_only_when_equivalent() {
+        use super::strip_verbatim;
+        use std::path::PathBuf;
+        let strip = |text: &str| strip_verbatim(PathBuf::from(text));
+        let same = |text: &str| assert_eq!(strip(text), PathBuf::from(text), "{text}");
+        assert_eq!(
+            strip("\\\\?\\C:\\Users\\me\\Down"),
+            PathBuf::from("C:\\Users\\me\\Down")
+        );
+        assert_eq!(
+            strip("\\\\?\\UNC\\nas\\share\\x"),
+            PathBuf::from("\\\\nas\\share\\x")
+        );
+        // A trailing dot or a reserved name would change meaning without it.
+        same("\\\\?\\C:\\a.\\b");
+        same("\\\\?\\C:\\x\\NUL");
+        same("\\\\?\\Volume{1}\\x");
+        same("C:\\plain");
+    }
+
+    #[test]
+    fn canonical_dir_resolves_an_existing_directory() {
+        let dir = std::env::temp_dir();
+        let canonical = super::canonical_dir(&dir).unwrap();
+        assert!(canonical.is_absolute());
+        assert!(canonical.is_dir());
+        if cfg!(windows) {
+            let text = canonical.to_string_lossy();
+            assert!(!text.starts_with(super::VERBATIM), "{text}");
+        }
+    }
+}

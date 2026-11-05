@@ -24,13 +24,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use templartorrent_core::{
     budget::{ByteBudget, Permit},
-    model::{JobState, Limits, PeerPreference, Snapshot, TorrentId},
+    model::{JobState, Limits, PeerPreference, Snapshot, TorrentId, TorrentRow},
 };
 use templartorrent_engine::{
     event::PeerId,
@@ -51,6 +51,15 @@ const EVENT_CAP: usize = 64;
 const WIRE_CAP: usize = DEFAULT_MAX_IN_FLIGHT + 16;
 /// Sources a magnet's metadata resolution may try before the job exists.
 const CANDIDATE_CAP: usize = 32;
+/// Magnets resolving metadata at once. Each holds up to
+/// [`METADATA_PARALLEL`] connections and shares the metadata byte budget.
+const RESOLVING_CAP: usize = 8;
+/// Metadata candidates one magnet tries at once; the first verified wins.
+const METADATA_PARALLEL: usize = 4;
+/// Bound on one magnet's metadata exchange, after peer discovery.
+const METADATA_DEADLINE: Duration = Duration::from_secs(60);
+/// Characters of a magnet's `dn` kept for its row before metadata arrives.
+const NAME_CAP: usize = 256;
 /// Remembered peer candidates per job (DESIGN.md section 5: 2,048).
 const POOL_CAP: usize = 2048;
 /// Outgoing connection attempts in flight across all jobs.
@@ -96,6 +105,9 @@ impl fmt::Display for DriverError {
 }
 impl std::error::Error for DriverError {}
 type Result<T> = std::result::Result<T, DriverError>;
+
+/// A connection whose remote peer id is this client's own.
+pub const SELF_CONNECTION: &str = "connected to this client itself";
 
 /// Message Stream Encryption (MSE/PE) on peer connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -398,6 +410,9 @@ pub struct DriverReport {
     pub hash_failures: usize,
     pub disconnected: usize,
     pub peer_errors: Vec<&'static str>,
+    /// Magnets whose metadata was installed in this step: each is now a
+    /// normal job with files and a persistable record.
+    pub resolved: Vec<TorrentId>,
 }
 
 pub struct Driver {
@@ -409,6 +424,10 @@ pub struct Driver {
     event_sender: mpsc::Sender<WireEvent>,
     metadata_budget: ByteBudget,
     peer_id: [u8; 20],
+    /// Addresses that answered a dial with our own peer id: this client,
+    /// reached through a tracker or DHT reply that listed us. Never dialed
+    /// again.
+    self_addresses: std::collections::HashSet<SocketAddr>,
     encryption: PeerEncryption,
     incoming_keys: Arc<Mutex<IncomingKeys>>,
     started: Instant,
@@ -449,6 +468,9 @@ pub struct Driver {
     /// announce_peer queries remote nodes accepted, since start.
     dht_announced: usize,
     pex_interval_s: u64,
+    /// Magnets shown as jobs while their metadata is fetched, by the id
+    /// reserved for them in the session.
+    pending: HashMap<TorrentId, PendingMagnet>,
 }
 
 /// One finished outgoing connection attempt.
@@ -487,6 +509,7 @@ impl Driver {
             event_sender,
             metadata_budget: ByteBudget::new(METADATA_BUDGET),
             peer_id,
+            self_addresses: std::collections::HashSet::new(),
             encryption: PeerEncryption::default(),
             incoming_keys: Arc::default(),
             started: Instant::now(),
@@ -518,6 +541,7 @@ impl Driver {
             dht_found,
             dht_announced: 0,
             pex_interval_s: crate::pex::INTERVAL_S,
+            pending: HashMap::new(),
         })
     }
 
@@ -573,7 +597,7 @@ impl Driver {
     fn now_ns(&self) -> u64 {
         self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64
     }
-    pub fn snapshot(&mut self) -> Snapshot {
+    fn session_rows(&mut self) -> Snapshot {
         let mut snapshot = self.session.snapshot();
         let mut jobs = snapshot.jobs.to_vec();
         for job in &mut jobs {
@@ -587,6 +611,17 @@ impl Driver {
                 job.state = JobState::Complete;
             }
         }
+        snapshot.jobs = jobs.into();
+        snapshot
+    }
+    /// Every job, including magnets still fetching metadata, in id order.
+    pub fn snapshot(&mut self) -> Snapshot {
+        let mut snapshot = self.session_rows();
+        let mut jobs = snapshot.jobs.to_vec();
+        jobs.extend(self.pending.iter().map(|(id, pending)| pending.row(*id)));
+        // A magnet keeps its reserved id, so it keeps its place when its
+        // metadata is installed.
+        jobs.sort_by_key(|row| row.id.0);
         snapshot.jobs = jobs.into();
         snapshot
     }
@@ -635,9 +670,15 @@ impl Driver {
         self.wires.len()
     }
     pub fn last_error(&self, id: TorrentId) -> Option<&'static str> {
+        if let Some(pending) = self.pending.get(&id) {
+            return pending.error;
+        }
         self.jobs.0.get(&id).and_then(|job| job.last_error)
     }
     pub fn destination(&self, id: TorrentId) -> Option<PathBuf> {
+        if let Some(pending) = self.pending.get(&id) {
+            return Some(pending.destination.clone());
+        }
         self.jobs.0.get(&id).map(|job| job.destination.clone())
     }
     pub fn limits(&self) -> &Limits {
@@ -709,14 +750,14 @@ impl Driver {
         if self.listener.is_some() {
             return Err(DriverError("listener already bound"));
         }
-        // `[::]` is dual-stack on Linux by default; a host without IPv6
-        // falls back to IPv4 on the same port.
-        let socket = match TcpListener::bind(address).await {
+        // `[::]` is made dual-stack explicitly (Windows defaults to
+        // IPV6_V6ONLY); a host without IPv6 falls back to IPv4 on the same
+        // port.
+        let socket = match bind_listener(address) {
             Ok(socket) => socket,
-            Err(_) if address.ip().is_unspecified() && address.is_ipv6() => TcpListener::bind(
+            Err(_) if address.ip().is_unspecified() && address.is_ipv6() => bind_listener(
                 SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), address.port()),
             )
-            .await
             .map_err(|_| DriverError("listener bind failed"))?,
             Err(_) => return Err(DriverError("listener bind failed")),
         };
@@ -821,10 +862,12 @@ impl Driver {
             return;
         }
         if let Some((_, task)) = listener.mapped.take() {
+            // Joined, so the old socket is closed before a rebind.
             task.abort();
+            let _ = task.await;
         }
         if let Some(address) = wanted
-            && let Ok(socket) = TcpListener::bind(address).await
+            && let Ok(socket) = bind_listener(address)
         {
             let task = accept_loop(
                 socket,
@@ -948,10 +991,278 @@ impl Driver {
             .map_err(|_| DriverError("peer command queue full or closed"))
     }
 
-    /// Resolve from one explicitly permitted source. add_magnet borrows the
-    /// coordinator for the resolution deadline; actor receive queues remain
-    /// bounded while another job is being added. A later UI actor can run the
-    /// resolution as a separate bounded work item without changing this seam.
+    /// Checks every magnet admission rule that needs no network, so a bad
+    /// Add is refused at once rather than after the metadata exchange.
+    fn admit_magnet(
+        &self,
+        uri: &str,
+        sources: &[PeerSource],
+        public_bootstrap: bool,
+        discover: bool,
+    ) -> Result<(rbit::MagnetLink, [u8; 20])> {
+        if uri.len() > 16 * 1024 {
+            return Err(DriverError("magnet exceeds 16 KiB limit"));
+        }
+        let magnet = rbit::MagnetLink::parse(uri).map_err(|_| DriverError("invalid magnet"))?;
+        let Some(hash) = magnet.info_hash.v1_hash().map(|hash| hash.0) else {
+            return Err(DriverError("pure v2 magnets are not supported"));
+        };
+        if self.knows_hash(hash) {
+            return Err(DriverError("torrent already exists"));
+        }
+        if !discover && (sources.is_empty() || sources.len() > CANDIDATE_CAP) {
+            return Err(DriverError("provide 1..=32 permitted peer sources"));
+        }
+        if self.limits.connections_per_job == 0 || self.limits.download_jobs == 0 {
+            return Err(DriverError("no connection or download slot available"));
+        }
+        let any_permitted = sources.iter().any(|source| {
+            matches!(source.origin, PeerOrigin::OriginalTracker(_)) || public_bootstrap
+        });
+        if !discover && !any_permitted {
+            return Err(DriverError(
+                "strict bootstrap requires an original-tracker source",
+            ));
+        }
+        if discover {
+            if self.announced_port().is_none() {
+                return Err(DriverError("listening port is not configured"));
+            }
+            if magnet.trackers.is_empty() && !public_bootstrap && !any_permitted {
+                return Err(DriverError(
+                    "magnet has no trackers; enable public peer discovery",
+                ));
+            }
+        }
+        Ok((magnet, hash))
+    }
+
+    fn resolve_input(
+        &self,
+        hash: [u8; 20],
+        trackers: &[String],
+        sources: &[PeerSource],
+        public_bootstrap: bool,
+        discover: bool,
+    ) -> Resolve {
+        Resolve {
+            hash,
+            discover,
+            trackers: trackers.to_vec(),
+            allow_local: self.allow_local_trackers,
+            port: self.announced_port().unwrap_or(0),
+            sources: sources
+                .iter()
+                .filter(|source| !self.self_addresses.contains(&source.address))
+                .copied()
+                .collect(),
+            public_bootstrap,
+            dht: self.dht.clone(),
+            peer_id: self.peer_id,
+            encryption: self.encryption,
+            budget: self.metadata_budget.clone(),
+        }
+    }
+
+    /// Add a magnet whose metadata is resolved in the background from the
+    /// explicit `sources` only. The job is in [`Driver::snapshot`] at once,
+    /// as [`JobState::Metadata`] with an unknown (zero) size, and becomes a
+    /// normal job in the [`Driver::step`] that installs verified metadata
+    /// ([`DriverReport::resolved`]). A failed resolution leaves the row in
+    /// [`JobState::Error`] with [`Driver::last_error`]; resume retries it.
+    pub fn start_magnet(
+        &mut self,
+        uri: &str,
+        destination: &Path,
+        existing: ExistingData,
+        sources: &[PeerSource],
+        public_bootstrap: bool,
+    ) -> Result<TorrentId> {
+        self.begin_magnet(uri, destination, existing, sources, public_bootstrap, false)
+    }
+
+    /// [`Driver::start_magnet`] that first asks the magnet's own trackers
+    /// (and the DHT for a public bootstrap) for peers, in the background.
+    /// Configured public trackers are appended only after metadata proves
+    /// the torrent is public.
+    pub fn start_magnet_with_discovery(
+        &mut self,
+        uri: &str,
+        destination: &Path,
+        existing: ExistingData,
+        sources: &[PeerSource],
+        public_bootstrap: bool,
+    ) -> Result<TorrentId> {
+        self.begin_magnet(uri, destination, existing, sources, public_bootstrap, true)
+    }
+
+    fn begin_magnet(
+        &mut self,
+        uri: &str,
+        destination: &Path,
+        existing: ExistingData,
+        sources: &[PeerSource],
+        public_bootstrap: bool,
+        discover: bool,
+    ) -> Result<TorrentId> {
+        let (magnet, hash) = self.admit_magnet(uri, sources, public_bootstrap, discover)?;
+        if self.resolving() >= RESOLVING_CAP {
+            return Err(DriverError("too many magnets are fetching metadata"));
+        }
+        let name: String = magnet
+            .display_name
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .take(NAME_CAP)
+            .collect();
+        let name = if name.trim().is_empty() {
+            hex_encode(&hash)
+        } else {
+            name
+        };
+        let id = self.session.reserve_id();
+        self.pending.insert(
+            id,
+            PendingMagnet {
+                hash,
+                name: name.into(),
+                destination: destination.to_path_buf(),
+                existing,
+                public_bootstrap,
+                discover,
+                trackers: magnet
+                    .trackers
+                    .into_iter()
+                    .take(crate::discovery::MAX_TRACKERS)
+                    .collect(),
+                sources: sources.iter().take(CANDIDATE_CAP).copied().collect(),
+                task: None,
+                progress: Arc::default(),
+                state: JobState::Metadata,
+                error: None,
+            },
+        );
+        self.spawn_resolution(id);
+        Ok(id)
+    }
+
+    /// Whether a job or a magnet still fetching metadata has this info hash.
+    fn knows_hash(&self, hash: [u8; 20]) -> bool {
+        self.jobs.0.values().any(|job| job.torrent.hash() == hash)
+            || self.pending.values().any(|pending| pending.hash == hash)
+    }
+
+    fn resolving(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|pending| pending.task.is_some())
+            .count()
+    }
+
+    fn spawn_resolution(&mut self, id: TorrentId) {
+        let Some(pending) = self.pending.get(&id) else {
+            return;
+        };
+        let input = self.resolve_input(
+            pending.hash,
+            &pending.trackers,
+            &pending.sources,
+            pending.public_bootstrap,
+            pending.discover,
+        );
+        let progress = Arc::clone(&pending.progress);
+        progress.reset();
+        let task = tokio::spawn(resolve_magnet(input, progress));
+        if let Some(pending) = self.pending.get_mut(&id) {
+            pending.task = Some(task);
+            pending.state = JobState::Metadata;
+            pending.error = None;
+        }
+    }
+
+    /// Cancel a resolution; its connections and metadata permits are
+    /// released before this returns.
+    async fn stop_resolution(&mut self, id: TorrentId) {
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return;
+        };
+        let task = pending.task.take();
+        let progress = Arc::clone(&pending.progress);
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        progress.reset();
+    }
+
+    /// Install every magnet whose resolution finished since the last step.
+    async fn collect_resolutions(&mut self, report: &mut DriverReport) {
+        let finished: Vec<TorrentId> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.task.as_ref().is_some_and(JoinHandle::is_finished))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in finished {
+            let Some(task) = self
+                .pending
+                .get_mut(&id)
+                .and_then(|pending| pending.task.take())
+            else {
+                continue;
+            };
+            let outcome = match task.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(DriverError("metadata resolution stopped")),
+            };
+            let installed = match outcome {
+                Ok(resolved) => {
+                    let Some(pending) = self.pending.remove(&id) else {
+                        continue;
+                    };
+                    let installed = self
+                        .install_magnet(
+                            Some(id),
+                            pending.hash,
+                            &pending.destination,
+                            pending.existing,
+                            pending.public_bootstrap,
+                            pending.discover,
+                            resolved,
+                        )
+                        .await;
+                    if installed.is_err() {
+                        self.pending.insert(id, pending);
+                    }
+                    installed.map(|_| ())
+                }
+                Err(error) => Err(error),
+            };
+            match installed {
+                Ok(()) => report.resolved.push(id),
+                Err(error) => {
+                    if let Some(pending) = self.pending.get_mut(&id) {
+                        pending.progress.reset();
+                        pending.state = JobState::Error;
+                        pending.error = Some(error.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `id` is a magnet still waiting for its metadata (fetching,
+    /// paused or failed). Such a job has no files, pieces or record yet.
+    pub fn awaiting_metadata(&self, id: TorrentId) -> bool {
+        self.pending.contains_key(&id)
+    }
+
+    /// Resolve metadata from the explicit `sources`, then install the job.
+    /// The coordinator is borrowed until the metadata arrives or the
+    /// deadline passes; dropping this future drops every connection and
+    /// permit at once. [`Driver::start_magnet`] shows the job immediately
+    /// and resolves in the background instead.
     pub async fn add_magnet(
         &mut self,
         uri: &str,
@@ -960,105 +1271,62 @@ impl Driver {
         sources: &[PeerSource],
         public_bootstrap: bool,
     ) -> Result<TorrentId> {
-        if uri.len() > 16 * 1024 {
-            return Err(DriverError("magnet exceeds 16 KiB limit"));
-        }
-        let magnet = rbit::MagnetLink::parse(uri).map_err(|_| DriverError("invalid magnet"))?;
-        let Some(hash) = magnet.info_hash.v1_hash().map(|hash| hash.0) else {
-            return Err(DriverError("pure v2 magnets are not supported"));
-        };
-        if self.jobs.0.values().any(|job| job.torrent.hash() == hash) {
+        self.add_magnet_now(uri, destination, existing, sources, public_bootstrap, false)
+            .await
+    }
+
+    async fn add_magnet_now(
+        &mut self,
+        uri: &str,
+        destination: &Path,
+        existing: ExistingData,
+        sources: &[PeerSource],
+        public_bootstrap: bool,
+        discover: bool,
+    ) -> Result<TorrentId> {
+        let (magnet, hash) = self.admit_magnet(uri, sources, public_bootstrap, discover)?;
+        let trackers: Vec<String> = magnet
+            .trackers
+            .into_iter()
+            .take(crate::discovery::MAX_TRACKERS)
+            .collect();
+        let input = self.resolve_input(hash, &trackers, sources, public_bootstrap, discover);
+        let resolved = resolve_magnet(input, Arc::default()).await?;
+        self.install_magnet(
+            None,
+            hash,
+            destination,
+            existing,
+            public_bootstrap,
+            discover,
+            resolved,
+        )
+        .await
+    }
+
+    /// Admit a job from verified metadata: storage, recheck, trackers and the
+    /// connection that supplied the metadata. Rolled back whole on failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn install_magnet(
+        &mut self,
+        reserved: Option<TorrentId>,
+        hash: [u8; 20],
+        destination: &Path,
+        existing: ExistingData,
+        public_bootstrap: bool,
+        discover: bool,
+        resolved: Resolved,
+    ) -> Result<TorrentId> {
+        let Resolved {
+            source,
+            connection,
+            metadata,
+            mut permitted,
+            announced,
+        } = resolved;
+        if self.knows_hash(hash) {
             return Err(DriverError("torrent already exists"));
         }
-        if sources.is_empty() || sources.len() > CANDIDATE_CAP {
-            return Err(DriverError("provide 1..=32 permitted peer sources"));
-        }
-        if self.wires.len() >= self.limits.connections_total
-            || self.limits.connections_per_job == 0
-            || self.limits.download_jobs == 0
-            || self
-                .snapshot()
-                .jobs
-                .iter()
-                .filter(|row| matches!(row.state, JobState::Downloading | JobState::Queued))
-                .count()
-                >= self.limits.download_jobs
-        {
-            return Err(DriverError("no connection or download slot available"));
-        }
-        let mut permitted = Vec::new();
-        for source in sources {
-            if (matches!(source.origin, PeerOrigin::OriginalTracker(_)) || public_bootstrap)
-                && !permitted
-                    .iter()
-                    .any(|known: &PeerSource| known.address == source.address)
-            {
-                permitted.push(*source);
-            }
-        }
-        if permitted.is_empty() {
-            return Err(DriverError(
-                "strict bootstrap requires an original-tracker source",
-            ));
-        }
-        // Up to METADATA_PARALLEL candidates at once; the first verified
-        // metadata wins. The attempts are polled here rather than spawned,
-        // so dropping this future drops every connection and permit at once.
-        const METADATA_PARALLEL: usize = 4;
-        type Attempt = std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Option<(
-                            PeerSource,
-                            PeerConnection,
-                            crate::metadata::FetchedMetadata,
-                        )>,
-                    > + Send,
-            >,
-        >;
-        let peer_id = self.peer_id;
-        let encryption = self.encryption;
-        let budget = self.metadata_budget.clone();
-        let resolution = timeout(Duration::from_secs(60), async {
-            let mut queue = permitted.iter().copied();
-            let mut attempts: Vec<Attempt> = Vec::new();
-            loop {
-                while attempts.len() < METADATA_PARALLEL {
-                    let Some(source) = queue.next() else {
-                        break;
-                    };
-                    let budget = budget.clone();
-                    attempts.push(Box::pin(async move {
-                        let mut connection = dial_peer(source.address, hash, peer_id, encryption)
-                            .await
-                            .ok()?;
-                        let metadata = fetch_metadata_budgeted(&mut connection, hash, &budget)
-                            .await
-                            .ok()?;
-                        Some((source, connection, metadata))
-                    }));
-                }
-                if attempts.is_empty() {
-                    return Err(DriverError("no permitted peer supplied valid metadata"));
-                }
-                let finished = std::future::poll_fn(|cx| {
-                    for index in 0..attempts.len() {
-                        if let std::task::Poll::Ready(result) = attempts[index].as_mut().poll(cx) {
-                            drop(attempts.swap_remove(index));
-                            return std::task::Poll::Ready(result);
-                        }
-                    }
-                    std::task::Poll::Pending
-                })
-                .await;
-                if let Some(found) = finished {
-                    return Ok(found);
-                }
-            }
-        })
-        .await
-        .map_err(|_| DriverError("magnet resolution deadline exceeded"))??;
-        let (source, connection, metadata) = resolution;
         let (torrent, buffered) = ValidatedV1::from_fetched(metadata, hash, &self.metadata_budget)
             .map_err(DriverError)?;
         let private_tracker = if torrent.is_private() {
@@ -1077,15 +1345,17 @@ impl Driver {
             private_tracker.is_none_or(|id| candidate.origin == PeerOrigin::OriginalTracker(id))
         });
         // Admission precedes creation of any payload file.
-        let id = self
-            .session
-            .add(JobSpec {
-                name: torrent.name().into(),
-                files: torrent.files(),
-                piece_length: torrent.piece_length(),
-                max_pieces: MAX_DRIVER_PIECES,
-            })
-            .map_err(|_| DriverError("torrent exceeds session admission limits"))?;
+        let spec = JobSpec {
+            name: torrent.name().into(),
+            files: torrent.files(),
+            piece_length: torrent.piece_length(),
+            max_pieces: MAX_DRIVER_PIECES,
+        };
+        let id = match reserved {
+            Some(id) => self.session.add_reserved(id, spec),
+            None => self.session.add(spec),
+        }
+        .map_err(|_| DriverError("torrent exceeds session admission limits"))?;
         let admitted =
             (|| {
                 let root = prepare_destination(destination, existing)?;
@@ -1136,13 +1406,71 @@ impl Driver {
                 resume_note: None,
             },
         );
-        if self
-            .session
-            .snapshot()
+        let mut kept = Vec::new();
+        let mut to_ingest = Vec::new();
+        for (mut tracker, response) in announced {
+            if private_tracker.is_some_and(|active| tracker.origin_id != active) {
+                continue;
+            }
+            let Ok(index) = self.session.add_tracker(id) else {
+                break;
+            };
+            let now = self.elapsed_s();
+            if let Some(response) = response {
+                let _ = self.session.tracker_success(
+                    id,
+                    index,
+                    now,
+                    response.interval,
+                    response.min_interval,
+                );
+                tracker.seeds = response.complete;
+                tracker.peers = response.incomplete;
+                tracker.started = true;
+                to_ingest.push((response, tracker.origin_id, tracker.local));
+            } else {
+                let _ = self.session.tracker_failure(id, index, now, 0);
+                tracker
+                    .last_error
+                    .get_or_insert_with(|| "announce failed".into());
+            }
+            kept.push(tracker);
+        }
+        if let Some(job) = self.jobs.0.get_mut(&id) {
+            job.trackers = kept;
+        }
+        // Metadata resolution used at most CANDIDATE_CAP of these peers; the
+        // pool keeps the rest for the dialer.
+        for (response, origin_id, local) in to_ingest {
+            self.ingest_peers(id, &response, PeerOrigin::OriginalTracker(origin_id), local);
+        }
+        if discover {
+            self.augment_public(id).await;
+        }
+        let rows = self.session_rows();
+        if rows
             .jobs
             .iter()
             .any(|row| row.id == id && row.state == JobState::Seeding)
         {
+            return Ok(id);
+        }
+        // Another job may have taken the last download slot while this one
+        // fetched metadata: queue rather than refuse, as `.torrent` adds do.
+        let running = rows
+            .jobs
+            .iter()
+            .filter(|row| row.id != id && row.state == JobState::Downloading)
+            .count();
+        if running >= self.limits.download_jobs {
+            self.pause(id).await?;
+            if let Some(job) = self.jobs.0.get_mut(&id) {
+                job.queued = true;
+            }
+            return Ok(id);
+        }
+        // At the connection cap the dialer connects this job once room frees.
+        if self.wires.len() >= self.limits.connections_total {
             return Ok(id);
         }
         if let Err(error) = self.attach(id, source, connection, buffered) {
@@ -1154,6 +1482,14 @@ impl Driver {
         Ok(id)
     }
 
+    /// The remote end sent our own peer id: we dialed ourselves.
+    fn is_own_peer_id(&self, connection: &PeerConnection) -> bool {
+        connection
+            .peer_id
+            .as_ref()
+            .is_some_and(|remote| remote.as_bytes() == &self.peer_id)
+    }
+
     fn attach(
         &mut self,
         id: TorrentId,
@@ -1161,6 +1497,11 @@ impl Driver {
         connection: PeerConnection,
         buffered: Vec<Message>,
     ) -> Result<()> {
+        // The accepting side of a self-connection; the dialing side is
+        // refused and remembered in `connect_peer`.
+        if self.is_own_peer_id(&connection) {
+            return Err(DriverError(SELF_CONNECTION));
+        }
         let peer = self
             .session
             .connect(id)
@@ -1326,10 +1667,17 @@ impl Driver {
         {
             return Err(DriverError("connection cap reached"));
         }
+        if self.self_addresses.contains(&source.address) {
+            return Err(DriverError(SELF_CONNECTION));
+        }
         let hash = job.torrent.hash();
         let connection = dial_peer(source.address, hash, self.peer_id, self.encryption)
             .await
             .map_err(DriverError)?;
+        if self.is_own_peer_id(&connection) {
+            self.self_addresses.insert(source.address);
+            return Err(DriverError(SELF_CONNECTION));
+        }
         let job = self.jobs.0.get_mut(&id).unwrap();
         if !job
             .sources
@@ -1342,6 +1690,13 @@ impl Driver {
     }
 
     pub async fn pause(&mut self, id: TorrentId) -> Result<()> {
+        if self.pending.contains_key(&id) {
+            self.stop_resolution(id).await;
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.state = JobState::Paused;
+            }
+            return Ok(());
+        }
         if !self.jobs.0.contains_key(&id) {
             return Err(DriverError("unknown job"));
         }
@@ -1353,6 +1708,16 @@ impl Driver {
         Ok(())
     }
     pub async fn resume(&mut self, id: TorrentId) -> Result<()> {
+        if let Some(pending) = self.pending.get(&id) {
+            // Paused or failed: fetch again. Already fetching: nothing to do.
+            if pending.task.is_none() {
+                if self.resolving() >= RESOLVING_CAP {
+                    return Err(DriverError("too many magnets are fetching metadata"));
+                }
+                self.spawn_resolution(id);
+            }
+            return Ok(());
+        }
         let sources = self
             .jobs
             .0
@@ -1372,7 +1737,7 @@ impl Driver {
         {
             return Ok(());
         }
-        let rows = self.snapshot();
+        let rows = self.session_rows();
         let runnable: Vec<_> = rows
             .jobs
             .iter()
@@ -1402,6 +1767,13 @@ impl Driver {
         Ok(())
     }
     pub async fn remove(&mut self, id: TorrentId, delete_data: bool) -> Result<()> {
+        if self.pending.contains_key(&id) {
+            // No payload file exists before metadata, so there is no data to
+            // delete: the destination is created only when the job installs.
+            self.stop_resolution(id).await;
+            self.pending.remove(&id);
+            return Ok(());
+        }
         if !self.jobs.0.contains_key(&id) {
             return Err(DriverError("unknown job"));
         }
@@ -1433,10 +1805,19 @@ impl Driver {
             listener.task.abort();
             let _ = listener.task.await;
             if let Some((_, task)) = listener.mapped {
+                // Joined like the main listener: the socket is closed when
+                // shutdown returns.
                 task.abort();
+                let _ = task.await;
             }
         }
-        let ids: Vec<_> = self.jobs.0.keys().copied().collect();
+        let ids: Vec<_> = self
+            .jobs
+            .0
+            .keys()
+            .chain(self.pending.keys())
+            .copied()
+            .collect();
         for id in ids {
             let _ = self.remove(id, false).await;
         }
@@ -1514,7 +1895,7 @@ impl Driver {
             .map_err(|_| DriverError("limits rejected"))?;
         self.limits = limits;
         // Preserve running intent separately from slot admission.
-        let rows = self.snapshot();
+        let rows = self.session_rows();
         let mut admitted = 0usize;
         let mut resume = Vec::new();
         for row in rows.jobs.iter() {
@@ -2094,6 +2475,7 @@ impl Driver {
         let mut report = DriverReport::default();
         self.sample_rates();
         self.accept_incoming().await;
+        self.collect_resolutions(&mut report).await;
         let failures = std::mem::take(&mut self.pending_failures);
         for (peer, error) in failures {
             if let Some(wire) = self.wires.get(&peer) {
@@ -2176,6 +2558,9 @@ impl Driver {
     }
 
     pub fn info_hash(&self, id: TorrentId) -> Option<[u8; 20]> {
+        if let Some(pending) = self.pending.get(&id) {
+            return Some(pending.hash);
+        }
         Some(self.jobs.0.get(&id)?.torrent.hash())
     }
 
@@ -2317,7 +2702,7 @@ impl Driver {
         if hash != record.info_hash {
             return Err(DriverError("stored torrent does not match its record"));
         }
-        if self.jobs.0.values().any(|job| job.torrent.hash() == hash) {
+        if self.knows_hash(hash) {
             return Err(DriverError("torrent already exists"));
         }
         let id = self
@@ -2478,7 +2863,7 @@ impl Driver {
             return Ok(id);
         }
         // Running intent still respects the download-slot cap.
-        let rows = self.snapshot();
+        let rows = self.session_rows();
         let running = rows
             .jobs
             .iter()
@@ -2672,6 +3057,8 @@ impl Driver {
     /// Resolve peers from the magnet's own trackers, then install the job.
     /// Explicit `sources` are additional permitted endpoints. Configured public
     /// trackers are appended only after metadata proves the torrent is public.
+    /// Waits for the metadata; [`Driver::start_magnet_with_discovery`] shows
+    /// the job immediately and resolves in the background instead.
     pub async fn add_magnet_with_discovery(
         &mut self,
         uri: &str,
@@ -2680,184 +3067,8 @@ impl Driver {
         sources: &[PeerSource],
         public_bootstrap: bool,
     ) -> Result<TorrentId> {
-        if uri.len() > 16 * 1024 {
-            return Err(DriverError("magnet exceeds 16 KiB limit"));
-        }
-        let magnet = rbit::MagnetLink::parse(uri).map_err(|_| DriverError("invalid magnet"))?;
-        let Some(hash) = magnet.info_hash.v1_hash().map(|hash| hash.0) else {
-            return Err(DriverError("pure v2 magnets are not supported"));
-        };
-        let port = self
-            .announced_port()
-            .ok_or(DriverError("listening port is not configured"))?;
-        let mut originals = Vec::new();
-        for url in magnet.trackers.iter().take(crate::discovery::MAX_TRACKERS) {
-            let Ok(admitted) =
-                crate::discovery::admit_tracker(url, self.allow_local_trackers).await
-            else {
-                continue;
-            };
-            if originals
-                .iter()
-                .any(|known: &Tracked| known.url == admitted.tracker.url)
-            {
-                continue;
-            }
-            originals.push(Tracked {
-                url: admitted.tracker.url,
-                origin: "original",
-                origin_id: originals.len() as u64 + 1,
-                local: admitted.local,
-                seeds: None,
-                peers: None,
-                last_error: None,
-                started: false,
-                port_stale: false,
-            });
-        }
-        let mut discovered = Vec::new();
-        let mut announced = Vec::new();
-        let peer_id = self.peer_id;
-        // A magnet with several trackers used to announce them one after
-        // another, each allowed ten seconds, before the job existed.
-        let had_trackers = !magnet.trackers.is_empty();
-        let allow_local = self.allow_local_trackers;
-        let mut tasks = JoinSet::new();
-        for (index, tracker) in originals.into_iter().enumerate() {
-            let url = tracker.url.clone();
-            let info_hash = hash;
-            let announce_id = peer_id;
-            tasks.spawn(async move {
-                let result = announce_detached(
-                    &url,
-                    allow_local,
-                    crate::announce::AnnounceRequest {
-                        info_hash: &info_hash,
-                        peer_id: &announce_id,
-                        port,
-                        uploaded: 0,
-                        downloaded: 0,
-                        left: UNKNOWN_LEFT,
-                        event: rbit::TrackerEvent::Started,
-                    },
-                )
-                .await;
-                (index, tracker, result)
-            });
-        }
-        let mut finished = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
-            if let Ok(item) = joined {
-                finished.push(item);
-            }
-        }
-        finished.sort_by_key(|(index, _, _)| *index);
-        for (_, mut tracker, result) in finished {
-            match result {
-                Ok(response) => {
-                    self.collect_peers(
-                        &response,
-                        tracker.local,
-                        tracker.origin_id,
-                        &mut discovered,
-                    );
-                    announced.push((tracker, Some(response)));
-                }
-                Err(failure) => {
-                    tracker.last_error = Some(failure.detail);
-                    announced.push((tracker, None));
-                }
-            }
-        }
-        for source in sources {
-            if discovered.len() >= CANDIDATE_CAP {
-                break;
-            }
-            let allowed =
-                matches!(source.origin, PeerOrigin::OriginalTracker(_)) || public_bootstrap;
-            if allowed
-                && !discovered
-                    .iter()
-                    .any(|known: &PeerSource| known.address == source.address)
-            {
-                discovered.push(*source);
-            }
-        }
-        // Trackers gave nothing: a public magnet may still find peers in the
-        // DHT. Strict bootstrap never asks it.
-        if discovered.is_empty()
-            && public_bootstrap
-            && let Some(dht) = self.dht.clone()
-            && let Ok(Ok(peers)) = timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers(hash)).await
-        {
-            for address in peers {
-                if discovered.len() >= CANDIDATE_CAP {
-                    break;
-                }
-                if peer_allowed(address, false)
-                    && !discovered.iter().any(|known| known.address == address)
-                {
-                    discovered.push(PeerSource {
-                        address,
-                        origin: PeerOrigin::Dht,
-                    });
-                }
-            }
-        }
-        if discovered.is_empty() {
-            return Err(DriverError(if !had_trackers && !public_bootstrap {
-                "magnet has no trackers; enable public peer discovery"
-            } else if had_trackers && !public_bootstrap {
-                "no tracker peers; public peer discovery is off for this magnet"
-            } else {
-                "no admissible tracker peers or explicit sources"
-            }));
-        }
-        let id = self
-            .add_magnet(uri, destination, existing, &discovered, public_bootstrap)
-            .await?;
-        let private_id = self.jobs.0.get(&id).and_then(|job| job.private_tracker);
-        let mut kept = Vec::new();
-        let mut to_ingest = Vec::new();
-        for (mut tracker, response) in announced {
-            if private_id.is_some_and(|active| tracker.origin_id != active) {
-                continue;
-            }
-            let index = self
-                .session
-                .add_tracker(id)
-                .map_err(|_| DriverError("tracker table full"))?;
-            let now = self.elapsed_s();
-            if let Some(response) = response {
-                let _ = self.session.tracker_success(
-                    id,
-                    index,
-                    now,
-                    response.interval,
-                    response.min_interval,
-                );
-                tracker.seeds = response.complete;
-                tracker.peers = response.incomplete;
-                tracker.started = true;
-                to_ingest.push((response, tracker.origin_id, tracker.local));
-            } else {
-                let _ = self.session.tracker_failure(id, index, now, 0);
-                tracker
-                    .last_error
-                    .get_or_insert_with(|| "announce failed".into());
-            }
-            kept.push(tracker);
-        }
-        if let Some(job) = self.jobs.0.get_mut(&id) {
-            job.trackers = kept;
-        }
-        // Metadata resolution used at most CANDIDATE_CAP of these peers; the
-        // pool keeps the rest for the dialer.
-        for (response, origin_id, local) in to_ingest {
-            self.ingest_peers(id, &response, PeerOrigin::OriginalTracker(origin_id), local);
-        }
-        self.augment_public(id).await;
-        Ok(id)
+        self.add_magnet_now(uri, destination, existing, sources, public_bootstrap, true)
+            .await
     }
 
     /// Add a job from `.torrent` bytes. The info dictionary is already in
@@ -2872,7 +3083,7 @@ impl Driver {
     ) -> Result<TorrentId> {
         let (torrent, hash) =
             ValidatedV1::from_torrent_bytes(bytes, &self.metadata_budget).map_err(DriverError)?;
-        if self.jobs.0.values().any(|job| job.torrent.hash() == hash) {
+        if self.knows_hash(hash) {
             return Err(DriverError("torrent already exists"));
         }
         if self.limits.download_jobs == 0 || self.limits.connections_per_job == 0 {
@@ -2980,7 +3191,7 @@ impl Driver {
         }
         self.augment_public(id).await;
         // The download-slot cap still applies: queue rather than refuse.
-        let rows = self.snapshot();
+        let rows = self.session_rows();
         let running = rows
             .jobs
             .iter()
@@ -3064,7 +3275,7 @@ impl Driver {
             }
         }
         for (id, index, manual) in due {
-            let running = self.snapshot().jobs.iter().any(|row| {
+            let running = self.session_rows().jobs.iter().any(|row| {
                 row.id == id
                     && matches!(
                         row.state,
@@ -3227,7 +3438,9 @@ impl Driver {
 
     /// Whether `source` may be dialed for this job now.
     fn dialable(&self, id: TorrentId, job: &Job, source: &PeerSource, now: u64) -> bool {
-        if job.preferences.get(&source.address.ip()) == Some(&PeerPreference::Block) {
+        if job.preferences.get(&source.address.ip()) == Some(&PeerPreference::Block)
+            || self.self_addresses.contains(&source.address)
+        {
             return false;
         }
         if job
@@ -3254,7 +3467,7 @@ impl Driver {
     /// per-job connection caps and [`HALF_OPEN_CAP`]. Never waits.
     fn fill_connections(&mut self) {
         let now = self.elapsed_s();
-        let rows = self.snapshot();
+        let rows = self.session_rows();
         let mut plan = Vec::new();
         for row in rows.jobs.iter() {
             if row.state != JobState::Downloading {
@@ -3335,9 +3548,13 @@ impl Driver {
                     continue;
                 }
             };
+            if self.is_own_peer_id(&connection) {
+                self.self_addresses.insert(done.source.address);
+                continue;
+            }
             let admissible = self.jobs.0.get(&done.torrent).is_some_and(|job| {
                 job.preferences.get(&done.source.address.ip()) != Some(&PeerPreference::Block)
-            }) && self.snapshot().jobs.iter().any(|row| {
+            }) && self.session_rows().jobs.iter().any(|row| {
                 row.id == done.torrent
                     && matches!(row.state, JobState::Downloading | JobState::Seeding)
             }) && self.wires.len() < self.limits.connections_total
@@ -3452,7 +3669,7 @@ impl Driver {
             return;
         }
         let now = self.elapsed_s();
-        let rows = self.snapshot();
+        let rows = self.session_rows();
         let mut due = Vec::new();
         for row in rows.jobs.iter() {
             let interval = match row.state {
@@ -3637,30 +3854,6 @@ impl Driver {
         }
     }
 
-    fn collect_peers(
-        &self,
-        response: &rbit::AnnounceResponse,
-        local: bool,
-        origin_id: u64,
-        discovered: &mut Vec<PeerSource>,
-    ) {
-        for address in response.peers.iter().chain(response.peers6.iter()).copied() {
-            if discovered.len() >= CANDIDATE_CAP {
-                break;
-            }
-            if !peer_allowed(address, local) {
-                continue;
-            }
-            if discovered.iter().any(|known| known.address == address) {
-                continue;
-            }
-            discovered.push(PeerSource {
-                address,
-                origin: PeerOrigin::OriginalTracker(origin_id),
-            });
-        }
-    }
-
     fn ingest_peers(
         &mut self,
         id: TorrentId,
@@ -3754,6 +3947,28 @@ impl Driver {
             }
         }
     }
+}
+
+/// Bind a TCP listener. An IPv6 address accepts IPv4-mapped peers too:
+/// `IPV6_V6ONLY` is cleared explicitly, since Linux defaults it off but
+/// Windows defaults it on. Unix sets `SO_REUSEADDR` as tokio's own `bind`
+/// does; Windows does not, where it would allow port hijacking.
+fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if address.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
 }
 
 impl Drop for Driver {
@@ -3930,6 +4145,333 @@ fn preference_rank(preference: PeerPreference) -> u8 {
     }
 }
 
+/// Everything a magnet's metadata resolution needs, owned, so it can run as
+/// a task while the coordinator keeps stepping other jobs.
+struct Resolve {
+    hash: [u8; 20],
+    /// Ask the magnet's trackers (and the DHT for a public bootstrap) first.
+    discover: bool,
+    trackers: Vec<String>,
+    allow_local: bool,
+    port: u16,
+    sources: Vec<PeerSource>,
+    public_bootstrap: bool,
+    dht: Option<Arc<rbit::DhtServer>>,
+    peer_id: [u8; 20],
+    encryption: PeerEncryption,
+    budget: ByteBudget,
+}
+
+/// Verified-size metadata and the connection that supplied it, plus what
+/// discovery learned on the way.
+struct Resolved {
+    source: PeerSource,
+    connection: PeerConnection,
+    metadata: crate::metadata::FetchedMetadata,
+    permitted: Vec<PeerSource>,
+    announced: Vec<(Tracked, Option<rbit::AnnounceResponse>)>,
+}
+
+/// Live counts from one magnet's metadata resolution, for its row.
+#[derive(Default)]
+struct PendingProgress {
+    /// Candidates connected and exchanging metadata right now.
+    connected: AtomicU32,
+    /// One more than the largest tracker-reported seed and leecher counts;
+    /// zero is unknown. Trackers overlap, so counts are never added.
+    seeds: AtomicU32,
+    peers: AtomicU32,
+}
+impl PendingProgress {
+    fn reset(&self) {
+        self.connected.store(0, Ordering::Relaxed);
+        self.seeds.store(0, Ordering::Relaxed);
+        self.peers.store(0, Ordering::Relaxed);
+    }
+    fn note_tracker(&self, seeds: Option<u32>, peers: Option<u32>) {
+        if let Some(seeds) = seeds {
+            self.seeds
+                .fetch_max(seeds.saturating_add(1), Ordering::Relaxed);
+        }
+        if let Some(peers) = peers {
+            self.peers
+                .fetch_max(peers.saturating_add(1), Ordering::Relaxed);
+        }
+    }
+}
+/// Counts one connected metadata candidate for as long as it lives.
+struct Connected(Arc<PendingProgress>);
+impl Connected {
+    fn new(progress: Arc<PendingProgress>) -> Self {
+        progress.connected.fetch_add(1, Ordering::Relaxed);
+        Self(progress)
+    }
+}
+impl Drop for Connected {
+    fn drop(&mut self) {
+        self.0.connected.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A magnet admitted by the user whose metadata is not installed yet. Its
+/// id is reserved in the session, so the row keeps it when it becomes a job.
+struct PendingMagnet {
+    hash: [u8; 20],
+    /// The magnet's `dn`, or the hex info hash when it has none.
+    name: Arc<str>,
+    destination: PathBuf,
+    existing: ExistingData,
+    public_bootstrap: bool,
+    discover: bool,
+    trackers: Vec<String>,
+    sources: Vec<PeerSource>,
+    /// The running resolution; `None` while paused or failed.
+    task: Option<JoinHandle<Result<Resolved>>>,
+    progress: Arc<PendingProgress>,
+    /// Metadata, Paused or Error.
+    state: JobState,
+    error: Option<&'static str>,
+}
+impl PendingMagnet {
+    fn row(&self, id: TorrentId) -> TorrentRow {
+        let estimate = |value: &AtomicU32| value.load(Ordering::Relaxed).checked_sub(1);
+        TorrentRow {
+            id,
+            name: Arc::clone(&self.name),
+            state: self.state,
+            wanted_bytes: 0,
+            verified_bytes: 0,
+            total_payload_downloaded: 0,
+            total_payload_uploaded: 0,
+            down_bps: 0,
+            up_bps: 0,
+            connected_seeds: 0,
+            connected_peers: self.progress.connected.load(Ordering::Relaxed),
+            estimated_seeds: estimate(&self.progress.seeds),
+            estimated_peers: estimate(&self.progress.peers),
+        }
+    }
+}
+
+/// Find peers for a magnet (when `discover`) and fetch its metadata from the
+/// first permitted candidate that supplies it. Up to [`METADATA_PARALLEL`]
+/// candidates are tried at once. The attempts are polled here rather than
+/// spawned, so dropping this future drops every connection and permit.
+async fn resolve_magnet(input: Resolve, progress: Arc<PendingProgress>) -> Result<Resolved> {
+    let Resolve {
+        hash,
+        discover,
+        trackers,
+        allow_local,
+        port,
+        sources,
+        public_bootstrap,
+        dht,
+        peer_id,
+        encryption,
+        budget,
+    } = input;
+    let mut discovered = Vec::new();
+    let mut announced = Vec::new();
+    if discover {
+        let mut originals = Vec::new();
+        for url in trackers.iter().take(crate::discovery::MAX_TRACKERS) {
+            let Ok(admitted) = crate::discovery::admit_tracker(url, allow_local).await else {
+                continue;
+            };
+            if originals
+                .iter()
+                .any(|known: &Tracked| known.url == admitted.tracker.url)
+            {
+                continue;
+            }
+            originals.push(Tracked {
+                url: admitted.tracker.url,
+                origin: "original",
+                origin_id: originals.len() as u64 + 1,
+                local: admitted.local,
+                seeds: None,
+                peers: None,
+                last_error: None,
+                started: false,
+                port_stale: false,
+            });
+        }
+        // The magnet's trackers announce concurrently, each bounded.
+        let mut tasks = JoinSet::new();
+        for (index, tracker) in originals.into_iter().enumerate() {
+            let url = tracker.url.clone();
+            tasks.spawn(async move {
+                let result = announce_detached(
+                    &url,
+                    allow_local,
+                    crate::announce::AnnounceRequest {
+                        info_hash: &hash,
+                        peer_id: &peer_id,
+                        port,
+                        uploaded: 0,
+                        downloaded: 0,
+                        left: UNKNOWN_LEFT,
+                        event: rbit::TrackerEvent::Started,
+                    },
+                )
+                .await;
+                (index, tracker, result)
+            });
+        }
+        let mut finished = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(item) = joined {
+                finished.push(item);
+            }
+        }
+        finished.sort_by_key(|(index, _, _)| *index);
+        for (_, mut tracker, result) in finished {
+            match result {
+                Ok(response) => {
+                    progress.note_tracker(response.complete, response.incomplete);
+                    collect_peers(&response, tracker.local, tracker.origin_id, &mut discovered);
+                    announced.push((tracker, Some(response)));
+                }
+                Err(failure) => {
+                    tracker.last_error = Some(failure.detail);
+                    announced.push((tracker, None));
+                }
+            }
+        }
+    }
+    for source in &sources {
+        if discovered.len() >= CANDIDATE_CAP {
+            break;
+        }
+        if !discovered
+            .iter()
+            .any(|known: &PeerSource| known.address == source.address)
+        {
+            discovered.push(*source);
+        }
+    }
+    let mut permitted: Vec<PeerSource> = discovered
+        .into_iter()
+        .filter(|source| {
+            matches!(source.origin, PeerOrigin::OriginalTracker(_)) || public_bootstrap
+        })
+        .collect();
+    // Trackers gave nothing: a public magnet may still find peers in the
+    // DHT. Strict bootstrap never asks it.
+    if discover
+        && permitted.is_empty()
+        && public_bootstrap
+        && let Some(dht) = dht
+        && let Ok(Ok(peers)) = timeout(DHT_LOOKUP_TIMEOUT, dht.get_peers(hash)).await
+    {
+        for address in peers {
+            if permitted.len() >= CANDIDATE_CAP {
+                break;
+            }
+            if peer_allowed(address, false)
+                && !permitted.iter().any(|known| known.address == address)
+            {
+                permitted.push(PeerSource {
+                    address,
+                    origin: PeerOrigin::Dht,
+                });
+            }
+        }
+    }
+    if permitted.is_empty() {
+        return Err(DriverError(if !discover {
+            "strict bootstrap requires an original-tracker source"
+        } else if trackers.is_empty() && !public_bootstrap {
+            "magnet has no trackers; enable public peer discovery"
+        } else if !trackers.is_empty() && !public_bootstrap {
+            "no tracker peers; public peer discovery is off for this magnet"
+        } else {
+            "no admissible tracker peers or explicit sources"
+        }));
+    }
+    type Attempt = std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<(PeerSource, PeerConnection, crate::metadata::FetchedMetadata)>,
+                > + Send,
+        >,
+    >;
+    let candidates = permitted.clone();
+    let resolution = timeout(METADATA_DEADLINE, async {
+        let mut queue = candidates.iter().copied();
+        let mut attempts: Vec<Attempt> = Vec::new();
+        loop {
+            while attempts.len() < METADATA_PARALLEL {
+                let Some(source) = queue.next() else {
+                    break;
+                };
+                let budget = budget.clone();
+                let progress = Arc::clone(&progress);
+                attempts.push(Box::pin(async move {
+                    let mut connection = dial_peer(source.address, hash, peer_id, encryption)
+                        .await
+                        .ok()?;
+                    let _live = Connected::new(progress);
+                    let metadata = fetch_metadata_budgeted(&mut connection, hash, &budget)
+                        .await
+                        .ok()?;
+                    Some((source, connection, metadata))
+                }));
+            }
+            if attempts.is_empty() {
+                return Err(DriverError("no permitted peer supplied valid metadata"));
+            }
+            let finished = std::future::poll_fn(|cx| {
+                for index in 0..attempts.len() {
+                    if let std::task::Poll::Ready(result) = attempts[index].as_mut().poll(cx) {
+                        drop(attempts.swap_remove(index));
+                        return std::task::Poll::Ready(result);
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            if let Some(found) = finished {
+                return Ok(found);
+            }
+        }
+    })
+    .await
+    .map_err(|_| DriverError("magnet resolution deadline exceeded"))??;
+    let (source, connection, metadata) = resolution;
+    Ok(Resolved {
+        source,
+        connection,
+        metadata,
+        permitted,
+        announced,
+    })
+}
+
+fn collect_peers(
+    response: &rbit::AnnounceResponse,
+    local: bool,
+    origin_id: u64,
+    discovered: &mut Vec<PeerSource>,
+) {
+    for address in response.peers.iter().chain(response.peers6.iter()).copied() {
+        if discovered.len() >= CANDIDATE_CAP {
+            break;
+        }
+        if !peer_allowed(address, local) {
+            continue;
+        }
+        if discovered.iter().any(|known| known.address == address) {
+            continue;
+        }
+        discovered.push(PeerSource {
+            address,
+            origin: PeerOrigin::OriginalTracker(origin_id),
+        });
+    }
+}
+
 /// Whether DHT and PEX may serve this job: a public torrent whose user did
 /// not ask for strict, tracker-only bootstrap.
 fn public_discovery(job: &Job) -> bool {
@@ -3965,7 +4507,8 @@ fn prepare_destination(path: &Path, existing: ExistingData) -> Result<PathBuf> {
             }
         }
     }
-    std::fs::canonicalize(path).map_err(|_| DriverError("destination validation failed"))
+    templartorrent_core::paths::canonical_dir(path)
+        .map_err(|_| DriverError("destination validation failed"))
 }
 
 /// Accept loop for one listening socket: each accepted connection gets its

@@ -583,3 +583,20 @@ record templartorrent.observation.internet-download-stall/3 : observation {
     watches [ "crates/templartorrent-engine/src/**", "integration/rbit-adapter/src/driver.rs" ]
     supersedes [ @templartorrent.observation.internet-download-stall/2 ]
 }
+
+record templartorrent.observation.windows-network-defaults/1 : observation {
+    title "Windows socket defaults broke dual-stack listening, UDP tracker replies and the DHT loop"
+    state verified
+    scope [ path "integration/rbit-adapter/**", path "vendor/rbit/src/dht/**" ]
+    statement """
+        Running the existing loopback suite on Windows 11 showed three platform differences that would hurt real downloads there. Each is now handled. (1) IPV6_V6ONLY defaults to on, so the client's [::]:0 listener accepted no IPv4 peers; driver::bind_listener now clears it with socket2. (2) A UDP datagram larger than the receive buffer fails with WSAEMSGSIZE (10040) instead of being truncated, which failed tracker replies with more than MAX_PEERS peers; udp_announce now treats it as a full buffer. (3) An ICMP port-unreachable from an earlier send arrives as WSAECONNRESET on the next recv_from, and vendor/rbit's DHT server returned on that error, so the first offline node stopped the whole DHT. It now logs and skips ConnectionReset and 10040. Separately, the mapped-port listener task was aborted but never joined at shutdown, so its socket could outlive Driver::shutdown; it is now awaited. fs::canonicalize returns verbatim \\?\ paths on Windows; destinations now go through core::paths::canonical_dir, which strips the prefix when that is equivalent.
+        """
+    observed_at git:bec11617c2f26a1a0204d5540e8036bd52558fc2
+    method command
+    watches [
+        "integration/rbit-adapter/src/driver.rs",
+        "integration/rbit-adapter/src/udp_announce.rs",
+        "vendor/rbit/src/dht/server.rs"
+    ]
+    derived_from [ @templartorrent.evidence.windows-port ]
+}

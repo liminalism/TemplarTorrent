@@ -1015,7 +1015,8 @@ fn prepare_destination(path: &Path) -> Result<PathBuf, String> {
         }
         Err(_) => return Err("destination validation failed".into()),
     }
-    std::fs::canonicalize(path).map_err(|_| "destination validation failed".to_string())
+    templartorrent_core::paths::canonical_dir(path)
+        .map_err(|_| "destination validation failed".to_string())
 }
 
 pub fn hex(bytes: &[u8]) -> String {

@@ -47,3 +47,13 @@ strip = "none"
 # rustls 0.23.46 with aws-lc-rs. See vendor/rbit/TEMPLARTORRENT-FORK.md.
 [patch.crates-io]
 rbit = { path = "vendor/rbit" }
+
+# Local liminalkit checkout on branch `windows-clipboard` (Windows text
+# clipboard through arboard). Temporary: replace with a pinned git rev once
+# that branch is pushed.
+[patch."https://github.com/liminalism/liminalkit"]
+liminalkit-raster = { path = "../liminalkit/crates/liminalkit-raster" }
+liminalkit-shell = { path = "../liminalkit/crates/liminalkit-shell" }
+liminalkit-text = { path = "../liminalkit/crates/liminalkit-text" }
+liminalkit-ui = { path = "../liminalkit/crates/liminalkit-ui" }
+liminalkit-windowing = { path = "../liminalkit/crates/liminalkit-windowing" }
