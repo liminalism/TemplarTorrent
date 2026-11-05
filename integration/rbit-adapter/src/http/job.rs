@@ -7,7 +7,6 @@
 //! completes and the counters the manager reads afterwards are written.
 
 use std::{
-    os::unix::fs::FileExt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -25,6 +24,43 @@ use super::{
     Validator, derive_name, hex, lock, plan_parts,
     transport::{self, Connection, Request, parse_url},
 };
+
+/// Positional read: `pread` on Unix, `ReadFile` with an offset on Windows.
+/// Neither depends on (Windows: nor serialises through) a shared cursor that
+/// any other reader or writer relies on.
+fn read_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+    }
+}
+
+/// Positional write of the whole buffer.
+#[cfg(unix)]
+fn write_all_at(file: &std::fs::File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buffer, offset)
+}
+
+/// Positional write of the whole buffer.
+#[cfg(windows)]
+fn write_all_at(file: &std::fs::File, mut buffer: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !buffer.is_empty() {
+        match std::os::windows::fs::FileExt::seek_write(file, buffer, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buffer = &buffer[n..];
+                offset += n as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 pub(super) struct Context {
     pub id: TorrentId,
@@ -332,8 +368,7 @@ fn hash_file(file: &std::fs::File, size: u64) -> Result<[u8; 32], String> {
         let want = buffer
             .len()
             .min(usize::try_from(size - offset).unwrap_or(usize::MAX));
-        let n = file
-            .read_at(&mut buffer[..want], offset)
+        let n = read_at(file, &mut buffer[..want], offset)
             .map_err(|error| format!("digest read failed: {error}"))?;
         if n == 0 {
             return Err("the file is shorter than the download".into());
@@ -567,7 +602,7 @@ async fn read_part(
             return Ok(received);
         }
         let offset = part.start + written;
-        if let Err(error) = shared.file.write_all_at(&buffer[..n], offset) {
+        if let Err(error) = write_all_at(&shared.file, &buffer[..n], offset) {
             return Err((
                 received,
                 Failure::Permanent(format!("write failed at byte {offset}: {error}")),

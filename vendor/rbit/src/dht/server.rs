@@ -508,7 +508,21 @@ impl DhtServer {
         loop {
             tokio::select! {
                 result = self.socket.recv_from(&mut buf) => {
-                    let (n, addr) = result?;
+                    let (n, addr) = match result {
+                        Ok(received) => received,
+                        // Windows delivers an ICMP port-unreachable for an
+                        // earlier query as WSAECONNRESET on the next read, and
+                        // an oversized datagram as WSAEMSGSIZE. Neither says
+                        // anything about this socket; keep serving.
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::ConnectionReset
+                                || error.raw_os_error() == Some(10040) =>
+                        {
+                            debug!("Ignoring transient DHT socket error: {}", error);
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     match DhtMessage::parse(&buf[..n]) {
                         Ok(msg) => {
                             self.handle_message(msg, addr).await;

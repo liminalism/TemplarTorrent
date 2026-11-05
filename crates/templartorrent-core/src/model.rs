@@ -75,6 +75,10 @@ pub struct TorrentRow {
 impl TorrentRow {
     /// None means unknown, not infinite or zero. Production UI uses a smoothed rate.
     pub fn eta_seconds(&self) -> Option<u64> {
+        // Size is unknown until a magnet's metadata arrives.
+        if self.state == JobState::Metadata {
+            return None;
+        }
         if self.verified_bytes >= self.wanted_bytes {
             return Some(0);
         }

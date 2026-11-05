@@ -886,6 +886,24 @@ async fn a_silent_connection_is_cut_and_retried_without_a_total_timeout() {
     );
 }
 
+/// Create a file symlink. Windows needs Developer Mode or the symlink
+/// privilege; without it the symlink half of a test is skipped, loudly.
+fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+    #[cfg(windows)]
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("skipping the symlink check: {error}");
+            false
+        }
+    }
+}
+
 #[tokio::test]
 async fn delete_data_removes_the_file_and_part_but_refuses_links() {
     let root = Root::new("delete");
@@ -907,7 +925,7 @@ async fn delete_data_removes_the_file_and_part_but_refuses_links() {
         key,
         UrlRecord::new(
             &server.url("/done.bin"),
-            root.dest().canonicalize().unwrap(),
+            templartorrent_core::paths::canonical_dir(&root.dest()).unwrap(),
             None
         )
         .key
@@ -944,13 +962,14 @@ async fn delete_data_removes_the_file_and_part_but_refuses_links() {
     let victim = root.0.join("victim.bin");
     std::fs::write(&victim, b"not yours").unwrap();
     std::fs::remove_file(&part).unwrap();
-    std::os::unix::fs::symlink(&victim, &part).unwrap();
-    let error = manager.remove(id, true).await.unwrap_err();
-    assert!(error.contains("symlink"), "{error}");
-    assert_eq!(read(&victim), b"not yours");
-    assert!(part.is_symlink(), "the link itself is untouched");
+    if symlink_file(&victim, &part) {
+        let error = manager.remove(id, true).await.unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert_eq!(read(&victim), b"not yours");
+        assert!(part.is_symlink(), "the link itself is untouched");
+        std::fs::remove_file(&part).unwrap();
+    }
     // A hardlinked partial is refused as well.
-    std::fs::remove_file(&part).unwrap();
     std::fs::hard_link(&victim, &part).unwrap();
     let error = manager.remove(id, true).await.unwrap_err();
     assert!(error.contains("hardlink"), "{error}");

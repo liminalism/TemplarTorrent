@@ -9,7 +9,6 @@ use std::{
     fs,
     io::Write,
     net::IpAddr,
-    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
 };
 
@@ -74,12 +73,13 @@ pub struct UiState {
 
 impl Default for UiState {
     fn default() -> Self {
-        // Transmission GTK's default main window; a larger opening leaves the
-        // download list empty.
+        // A wide window: the download list, the details pane and the peer
+        // table all fit without scrolling sideways. 1200×760 logical pixels
+        // still fits a 1080p screen at 125% scaling.
         Self {
-            width: 300,
-            height: 500,
-            split: 0.38,
+            width: 1200,
+            height: 760,
+            split: 0.45,
         }
     }
 }
@@ -88,6 +88,20 @@ impl UiState {
     pub const MIN_WIDTH: u32 = 260;
     pub const MIN_HEIGHT: u32 = 320;
     const MAX_SIDE: u32 = 16_384;
+
+    /// The default before 2026-11-05 (300×500). Never chosen by resizing,
+    /// only saved back unchanged, so it is read as "no preference".
+    const LEGACY_DEFAULT: (u32, u32) = (300, 500);
+
+    /// Replace a saved legacy default size with the current default, keeping
+    /// any size the user picked.
+    pub fn upgraded(self) -> Self {
+        if (self.width, self.height) == Self::LEGACY_DEFAULT {
+            Self::default()
+        } else {
+            self
+        }
+    }
 
     pub fn clamped(self) -> Self {
         Self {
@@ -117,8 +131,12 @@ impl SessionStore {
 
     fn ensure_dir(&self) -> Result<(), String> {
         fs::create_dir_all(&self.dir).map_err(|error| format!("session directory: {error}"))?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700));
+        // Windows: %LOCALAPPDATA% is already private to the user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700));
+        }
         Ok(())
     }
 
@@ -324,7 +342,7 @@ pub fn encode_record(record: &JobRecord) -> String {
     out.push('\n');
     out.push_str(&format!(
         "destination {}\n",
-        hex(record.destination.as_os_str().as_bytes())
+        hex(&path_bytes(&record.destination))
     ));
     out.push_str(&format!("paused {}\n", u8::from(record.paused)));
     out.push_str(&format!(
@@ -384,7 +402,7 @@ pub fn decode_record(
         match key {
             "destination" => {
                 let bytes = unhex(value)?;
-                let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                let path = path_from_bytes(bytes)?;
                 if !path.is_absolute() {
                     return Err("destination must be absolute".into());
                 }
@@ -626,7 +644,7 @@ pub fn encode_url(record: &UrlRecord) -> String {
     out.push_str(&format!("url {}\n", record.url));
     out.push_str(&format!(
         "destination {}\n",
-        hex(record.destination.as_os_str().as_bytes())
+        hex(&path_bytes(&record.destination))
     ));
     if let Some(name) = &record.name {
         out.push_str(&format!("name {}\n", hex(name.as_bytes())));
@@ -700,7 +718,7 @@ pub fn decode_url(text: &str, key: [u8; 20]) -> Result<UrlRecord, String> {
             }
             "destination" => {
                 let bytes = unhex(value)?;
-                let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                let path = path_from_bytes(bytes)?;
                 if !path.is_absolute() {
                     return Err("destination must be absolute".into());
                 }
@@ -1000,6 +1018,46 @@ fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
 
 /// Temporary file, data sync, rename, directory sync: readers see the old or
 /// the new content, never a torn file.
+/// Make a rename in `dir` durable. Windows cannot open a directory with
+/// `File::open` and commits the rename's metadata itself (NTFS journal), so
+/// there it is a no-op.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Bytes of a path for the hex-encoded record field: raw bytes on Unix, the
+/// UTF-8 text on Windows. Destinations there come from typed or browsed
+/// Unicode text, so the lossy branch only guards impossible input.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf, String> {
+    String::from_utf8(bytes)
+        .map(PathBuf::from)
+        .map_err(|_| "destination is not valid UTF-8".to_string())
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -1015,7 +1073,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
-        fs::File::open(parent)?.sync_all()
+        sync_dir(parent)
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&tmp);
@@ -1027,6 +1085,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Absolute, non-ASCII destinations in the platform's own form.
+    #[cfg(unix)]
+    const SHOWS: &str = "/tmp/shows/sÉason 1";
+    #[cfg(windows)]
+    const SHOWS: &str = r"C:\tmp\shows\sÉason 1";
+    #[cfg(unix)]
+    const DOWNLOADS: &str = "/tmp/downloads/isós";
+    #[cfg(windows)]
+    const DOWNLOADS: &str = r"C:\tmp\downloads\isós";
 
     struct Dir(PathBuf);
     impl Dir {
@@ -1049,7 +1117,7 @@ mod tests {
         JobRecord {
             info_hash: [7; 20],
             torrent: b"d4:infod4:name1:x12:piece lengthi16384e6:pieces0:6:lengthi0eee".to_vec(),
-            destination: PathBuf::from("/tmp/shows/sÉason 1"),
+            destination: PathBuf::from(SHOWS),
             paused: true,
             public_bootstrap: true,
             wanted: vec![true, false, true],
@@ -1113,10 +1181,7 @@ mod tests {
             let error = decode_record(&mutation, [1; 20], Vec::new()).unwrap_err();
             assert!(error.contains(reason), "{reason}: {error}");
         }
-        let relative = base.replace(
-            &hex("/tmp/shows/sÉason 1".as_bytes()),
-            &hex(b"relative/path"),
-        );
+        let relative = base.replace(&hex(SHOWS.as_bytes()), &hex(b"relative/path"));
         assert!(
             decode_record(&relative, [1; 20], Vec::new())
                 .unwrap_err()
@@ -1174,6 +1239,23 @@ mod tests {
         };
         assert!(encode_settings(&off).contains("port_mapping 0\n"));
         assert!(encode_settings(&off).contains("allow_local_urls 0\n"));
+    }
+
+    #[test]
+    fn a_saved_legacy_default_size_becomes_the_wide_default() {
+        let legacy = UiState {
+            width: 300,
+            height: 500,
+            split: 0.3797,
+        };
+        assert_eq!(legacy.upgraded(), UiState::default());
+        assert!(UiState::default().width > UiState::default().height);
+        let chosen = UiState {
+            width: 640,
+            height: 900,
+            split: 0.5,
+        };
+        assert_eq!(chosen.upgraded(), chosen, "a user's size is kept");
     }
 
     #[test]
@@ -1342,7 +1424,7 @@ mod tests {
         UrlRecord {
             key: [9; 20],
             url: "https://files.example/dir/image.iso?token=abc".into(),
-            destination: PathBuf::from("/tmp/downloads/isós"),
+            destination: PathBuf::from(DOWNLOADS),
             name: Some("image.iso".into()),
             size: Some(4_000_000),
             ranged: true,

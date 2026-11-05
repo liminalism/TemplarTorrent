@@ -18,13 +18,17 @@ use templartorrent_core::model::{
 };
 
 use crate::activate::Activator;
+use crate::flags;
 use crate::persist::{SessionStore, UiState};
-use crate::worker::{FileRow, ListenState, Request, SessionView, TrackerView, WorkerHandle};
+use crate::text::{t, tf};
+use crate::worker::{
+    FileRow, ListenState, PeerView, Request, SessionView, TrackerView, WorkerHandle,
+};
 use crate::workflow::{
-    self, AddSource, LimitForm, PREFERENCE_NOTE, affected_bytes, app_title, classify_source,
-    cooldown_text, country_text, eta_text, format_bytes, move_file, normalize_magnet,
-    parse_optional_sha256, preference_text, rank_label, rate_text, rtt_text, speed_cap,
-    validate_destination,
+    self, AddSource, LimitForm, affected_bytes, app_title, classify_source, cooldown_text,
+    country_text, eta_text, format_bytes, move_file, normalize_magnet, parse_optional_sha256,
+    percent_text, preference_note, preference_text, rank_label, rate_text, rtt_text, speed_cap,
+    state_text, unknown, validate_destination,
 };
 use templartorrent_rbit_adapter::driver::PeerEncryption;
 use templartorrent_rbit_adapter::http::UrlDetail;
@@ -68,49 +72,51 @@ fn app_theme(scale: Scale) -> Theme {
     }
 }
 
-fn download_columns(px: impl Fn(i32) -> i32, width: i32) -> Vec<Column> {
+/// What a job-list column shows. The titles are user text, so cells are
+/// matched on this, never on a title.
+#[derive(Clone, Copy)]
+enum JobColumn {
+    Name,
+    Progress,
+    Down,
+    Up,
+    Peers,
+    State,
+}
+
+fn download_columns(px: impl Fn(i32) -> i32, width: i32) -> (Vec<JobColumn>, Vec<Column>) {
     // 300 logical pixels is the opening width. Fixed columns beyond Name and
     // Progress would leave the name unreadably narrow until the window grows.
+    let mut kinds = vec![JobColumn::Name, JobColumn::Progress];
     let mut columns = vec![
-        Column::flex("Name", 4, Align::Left),
-        Column::fixed("Progress", px(72), Align::Left),
+        Column::flex(t("jobs.column_name"), 4, Align::Left),
+        Column::fixed(t("jobs.column_progress"), px(72), Align::Left),
     ];
     if width >= px(640) {
-        columns.push(Column::fixed("Down", px(72), Align::Right));
-        columns.push(Column::fixed("Up", px(72), Align::Right));
+        kinds.extend([JobColumn::Down, JobColumn::Up]);
+        columns.push(Column::fixed(t("jobs.column_down"), px(72), Align::Right));
+        columns.push(Column::fixed(t("jobs.column_up"), px(72), Align::Right));
     }
     if width >= px(760) {
-        columns.push(Column::fixed("Peers", px(64), Align::Left));
+        kinds.push(JobColumn::Peers);
+        columns.push(Column::fixed(t("jobs.column_peers"), px(64), Align::Left));
     }
     if width >= px(420) {
         // Right-aligned like the rates before it, so a right-aligned Up
         // value never runs into a left-aligned state name.
-        columns.push(Column::fixed("State", px(96), Align::Right));
+        kinds.push(JobColumn::State);
+        columns.push(Column::fixed(t("jobs.column_state"), px(96), Align::Right));
     }
-    columns
+    (kinds, columns)
 }
 
 fn progress_parts(row: &TorrentRow) -> (String, f64) {
     if row.wanted_bytes == 0 {
-        return ("—".into(), 0.0);
+        return (unknown().into(), 0.0);
     }
     let percent = row.verified_bytes.saturating_mul(100) / row.wanted_bytes;
     let fraction = (row.verified_bytes as f64 / row.wanted_bytes as f64).clamp(0.0, 1.0);
-    (format!("{percent}%"), fraction)
-}
-
-fn state_name(state: JobState) -> &'static str {
-    match state {
-        JobState::Queued => "Queued",
-        JobState::Metadata => "Metadata",
-        JobState::Checking => "Checking",
-        JobState::Downloading => "Downloading",
-        JobState::Complete => "Complete",
-        JobState::Seeding => "Seeding",
-        JobState::Paused => "Paused",
-        JobState::Removing => "Removing",
-        JobState::Error => "Error",
-    }
+    (percent_text(percent), fraction)
 }
 
 fn state_ink(state: JobState, accent: u32, good: u32, alarm: u32, dim: u32) -> u32 {
@@ -124,7 +130,7 @@ fn state_ink(state: JobState, accent: u32, good: u32, alarm: u32, dim: u32) -> u
 
 fn job_cells(
     job: &TorrentRow,
-    columns: &[Column],
+    kinds: &[JobColumn],
     accent: u32,
     good: u32,
     alarm: u32,
@@ -132,30 +138,40 @@ fn job_cells(
 ) -> Vec<Cell<'static>> {
     let (progress, fraction) = progress_parts(job);
     let state_colour = state_ink(job.state, accent, good, alarm, dim);
-    columns
+    kinds
         .iter()
-        .map(|column| match column.title.as_ref() {
-            "Name" => Cell::new(clean_label(&job.name, 160)),
-            "Progress" => Cell::meter(progress.clone(), fraction, accent),
-            "Down" => Cell::new(rate_text(job.down_bps)),
-            "Up" => Cell::new(rate_text(job.up_bps)),
-            "Peers" => Cell::new(format!("{} / {}", job.connected_seeds, job.connected_peers)),
-            "State" => Cell::coloured(state_name(job.state), state_colour),
-            _ => Cell::new(""),
+        .map(|kind| match kind {
+            JobColumn::Name => Cell::new(clean_label(&job.name, 160)),
+            JobColumn::Progress => Cell::meter(progress.clone(), fraction, accent),
+            JobColumn::Down => Cell::new(rate_text(job.down_bps)),
+            JobColumn::Up => Cell::new(rate_text(job.up_bps)),
+            JobColumn::Peers => Cell::new(tf(
+                "jobs.peers_cell",
+                &[
+                    ("seeds", &job.connected_seeds),
+                    ("peers", &job.connected_peers),
+                ],
+            )),
+            JobColumn::State => Cell::coloured(state_text(job.state), state_colour),
         })
         .collect()
 }
 
-const LIMIT_LABELS: [&str; 8] = [
-    "Download jobs",
-    "Seed jobs",
-    "Upload peer slots",
-    "Max connections",
-    "Max per job",
-    "Download kB/s (0 = unlimited)",
-    "Upload kB/s (0 = unlimited)",
-    "Payload memory MiB",
-];
+/// The Limits dialog's fields, in `LimitForm` order.
+const LIMIT_FIELDS: usize = 8;
+
+fn limit_labels() -> [&'static str; LIMIT_FIELDS] {
+    [
+        t("limits.label_download_jobs"),
+        t("limits.label_seed_jobs"),
+        t("limits.label_upload_slots"),
+        t("limits.label_connections"),
+        t("limits.label_per_job"),
+        t("limits.label_down_kb"),
+        t("limits.label_up_kb"),
+        t("limits.label_memory"),
+    ]
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -205,7 +221,7 @@ struct AddDialog {
 }
 
 struct LimitsDialog {
-    fields: [TextFieldState; 8],
+    fields: [TextFieldState; LIMIT_FIELDS],
     focus: usize,
     error: String,
 }
@@ -253,6 +269,12 @@ struct FrameState {
     selected: Option<TorrentId>,
 }
 
+/// Whether the Pause/Resume button resumes this job: paused, waiting for a
+/// slot, or failed (a failed magnet fetch is retried by Resume).
+fn resumable(state: JobState) -> bool {
+    matches!(state, JobState::Paused | JobState::Queued | JobState::Error)
+}
+
 struct Desktop {
     panes: Panes<Pane>,
     jobs_table: TableState,
@@ -280,6 +302,8 @@ struct Desktop {
     /// Window size in logical pixels as last rendered.
     logical_size: (f32, f32),
     store: Option<SessionStore>,
+    /// Native folder and .torrent pickers (Windows).
+    pickers: crate::picker::Pickers,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,6 +321,7 @@ impl Desktop {
             panes.split(root, Side::Bottom, Pane::Inspector, ui.split);
         }
         Self {
+            pickers: crate::picker::Pickers::default(),
             panes,
             jobs_table: TableState::new(),
             cursor: CursorShape::Default,
@@ -314,9 +339,15 @@ impl Desktop {
             applied: 0,
             seq: 0,
             inflight: None,
-            status: "Ready.".into(),
+            status: match crate::text::override_problem() {
+                Some((path, detail)) => tf(
+                    "status.messages_override_ignored",
+                    &[("path", &path.display()), ("detail", &detail)],
+                ),
+                None => t("status.ready").into(),
+            },
             last_title: String::new(),
-            pending_title: Some("TemplarTorrent".into()),
+            pending_title: Some(t("title.app").into()),
             waiting: VecDeque::new(),
             split: ui.split,
             logical_size: (ui.width as f32, ui.height as f32),
@@ -343,7 +374,9 @@ impl Desktop {
         }
     }
 
-    fn pump(&mut self) {
+    /// Apply worker acks and forwarded activations. Returns whether another
+    /// launch forwarded a payload this frame, so the window can come forward.
+    fn pump(&mut self) -> bool {
         let acks = self.client.view().acks;
         for ack in acks {
             if ack.seq <= self.applied {
@@ -352,10 +385,16 @@ impl Desktop {
             self.applied = ack.seq;
             self.apply_ack(ack);
         }
+        if let Some(picked) = self.pickers.poll() {
+            self.apply_pick(picked);
+        }
+        let mut activated = false;
         while let Some(payload) = self.activator.try_recv() {
             self.queue_activation(payload);
+            activated = true;
         }
         self.poll_space();
+        activated
     }
 
     fn apply_ack(&mut self, ack: crate::worker::Ack) {
@@ -374,7 +413,10 @@ impl Desktop {
             if add.pending_space == Some(ack.seq) {
                 add.pending_space = None;
                 consumed = true;
-                add.space = ack.space.map(format_bytes).unwrap_or_else(|| "—".into());
+                add.space = ack
+                    .space
+                    .map(format_bytes)
+                    .unwrap_or_else(|| unknown().into());
             }
             if add.pending_torrent == Some(ack.seq) {
                 add.pending_torrent = None;
@@ -400,7 +442,7 @@ impl Desktop {
             return;
         }
         if ack.message.is_empty() {
-            self.status = "Command accepted.".into();
+            self.status = t("status.command_accepted").into();
         } else {
             self.status = ack.message;
         }
@@ -467,7 +509,7 @@ impl Desktop {
             _ => Pending::Other,
         };
         if self.inflight.is_some() && !matches!(kind, Pending::Other) {
-            self.status = "the previous command is still running".into();
+            self.status = t("status.previous_running").into();
             return;
         }
         let seq = self.seq.wrapping_add(1);
@@ -479,7 +521,7 @@ impl Desktop {
         if !matches!(kind, Pending::Other) {
             self.inflight = Some((seq, kind));
         }
-        self.status = "Working…".into();
+        self.status = t("status.working").into();
     }
 
     fn send(&mut self, request: Request) -> Option<u64> {
@@ -491,7 +533,7 @@ impl Desktop {
             other => other,
         };
         if self.client.try_request(request).is_err() {
-            self.status = "command queue is full".into();
+            self.status = t("status.queue_full").into();
             return None;
         }
         self.seq = seq;
@@ -503,7 +545,7 @@ impl Desktop {
             self.open_activation(payload);
         } else {
             self.waiting.push_back(payload);
-            self.status = "another magnet is waiting for the Add dialog".into();
+            self.status = t("status.activation_waiting").into();
         }
     }
 
@@ -520,7 +562,7 @@ impl Desktop {
             browse_path: PathBuf::new(),
             entries: Vec::new(),
             browse_error: String::new(),
-            space: "—".into(),
+            space: unknown().into(),
             space_path: String::new(),
             pending_list: None,
             pending_space: None,
@@ -554,7 +596,7 @@ impl Desktop {
         }) && let Dialog::Add(add) = &mut self.dialog
         {
             add.pending_torrent = Some(seq);
-            add.error = "Reading the torrent file…".into();
+            add.error = t("add.reading_torrent").into();
         }
     }
 
@@ -603,7 +645,7 @@ impl Desktop {
             AddSource::Magnet(magnet) => {
                 if !digest.trim().is_empty() {
                     if let Dialog::Add(add) = &mut self.dialog {
-                        add.error = "a SHA-256 applies to a URL download, not a torrent".into();
+                        add.error = t("add.sha256_not_for_torrent").into();
                     }
                     return;
                 }
@@ -625,12 +667,12 @@ impl Desktop {
                 };
                 if sha256.is_some() && urls.len() > 1 {
                     if let Dialog::Add(add) = &mut self.dialog {
-                        add.error = "a SHA-256 applies to one URL; add a batch without it".into();
+                        add.error = t("add.sha256_one_url").into();
                     }
                     return;
                 }
                 if self.inflight.is_some() {
-                    self.status = "the previous command is still running".into();
+                    self.status = t("status.previous_running").into();
                     return;
                 }
                 let last = urls.len() - 1;
@@ -684,8 +726,19 @@ impl Desktop {
         };
         let path = add.torrent.text().trim().to_string();
         if path.is_empty() {
+            if crate::picker::Pickers::native() {
+                let start = crate::workflow::home_dir()
+                    .map(|home| home.join("Downloads"))
+                    .unwrap_or_default();
+                self.pickers.pick_torrent(
+                    t("add.pick_torrent_title").into(),
+                    t("add.pick_torrent_filter").into(),
+                    start,
+                );
+                return;
+            }
             if let Dialog::Add(add) = &mut self.dialog {
-                add.error = "choose a .torrent file".into();
+                add.error = t("add.choose_torrent").into();
             }
             return;
         }
@@ -695,7 +748,7 @@ impl Desktop {
         }) && let Dialog::Add(add) = &mut self.dialog
         {
             add.pending_torrent = Some(seq);
-            add.error = "Reading the torrent file…".into();
+            add.error = t("add.reading_torrent").into();
         }
     }
 
@@ -711,8 +764,7 @@ impl Desktop {
                 .parent()
                 .unwrap_or(std::path::Path::new("/"))
                 .to_path_buf()
-        } else if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
+        } else if let Some(home) = crate::workflow::home_dir() {
             if home.is_dir() {
                 home
             } else {
@@ -721,6 +773,11 @@ impl Desktop {
         } else {
             PathBuf::from("/")
         };
+        if crate::picker::Pickers::native() {
+            self.pickers
+                .pick_folder(t("add.pick_folder_title").into(), start);
+            return;
+        }
         if let Dialog::Add(add) = &mut self.dialog {
             add.browsing = true;
             add.browse_path = start.clone();
@@ -748,6 +805,27 @@ impl Desktop {
         self.request_list(path);
     }
 
+    /// Fill the Add dialog from a closed native picker. A cancel changes
+    /// nothing.
+    fn apply_pick(&mut self, picked: crate::picker::Picked) {
+        use crate::picker::Picked;
+        let Dialog::Add(add) = &mut self.dialog else {
+            return;
+        };
+        match picked {
+            Picked::Folder(Some(path)) => {
+                add.destination = TextFieldState::with_text(path.display().to_string());
+                add.space_path.clear();
+                add.focus = AddFocus::Destination;
+            }
+            Picked::Torrent(Some(path)) => {
+                add.torrent = TextFieldState::with_text(path.display().to_string());
+                self.load_torrent_field();
+            }
+            Picked::Folder(None) | Picked::Torrent(None) => {}
+        }
+    }
+
     fn use_folder(&mut self) {
         let Dialog::Add(add) = &self.dialog else {
             return;
@@ -763,7 +841,7 @@ impl Desktop {
 
     fn pause_or_resume(&mut self, view: &SessionView) {
         let Some(id) = self.selected else {
-            self.status = "select a torrent first".into();
+            self.status = t("status.select_torrent").into();
             return;
         };
         let paused = view
@@ -771,7 +849,7 @@ impl Desktop {
             .jobs
             .iter()
             .find(|job| job.id == id)
-            .is_some_and(|job| matches!(job.state, JobState::Paused | JobState::Queued));
+            .is_some_and(|job| resumable(job.state));
         if paused {
             self.submit(Command::Resume(id));
         } else {
@@ -781,11 +859,11 @@ impl Desktop {
 
     fn open_remove(&mut self, view: &SessionView) {
         let Some(id) = self.selected else {
-            self.status = "select a torrent first".into();
+            self.status = t("status.select_torrent").into();
             return;
         };
         let Some(job) = view.snapshot.jobs.iter().find(|job| job.id == id) else {
-            self.status = "select a torrent first".into();
+            self.status = t("status.select_torrent").into();
             return;
         };
         let bytes = if let Some(detail) = view
@@ -812,7 +890,7 @@ impl Desktop {
                 .destination
                 .clone()
                 .filter(|_| view.selected == Some(id))
-                .unwrap_or_else(|| "—".into()),
+                .unwrap_or_else(|| unknown().into()),
             bytes,
             delete_data: false,
             error: String::new(),
@@ -941,17 +1019,23 @@ impl Desktop {
                 .jobs
                 .iter()
                 .find(|job| self.selected == Some(job.id));
-            let pause_label = if selected_job.is_some_and(|job| job.state == JobState::Paused) {
-                "Resume"
+            let pause_label = if selected_job.is_some_and(|job| resumable(job.state)) {
+                t("toolbar.resume")
             } else {
-                "Pause"
+                t("toolbar.pause")
             };
             let selected_name = selected_job
                 .map(|job| clean_label(&job.name, 80))
-                .unwrap_or_else(|| "No torrent selected".into());
+                .unwrap_or_else(|| t("toolbar.no_selection").into());
             (pause_label, selected_name)
         };
-        let labels = ["Add", pause_label, "Remove", "Limits", "Settings"];
+        let labels = [
+            t("toolbar.add"),
+            pause_label,
+            t("toolbar.remove"),
+            t("toolbar.limits"),
+            t("toolbar.settings"),
+        ];
         // Minima hold the labels at the 13px body size inside a 300px window.
         let minima = [s.px(36), s.px(58), s.px(58), s.px(54), s.px(68)];
         let pad = s.px(4);
@@ -1019,30 +1103,26 @@ impl Desktop {
             })
             .count();
         let jobs = view.snapshot.jobs.len();
+        let down = rate_text(down);
+        let up = rate_text(up);
+        let down_limit = speed_cap(view.limits.download_kb_s);
+        let up_limit = speed_cap(view.limits.upload_kb_s);
+        let values: &[(&str, &dyn std::fmt::Display)] = &[
+            ("down", &down),
+            ("up", &up),
+            ("down_limit", &down_limit),
+            ("up_limit", &up_limit),
+            ("active", &active),
+            ("jobs", &jobs),
+        ];
         let footer = if area.w < ui.px(420) {
-            format!(
-                "Down {}   Up {}   {active}/{jobs}",
-                rate_text(down),
-                rate_text(up),
-            )
+            tf("status.footer_narrow", values)
         } else if area.w < ui.px(720) {
-            format!(
-                "Down {} / {}   Up {} / {}   {active}/{jobs}",
-                rate_text(down),
-                speed_cap(view.limits.download_kb_s),
-                rate_text(up),
-                speed_cap(view.limits.upload_kb_s),
-            )
+            tf("status.footer_medium", values)
         } else {
-            format!(
-                "Down: {} / {}    Up: {} / {}    {active} active / {jobs} jobs    {}    {}",
-                rate_text(down),
-                speed_cap(view.limits.download_kb_s),
-                rate_text(up),
-                speed_cap(view.limits.upload_kb_s),
-                listen_text(&view.listen),
-                self.status
-            )
+            let listen = listen_text(&view.listen);
+            let wide = [values, &[("listen", &listen), ("status", &self.status)]].concat();
+            tf("status.footer_wide", &wide)
         };
         ui.label(
             Rect::new(
@@ -1074,7 +1154,7 @@ impl Desktop {
                 (inner.w - s.px(24)).max(1),
                 caption_h,
             ),
-            "Downloads",
+            t("jobs.caption"),
             *body,
             INK,
             Align::Left,
@@ -1085,9 +1165,9 @@ impl Desktop {
             (inner.w - s.px(16)).max(1),
             (inner.h - caption_h - s.px(6)).max(1),
         );
-        let columns = download_columns(|logical| s.px(logical), table_area.w);
+        let (kinds, columns) = download_columns(|logical| s.px(logical), table_area.w);
         if !interactive {
-            self.paint_jobs_static(ui, view, table_area, &columns, body);
+            self.paint_jobs_static(ui, view, table_area, &kinds, &columns, body);
             return;
         }
         let keys: Vec<String> = view
@@ -1108,7 +1188,7 @@ impl Desktop {
         let outcome = ui.table(&mut self.jobs_table, table_area, &columns, &keys, |index| {
             let job = &jobs[index];
             Row {
-                cells: job_cells(job, &columns, accent, good, alarm, dim),
+                cells: job_cells(job, &kinds, accent, good, alarm, dim),
             }
         });
         let page = outcome.visible_rows.max(1);
@@ -1122,7 +1202,7 @@ impl Desktop {
                     table_area.w,
                     s.px(24),
                 ),
-                "No jobs. Add a magnet, a .torrent file or a URL.",
+                t("jobs.empty"),
                 *body,
                 MUTED,
                 Align::Left,
@@ -1153,6 +1233,7 @@ impl Desktop {
         ui: &mut Ui<'_>,
         view: &SessionView,
         area: Rect,
+        kinds: &[JobColumn],
         columns: &[Column],
         body: &TextStyle,
     ) {
@@ -1174,7 +1255,7 @@ impl Desktop {
         if view.snapshot.jobs.is_empty() {
             ui.label_styled(
                 Rect::new(area.x, area.y + header_h + ui.px(8), area.w, header_h),
-                "No jobs. Add a magnet, a .torrent file or a URL.",
+                t("jobs.empty"),
                 *body,
                 MUTED,
                 Align::Left,
@@ -1194,7 +1275,7 @@ impl Desktop {
             if self.selected == Some(job.id) {
                 ui.painter.fill_rect(row, SELECTED);
             }
-            let cells = job_cells(job, columns, accent, good, alarm, dim);
+            let cells = job_cells(job, kinds, accent, good, alarm, dim);
             let mut x = area.x;
             for ((column, width), cell) in columns.iter().zip(&widths).zip(cells.iter()) {
                 let bounds = Rect::new(x, top, *width, header_h);
@@ -1231,7 +1312,7 @@ impl Desktop {
                 (inner.w - s.px(24)).max(1),
                 caption_h,
             ),
-            "Status",
+            t("inspector.caption"),
             *body,
             INK,
             Align::Left,
@@ -1245,7 +1326,12 @@ impl Desktop {
                     s.px(470).min(inner.w),
                     s.px(36),
                 ),
-                &["Details", "Files", "Peers", "Trackers"],
+                &[
+                    t("inspector.tab_details"),
+                    t("inspector.tab_files"),
+                    t("inspector.tab_peers"),
+                    t("inspector.tab_trackers"),
+                ],
                 *body,
                 INK,
                 MUTED,
@@ -1282,7 +1368,13 @@ impl Desktop {
         interactive: bool,
     ) {
         let Some(job) = job else {
-            ui.label_styled(content, "Select a download.", *body, MUTED, Align::Left);
+            ui.label_styled(
+                content,
+                t("inspector.select_download"),
+                *body,
+                MUTED,
+                Align::Left,
+            );
             return;
         };
         if let Some(detail) = view
@@ -1294,7 +1386,7 @@ impl Desktop {
             return;
         }
         let ratio = if job.total_payload_downloaded == 0 {
-            "—".to_string()
+            unknown().to_string()
         } else {
             format!(
                 "{:.2}",
@@ -1304,53 +1396,59 @@ impl Desktop {
         let current = if view.selected == Some(job.id) {
             current_file(&view.files)
         } else {
-            "—"
+            unknown()
         };
         let reason = if job.state == JobState::Complete {
             view.seeding_reason.as_str()
         } else {
             ""
         };
+        let destination = view
+            .destination
+            .as_deref()
+            .filter(|_| view.selected == Some(job.id))
+            .unwrap_or(unknown());
+        let last_error = view
+            .last_error
+            .as_deref()
+            .filter(|_| view.selected == Some(job.id))
+            .unwrap_or(unknown());
         let lines = [
             clean_label(&job.name, 160),
-            format!("State: {:?}", job.state),
-            format!(
-                "Verified {} / {}    downloaded {}    uploaded {}",
-                format_bytes(job.verified_bytes),
-                format_bytes(job.wanted_bytes),
-                format_bytes(job.total_payload_downloaded),
-                format_bytes(job.total_payload_uploaded)
+            tf("details.state", &[("state", &state_text(job.state))]),
+            tf(
+                "details.bytes",
+                &[
+                    ("verified", &format_bytes(job.verified_bytes)),
+                    ("wanted", &format_bytes(job.wanted_bytes)),
+                    ("downloaded", &format_bytes(job.total_payload_downloaded)),
+                    ("uploaded", &format_bytes(job.total_payload_uploaded)),
+                ],
             ),
-            format!(
-                "Down: {}    Up: {}    ETA: {}    Ratio: {ratio}",
-                rate_text(job.down_bps),
-                rate_text(job.up_bps),
-                eta_text(job)
+            tf(
+                "details.rates",
+                &[
+                    ("down", &rate_text(job.down_bps)),
+                    ("up", &rate_text(job.up_bps)),
+                    ("eta", &eta_text(job)),
+                    ("ratio", &ratio),
+                ],
             ),
-            format!(
-                "Connected seeds {}    peers {}",
-                job.connected_seeds, job.connected_peers
+            tf(
+                "details.connected",
+                &[
+                    ("seeds", &job.connected_seeds),
+                    ("peers", &job.connected_peers),
+                ],
             ),
-            "Tracker seed and peer estimates are listed per tracker.".into(),
-            format!(
-                "Destination: {}",
-                view.destination
-                    .as_deref()
-                    .filter(|_| view.selected == Some(job.id))
-                    .unwrap_or("—")
-            ),
-            format!("Current file: {current}"),
-            format!(
-                "Last error: {}",
-                view.last_error
-                    .as_deref()
-                    .filter(|_| view.selected == Some(job.id))
-                    .unwrap_or("—")
-            ),
+            t("details.tracker_estimates").into(),
+            tf("details.destination", &[("path", &destination)]),
+            tf("details.current_file", &[("file", &current)]),
+            tf("details.last_error", &[("error", &last_error)]),
             if reason.is_empty() {
                 String::new()
             } else {
-                format!("Seeding: {reason}")
+                tf("details.seeding", &[("reason", &reason)])
             },
         ];
         let rowh = s.px(24);
@@ -1388,10 +1486,13 @@ impl Desktop {
         let mut retry = false;
         let mut cancel = false;
         if interactive {
-            retry = ui.button(Rect::new(content.x, content.y, s.px(90), s.px(26)), "Retry");
+            retry = ui.button(
+                Rect::new(content.x, content.y, s.px(90), s.px(26)),
+                t("details.retry"),
+            );
             cancel = ui.button(
                 Rect::new(content.x + s.px(98), content.y, s.px(90), s.px(26)),
-                "Cancel",
+                t("common.cancel"),
             );
         }
         let lines = url_detail_lines(job, detail);
@@ -1432,28 +1533,22 @@ impl Desktop {
             return;
         }
         if view.url_detail.is_some() {
-            ui.label_styled(
-                content,
-                "A URL download is one file; see Details.",
-                *body,
-                MUTED,
-                Align::Left,
-            );
+            ui.label_styled(content, t("files.url_one_file"), *body, MUTED, Align::Left);
             return;
         }
         let header = s.px(32);
         if interactive {
             let earlier = ui.button(
                 Rect::new(content.x, content.y, s.px(90), s.px(26)),
-                "Earlier",
+                t("files.earlier"),
             );
             let later = ui.button(
                 Rect::new(content.x + s.px(98), content.y, s.px(90), s.px(26)),
-                "Later",
+                t("files.later"),
             );
             let automatic = ui.button(
                 Rect::new(content.x + s.px(196), content.y, s.px(160), s.px(26)),
-                "Automatic order",
+                t("files.automatic"),
             );
             if earlier {
                 self.nudge(view, true);
@@ -1470,13 +1565,7 @@ impl Desktop {
             (content.h - header).max(1),
         );
         if view.files.is_empty() {
-            ui.label_styled(
-                list,
-                "This torrent has no files yet.",
-                *small,
-                MUTED,
-                Align::Left,
-            );
+            ui.label_styled(list, t("files.empty"), *small, MUTED, Align::Left);
             return;
         }
         // Pad files only align real files to pieces; they are not listed.
@@ -1525,7 +1614,7 @@ impl Desktop {
                     > 1;
             let mut rank = rank_label(file.rank, file.wanted, file.verified_bytes, file.length);
             if shared {
-                rank.push_str(" (shared)");
+                rank = tf("files.rank_shared", &[("rank", &rank)]);
             }
             ui.label_styled(
                 Rect::new(rect.x + rect.w / 2, rect.y, rect.w / 4, rect.h),
@@ -1536,12 +1625,14 @@ impl Desktop {
             );
             if !narrow {
                 let progress = if file.length == 0 {
-                    "—".into()
+                    unknown().into()
                 } else {
-                    format!(
-                        "{}/{}",
-                        format_bytes(file.verified_bytes),
-                        format_bytes(file.length)
+                    tf(
+                        "files.progress",
+                        &[
+                            ("verified", &format_bytes(file.verified_bytes)),
+                            ("length", &format_bytes(file.length)),
+                        ],
                     )
                 };
                 ui.label_styled(
@@ -1569,16 +1660,16 @@ impl Desktop {
 
     fn nudge(&mut self, view: &SessionView, earlier: bool) {
         let Some(id) = self.selected else {
-            self.status = "select a torrent first".into();
+            self.status = t("status.select_torrent").into();
             return;
         };
         let Some(index) = self.file_pick else {
-            self.status = "select a file first".into();
+            self.status = t("status.select_file").into();
             return;
         };
         let ranks: Vec<u32> = view.files.iter().map(|file| file.rank).collect();
         let Some(order) = move_file(&ranks, index, earlier) else {
-            self.status = "the file is already at that end of the order".into();
+            self.status = t("status.file_at_end").into();
             return;
         };
         self.submit(Command::SetFileOrder {
@@ -1604,7 +1695,7 @@ impl Desktop {
         small: &TextStyle,
         interactive: bool,
     ) {
-        let geo = format!("Country database: {}", view.geo_status);
+        let geo = tf("peers.country_database", &[("status", &view.geo_status)]);
         if let Some(message) = selection_message(self.selected, view.selected) {
             ui.label_styled(
                 Rect::new(content.x, content.y, content.w, s.px(22)),
@@ -1633,9 +1724,9 @@ impl Desktop {
             ui.label_styled(
                 Rect::new(content.x, content.y + s.px(28), content.w, s.px(24)),
                 if view.url_detail.is_some() {
-                    "A URL download has no peers; its connections are counted in Details."
+                    t("peers.url_none")
                 } else {
-                    "No connected peers."
+                    t("peers.empty")
                 },
                 *body,
                 MUTED,
@@ -1672,10 +1763,11 @@ impl Desktop {
             MUTED,
             Align::Left,
         );
-        let note_height = s.px(18) * PREFERENCE_NOTE.len() as i32;
+        let note = preference_note();
+        let note_height = s.px(18) * note.len() as i32;
         let with_note = content.h >= s.px(32) + note_height + s.px(44) * 4;
         if with_note {
-            for (line, text) in PREFERENCE_NOTE.iter().enumerate() {
+            for (line, text) in note.iter().enumerate() {
                 ui.label_styled(
                     Rect::new(
                         content.x,
@@ -1716,41 +1808,34 @@ impl Desktop {
                 pick = Some(index);
             }
             let remote = if peer.remote_choked {
-                "remote choked"
+                t("peers.remote_choked")
             } else {
-                "remote unchoked"
+                t("peers.remote_unchoked")
             };
             let local = if peer.we_choke {
-                "we choke"
+                t("peers.we_choke")
             } else {
-                "we unchoke"
+                t("peers.we_unchoke")
             };
             let interest = if peer.remote_interested {
-                "interested"
+                t("peers.remote_interested")
             } else {
-                "not interested"
+                t("peers.remote_not_interested")
             };
-            ui.label_styled(
-                Rect::new(rect.x, rect.y, rect.w, s.px(20)),
-                &format!(
-                    "[{}] {}    {}    {}",
-                    country_text(peer.country),
-                    peer.address,
-                    clean_label(&peer.client, 40),
-                    preference_text(peer.preference)
-                ),
-                *body,
-                INK,
-                Align::Left,
-            );
+            draw_peer_heading(ui, peer, rect, s, body);
             ui.label_styled(
                 Rect::new(rect.x, rect.y + s.px(20), rect.w, s.px(20)),
-                &format!(
-                    "{remote}, {local}, remote {interest}    down {}    up {}    rtt {}    bad {}",
-                    rate_text(peer.down_bps),
-                    rate_text(peer.up_bps),
-                    rtt_text(peer.rtt_us),
-                    peer.hash_failures
+                &tf(
+                    "peers.row_detail",
+                    &[
+                        ("remote", &remote),
+                        ("local", &local),
+                        ("interest", &interest),
+                        ("down", &rate_text(peer.down_bps)),
+                        ("up", &rate_text(peer.up_bps)),
+                        ("rtt", &rtt_text(peer.rtt_us)),
+                        ("bad", &peer.hash_failures),
+                    ],
                 ),
                 *small,
                 MUTED,
@@ -1775,7 +1860,7 @@ impl Desktop {
             return;
         };
         let Some(peer) = view.peers.get(index) else {
-            self.status = "Select a peer first.".into();
+            self.status = t("status.select_peer").into();
             return;
         };
         self.submit(Command::SetPeerPreference {
@@ -1800,20 +1885,14 @@ impl Desktop {
             return;
         }
         if view.url_detail.is_some() {
-            ui.label_styled(
-                content,
-                "A URL download has no trackers.",
-                *body,
-                MUTED,
-                Align::Left,
-            );
+            ui.label_styled(content, t("trackers.url_none"), *body, MUTED, Align::Left);
             return;
         }
         let mut reannounce = false;
         if interactive
             && ui.button(
                 Rect::new(content.x, content.y, s.px(140), s.px(26)),
-                "Reannounce",
+                t("trackers.reannounce"),
             )
         {
             reannounce = true;
@@ -1825,7 +1904,7 @@ impl Desktop {
                 (content.w - s.px(150)).max(1),
                 s.px(26),
             ),
-            "Manual refresh uses the same cooldown as a periodic announce.",
+            t("trackers.manual_note"),
             *small,
             MUTED,
             Align::Left,
@@ -1833,7 +1912,7 @@ impl Desktop {
         if view.trackers.is_empty() {
             ui.label_styled(
                 Rect::new(content.x, content.y + s.px(36), content.w, s.px(24)),
-                "No trackers yet.",
+                t("trackers.empty"),
                 *body,
                 MUTED,
                 Align::Left,
@@ -1880,13 +1959,13 @@ impl Desktop {
             return;
         };
         let Some(tracker) = view.trackers.get(self.tracker_pick) else {
-            self.status = "select a tracker first".into();
+            self.status = t("status.select_tracker").into();
             return;
         };
         if view.elapsed_s < tracker.manual_due_s {
-            self.status = format!(
-                "reannounce is still inside its cooldown ({} s)",
-                tracker.manual_due_s - view.elapsed_s
+            self.status = tf(
+                "status.reannounce_cooldown",
+                &[("seconds", &(tracker.manual_due_s - view.elapsed_s))],
             );
             return;
         }
@@ -1912,7 +1991,7 @@ impl Desktop {
         if tab {
             match &mut self.dialog {
                 Dialog::Add(add) if !add.browsing => add.focus = add.focus.next(),
-                Dialog::Limits(limits) => limits.focus = (limits.focus + 1) % LIMIT_LABELS.len(),
+                Dialog::Limits(limits) => limits.focus = (limits.focus + 1) % LIMIT_FIELDS,
                 _ => {}
             }
         }
@@ -1944,7 +2023,7 @@ impl Desktop {
         if add.browsing {
             ui.label_styled(
                 Rect::new(inner.x, inner.y, inner.w, s.px(24)),
-                "Choose a folder",
+                t("add.browse_title"),
                 *body,
                 INK,
                 Align::Left,
@@ -1958,15 +2037,15 @@ impl Desktop {
             );
             let parent = ui.button(
                 Rect::new(inner.x, inner.y + s.px(54), s.px(90), s.px(26)),
-                "Parent",
+                t("add.browse_parent"),
             );
             let use_this = ui.button(
                 Rect::new(inner.x + s.px(100), inner.y + s.px(54), s.px(150), s.px(26)),
-                "Use this folder",
+                t("add.browse_use"),
             );
             let cancel = ui.button(
                 Rect::new(inner.x + s.px(260), inner.y + s.px(54), s.px(90), s.px(26)),
-                "Back",
+                t("add.browse_back"),
             );
             if !add.browse_error.is_empty() {
                 ui.label_styled(
@@ -2013,14 +2092,14 @@ impl Desktop {
         }
         ui.label_styled(
             Rect::new(inner.x, inner.y, inner.w, s.px(24)),
-            "Add download",
+            t("add.title"),
             *body,
             INK,
             Align::Left,
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(32), inner.w, s.px(18)),
-            "Magnet, or one or more http(s) URLs separated by spaces",
+            t("add.source_label"),
             *small,
             MUTED,
             Align::Left,
@@ -2046,13 +2125,13 @@ impl Desktop {
         ui.text_field(
             &mut add.magnet,
             magnet_rect,
-            "magnet:?xt=urn:btih:… or https://…",
+            t("add.source_hint"),
             magnet_focus,
             false,
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(86), inner.w, s.px(18)),
-            "Or a .torrent file",
+            t("add.torrent_label"),
             *small,
             MUTED,
             Align::Left,
@@ -2060,7 +2139,7 @@ impl Desktop {
         ui.text_field(
             &mut add.torrent,
             torrent_rect,
-            "path ending in .torrent",
+            t("add.torrent_hint"),
             torrent_focus,
             false,
         );
@@ -2071,11 +2150,11 @@ impl Desktop {
                 s.px(100),
                 s.px(28),
             ),
-            "Load",
+            t("add.load"),
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(142), inner.w, s.px(18)),
-            "Destination folder",
+            t("add.destination_label"),
             *small,
             MUTED,
             Align::Left,
@@ -2083,7 +2162,7 @@ impl Desktop {
         ui.text_field(
             &mut add.destination,
             destination_rect,
-            "new or existing folder",
+            t("add.destination_hint"),
             dest_focus,
             false,
         );
@@ -2094,18 +2173,18 @@ impl Desktop {
                 s.px(100),
                 s.px(28),
             ),
-            "Browse",
+            t("add.browse"),
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(196), inner.w, s.px(20)),
-            &format!("Available: {}", add.space),
+            &tf("add.available", &[("space", &add.space)]),
             *small,
             MUTED,
             Align::Left,
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(216), inner.w, s.px(36)),
-            "A missing folder is created. An existing folder is rechecked. The folder itself is never deleted.",
+            t("add.folder_note"),
             *small,
             MUTED,
             Align::Left,
@@ -2114,20 +2193,25 @@ impl Desktop {
         if ui.checkbox(
             Rect::new(inner.x, inner.y + s.px(258), inner.w, s.px(28)),
             &mut bootstrap,
-            "Public peer discovery for this magnet",
+            t("add.public_discovery"),
         ) {
             add.public_bootstrap = bootstrap;
         }
         ui.label_styled(
-            Rect::new(inner.x + s.px(28), inner.y + s.px(286), inner.w - s.px(28), s.px(32)),
-            "Separate from the public tracker list. Unknown metadata does not prove the torrent is public. Not used for URLs.",
+            Rect::new(
+                inner.x + s.px(28),
+                inner.y + s.px(286),
+                inner.w - s.px(28),
+                s.px(32),
+            ),
+            t("add.public_note"),
             *small,
             MUTED,
             Align::Left,
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(322), inner.w, s.px(18)),
-            "SHA-256 of the file (optional, one URL only; checked before the job completes)",
+            t("add.sha256_label"),
             *small,
             MUTED,
             Align::Left,
@@ -2135,7 +2219,7 @@ impl Desktop {
         ui.text_field(
             &mut add.digest,
             digest_rect,
-            "64 hexadecimal digits",
+            t("add.sha256_hint"),
             digest_focus,
             false,
         );
@@ -2161,7 +2245,7 @@ impl Desktop {
         }
         let add_clicked = ui.button(
             Rect::new(inner.x, inner.y + inner.h - s.px(36), s.px(120), s.px(28)),
-            "Add",
+            t("add.confirm"),
         );
         let cancel = ui.button(
             Rect::new(
@@ -2170,7 +2254,7 @@ impl Desktop {
                 s.px(120),
                 s.px(28),
             ),
-            "Cancel",
+            t("common.cancel"),
         );
         if load {
             self.load_torrent_field();
@@ -2199,19 +2283,19 @@ impl Desktop {
         };
         ui.label_styled(
             Rect::new(inner.x, inner.y, inner.w, s.px(24)),
-            "Limits",
+            t("limits.title"),
             *body,
             INK,
             Align::Left,
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(26), inner.w, s.px(32)),
-            "0 kB/s means unlimited. 0 job slots pause new work in that queue. Payload memory is an admission budget, not a measured RSS.",
+            t("limits.note"),
             *small,
             MUTED,
             Align::Left,
         );
-        for (index, label) in LIMIT_LABELS.iter().enumerate() {
+        for (index, label) in limit_labels().iter().enumerate() {
             let y = inner.y + s.px(64) + index as i32 * s.px(48);
             ui.label_styled(
                 Rect::new(inner.x, y, inner.w, s.px(16)),
@@ -2243,7 +2327,7 @@ impl Desktop {
         }
         let apply = ui.button(
             Rect::new(inner.x, inner.y + inner.h - s.px(36), s.px(120), s.px(28)),
-            "Apply",
+            t("common.apply"),
         );
         let cancel = ui.button(
             Rect::new(
@@ -2252,7 +2336,7 @@ impl Desktop {
                 s.px(120),
                 s.px(28),
             ),
-            "Cancel",
+            t("common.cancel"),
         );
         if cancel {
             self.close_dialog();
@@ -2276,7 +2360,7 @@ impl Desktop {
         };
         ui.label_styled(
             Rect::new(inner.x, inner.y, inner.w, s.px(28)),
-            &format!("Remove {}?", dialog.name),
+            &tf("remove.title", &[("name", &dialog.name)]),
             *body,
             INK,
             Align::Left,
@@ -2285,24 +2369,24 @@ impl Desktop {
         if ui.checkbox(
             Rect::new(inner.x, inner.y + s.px(40), inner.w, s.px(28)),
             &mut delete_data,
-            "Also delete downloaded data",
+            t("remove.delete_data"),
         ) {
             dialog.delete_data = delete_data;
         }
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(76), inner.w, s.px(22)),
-            &format!("Path: {}", clean_label(&dialog.path, 140)),
+            &tf("remove.path", &[("path", &clean_label(&dialog.path, 140))]),
             *small,
             MUTED,
             Align::Left,
         );
         let effect = if dialog.delete_data {
-            format!(
-                "Deletes {} of this torrent's files only. The destination folder stays.",
-                format_bytes(dialog.bytes)
+            tf(
+                "remove.effect_delete",
+                &[("size", &format_bytes(dialog.bytes))],
             )
         } else {
-            "Downloaded files stay on disk. This is the safe default.".into()
+            t("remove.effect_keep").into()
         };
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(104), inner.w, s.px(44)),
@@ -2322,7 +2406,7 @@ impl Desktop {
         }
         let remove = ui.button(
             Rect::new(inner.x, inner.y + inner.h - s.px(36), s.px(120), s.px(28)),
-            "Remove",
+            t("remove.confirm"),
         );
         let cancel = ui.button(
             Rect::new(
@@ -2331,7 +2415,7 @@ impl Desktop {
                 s.px(120),
                 s.px(28),
             ),
-            "Cancel",
+            t("common.cancel"),
         );
         let delete_data = dialog.delete_data;
         let id = dialog.id;
@@ -2358,7 +2442,7 @@ impl Desktop {
         };
         ui.label_styled(
             Rect::new(inner.x, inner.y, inner.w, s.px(24)),
-            "Settings",
+            t("settings.title"),
             *body,
             INK,
             Align::Left,
@@ -2367,13 +2451,13 @@ impl Desktop {
         if ui.checkbox(
             Rect::new(inner.x, inner.y + s.px(36), inner.w, s.px(28)),
             &mut allow,
-            "Allow local and private tracker addresses",
+            t("settings.allow_local"),
         ) {
             dialog.allow_local = allow;
         }
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(68), inner.w, s.px(36)),
-            "Off by default. Applies to the next magnet. Automatically added public trackers still refuse loopback, link-local, and private addresses.",
+            t("settings.allow_local_note"),
             *small,
             MUTED,
             Align::Left,
@@ -2382,16 +2466,18 @@ impl Desktop {
         if ui.checkbox(
             Rect::new(inner.x, inner.y + s.px(104), inner.w, s.px(28)),
             &mut allow_urls,
-            "Allow local and private addresses for URL downloads (--allow-local-urls)",
+            t("settings.allow_local_urls"),
         ) {
             dialog.allow_local_urls = allow_urls;
         }
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(136), inner.w, s.px(44)),
-            &format!(
-                "Public tracker list: {} URL(s) from {}. An empty file adds nothing.",
-                view.public_tracker_count,
-                clean_label(&view.public_tracker_path, 120)
+            &tf(
+                "settings.public_trackers",
+                &[
+                    ("count", &view.public_tracker_count),
+                    ("path", &clean_label(&view.public_tracker_path, 120)),
+                ],
             ),
             *small,
             MUTED,
@@ -2399,11 +2485,11 @@ impl Desktop {
         );
         let reload = ui.button(
             Rect::new(inner.x, inner.y + s.px(188), s.px(180), s.px(28)),
-            "Reload tracker list",
+            t("settings.reload_trackers"),
         );
         ui.label_styled(
             Rect::new(inner.x, inner.y + s.px(232), inner.w, s.px(20)),
-            "Listen port (TCP, IPv4 and IPv6). A change applies after a restart.",
+            t("settings.listen_port_label"),
             *small,
             MUTED,
             Align::Left,
@@ -2419,7 +2505,7 @@ impl Desktop {
         if ui.checkbox(
             Rect::new(inner.x, inner.y + s.px(290), inner.w, s.px(28)),
             &mut port_mapping,
-            "Map the listen port on my router (UPnP / NAT-PMP)",
+            t("settings.port_mapping"),
         ) {
             dialog.port_mapping = port_mapping;
         }
@@ -2433,9 +2519,9 @@ impl Desktop {
         let cycle = ui.button(
             Rect::new(inner.x, inner.y + s.px(386), s.px(300), s.px(28)),
             match dialog.encryption {
-                PeerEncryption::PreferEncrypted => "Encryption: prefer encrypted",
-                PeerEncryption::RequireEncrypted => "Encryption: require encrypted",
-                PeerEncryption::PlaintextOnly => "Encryption: plaintext only",
+                PeerEncryption::PreferEncrypted => t("settings.encryption_prefer"),
+                PeerEncryption::RequireEncrypted => t("settings.encryption_require"),
+                PeerEncryption::PlaintextOnly => t("settings.encryption_plaintext"),
             },
         );
         if cycle {
@@ -2456,7 +2542,7 @@ impl Desktop {
         }
         let apply = ui.button(
             Rect::new(inner.x, inner.y + inner.h - s.px(36), s.px(120), s.px(28)),
-            "Apply",
+            t("common.apply"),
         );
         let close = ui.button(
             Rect::new(
@@ -2465,7 +2551,7 @@ impl Desktop {
                 s.px(120),
                 s.px(28),
             ),
-            "Close",
+            t("common.close"),
         );
         let allow = dialog.allow_local;
         let allow_urls = dialog.allow_local_urls;
@@ -2475,16 +2561,16 @@ impl Desktop {
         let bound_port = dialog.bound_port;
         if reload {
             if self.client.try_request(Request::ReloadTrackers).is_ok() {
-                self.status = "Reloaded the public tracker list.".into();
+                self.status = t("status.trackers_reloaded").into();
             } else {
-                self.status = "command queue is full".into();
+                self.status = t("status.queue_full").into();
             }
         } else if apply {
             let port = match port_text.parse::<u16>() {
                 Ok(port) if port >= 1024 => port,
                 _ => {
                     if let Dialog::Settings(dialog) = &mut self.dialog {
-                        dialog.error = "Listen port must be 1024 to 65535.".into();
+                        dialog.error = t("settings.port_invalid").into();
                     }
                     return;
                 }
@@ -2510,17 +2596,17 @@ impl Desktop {
                         .try_request(Request::AllowLocalUrls(allow_urls))
                         .is_err())
             {
-                self.status = "command queue is full".into();
+                self.status = t("status.queue_full").into();
                 return;
             }
             if self.client.try_request(Request::AllowLocal(allow)).is_ok() {
                 self.status = if allow {
-                    "Local trackers are allowed for the next magnet.".into()
+                    t("status.local_trackers_on").into()
                 } else {
-                    "Local trackers are off.".into()
+                    t("status.local_trackers_off").into()
                 };
             } else {
-                self.status = "command queue is full".into();
+                self.status = t("status.queue_full").into();
             }
             self.close_dialog();
         } else if close {
@@ -2534,72 +2620,233 @@ fn selection_message(
     published: Option<TorrentId>,
 ) -> Option<&'static str> {
     if selected.is_none() {
-        Some("Select a download.")
+        Some(t("inspector.select_download"))
     } else if published != selected {
-        Some("Loading details…")
+        Some(t("inspector.loading"))
     } else {
         None
+    }
+}
+
+/// A peer row's first line: the country flag, then the country code,
+/// address, resolved client and preference. The flag slot is reserved even
+/// when empty so addresses line up; the code stays in the text, so an
+/// unknown or flagless country still reads `[--]` or `[XK]`.
+fn draw_peer_heading(ui: &mut Ui<'_>, peer: &PeerView, rect: Rect, s: Scale, body: &TextStyle) {
+    let flag = peer_flag_rect(rect, s);
+    if flags::draw_flag(&mut ui.painter, peer.country, flag) {
+        ui.painter.stroke_rect(flag.inset(-1), 1, EDGE);
+    }
+    let text_x = rect.x + s.px(22);
+    ui.label_styled(
+        Rect::new(text_x, rect.y, (rect.right() - text_x).max(1), s.px(20)),
+        &tf(
+            "peers.row_heading",
+            &[
+                ("country", &country_text(peer.country)),
+                ("address", &peer.address),
+                ("client", &clean_label(&peer.client, 40)),
+                ("preference", &preference_text(peer.preference)),
+            ],
+        ),
+        *body,
+        INK,
+        Align::Left,
+    );
+}
+
+/// 16x12 logical (the 4:3 flag-icons shape), centred in the 20-pixel line.
+fn peer_flag_rect(row: Rect, s: Scale) -> Rect {
+    Rect::new(
+        row.x + s.px(1),
+        row.y + (s.px(20) - s.px(12)) / 2,
+        s.px(16),
+        s.px(12),
+    )
+}
+
+#[cfg(test)]
+mod peer_flag_tests {
+    //! Draws a real peer heading through PixelKit's `Ui` into an offscreen
+    //! buffer and checks where the flag pixels land.
+    use super::{EDGE, PANEL, draw_peer_heading, peer_flag_rect};
+    use crate::worker::PeerView;
+    use liminalkit_raster::{Painter, RasterKernel, Rect, WindowBuffer};
+    use liminalkit_shell::{Input, Scale};
+    use liminalkit_text::TextCache;
+    use liminalkit_text::TextStyle;
+    use liminalkit_text::font::{Face, FaceId, FontSet};
+    use liminalkit_ui::Ui;
+    use templartorrent_core::model::PeerPreference;
+
+    fn fonts() -> &'static FontSet {
+        static FONTS: std::sync::OnceLock<&'static FontSet> = std::sync::OnceLock::new();
+        FONTS.get_or_init(|| {
+            let path = crate::workflow::resolve_font(None).expect("a TrueType font");
+            let bytes: &'static [u8] = Box::leak(std::fs::read(path).expect("read font").into());
+            let face: &'static Face = Box::leak(Box::new(Face::from_bytes(bytes).expect("font")));
+            let mut fonts = FontSet::new();
+            fonts.add(face);
+            Box::leak(Box::new(fonts))
+        })
+    }
+
+    fn peer(country: Option<[u8; 2]>) -> PeerView {
+        PeerView {
+            address: "192.0.2.7:51413".into(),
+            socket: "192.0.2.7:51413".parse().unwrap(),
+            preference: PeerPreference::Normal,
+            client: "qBittorrent 4.6.2".into(),
+            down_bps: 0,
+            up_bps: 0,
+            rtt_us: None,
+            hash_failures: 0,
+            country,
+            remote_choked: true,
+            remote_interested: false,
+            we_choke: true,
+        }
+    }
+
+    /// Render one heading per peer, 44 px apart, at `s`; return the buffer.
+    fn render(peers: &[PeerView], s: Scale) -> WindowBuffer {
+        let mut buffer = WindowBuffer::new(s.px(480) as u32, s.px(44) as u32 * peers.len() as u32);
+        let mut text = TextCache::new(fonts());
+        let mut input = Input::new();
+        let mut kernel = RasterKernel::new();
+        let mut ui = Ui::new(
+            Painter::new(&mut buffer),
+            &mut text,
+            &mut input,
+            super::app_theme(s),
+            s,
+            &mut kernel,
+        );
+        ui.painter.clear(PANEL);
+        let body = TextStyle::new(FaceId(0), s.font(13.0));
+        for (index, peer) in peers.iter().enumerate() {
+            let row = Rect::new(0, s.px(44) * index as i32, s.px(480), s.px(44));
+            draw_peer_heading(&mut ui, peer, row, s, &body);
+        }
+        drop(ui);
+        buffer
+    }
+
+    fn rgb(buffer: &WindowBuffer, x: i32, y: i32) -> u32 {
+        buffer.pixels[y as usize * buffer.width as usize + x as usize] & 0x00ff_ffff
+    }
+
+    #[test]
+    fn flag_is_drawn_left_of_the_peer_text_only_for_a_known_country() {
+        for s in [Scale::ONE, Scale::new(2.0)] {
+            let rows = [peer(Some(*b"DE")), peer(None), peer(Some(*b"ZZ"))];
+            let buffer = render(&rows, s);
+            let flag = peer_flag_rect(Rect::new(0, 0, s.px(480), s.px(44)), s);
+            // Germany: black, red, gold bands, framed by the edge colour.
+            let cx = flag.x + flag.w / 2;
+            assert_eq!(rgb(&buffer, cx, flag.y + flag.h / 6), 0x000001);
+            assert_eq!(rgb(&buffer, cx, flag.y + flag.h / 2), 0xff0000);
+            assert_eq!(rgb(&buffer, cx, flag.y + flag.h * 5 / 6), 0xffcc00);
+            assert_eq!(rgb(&buffer, flag.x - 1, flag.y + 2), EDGE);
+            // The text starts after the flag slot, and the row has text.
+            let text_x = s.px(22);
+            let inked = |top: i32| {
+                (top..top + s.px(20))
+                    .flat_map(|y| (text_x..s.px(480)).map(move |x| (x, y)))
+                    .filter(|&(x, y)| rgb(&buffer, x, y) != PANEL)
+                    .count()
+            };
+            assert!(inked(0) > 0, "known-country row has no text");
+            // Unknown and flagless rows: the slot stays blank, text remains.
+            for row in 1..3 {
+                let top = s.px(44) * row;
+                for y in top..top + s.px(20) {
+                    for x in 0..text_x - s.px(2) {
+                        assert_eq!(rgb(&buffer, x, y), PANEL, "row {row} slot pixel ({x},{y})");
+                    }
+                }
+                assert!(inked(top) > 0, "row {row} lost its text");
+            }
+        }
     }
 }
 
 /// The Details lines for a URL job. Unknown values are an em dash: an
 /// unknown size is never shown as zero.
 pub(crate) fn url_detail_lines(job: &TorrentRow, detail: &UrlDetail) -> Vec<String> {
-    let size = detail.size.map(format_bytes).unwrap_or_else(|| "—".into());
+    let size = detail
+        .size
+        .map(format_bytes)
+        .unwrap_or_else(|| unknown().into());
     let percent = match detail.size {
-        Some(size) if size > 0 => format!("{}%", detail.done.saturating_mul(100) / size),
-        _ => "—".into(),
+        Some(size) if size > 0 => percent_text(detail.done.saturating_mul(100) / size),
+        _ => unknown().into(),
     };
     let parts = detail.parts.len();
     let connections = if parts > 1 {
-        format!(
-            "Connections: {} active of {parts} parts (ranged)",
-            detail.connections
+        tf(
+            "url.connections_parts",
+            &[("active", &detail.connections), ("parts", &parts)],
         )
     } else if detail.ranged {
-        format!("Connections: {} (ranged, one part)", detail.connections)
+        tf(
+            "url.connections_one_part",
+            &[("count", &detail.connections)],
+        )
     } else {
-        format!(
-            "Connections: {} (the server offers no ranges)",
-            detail.connections
+        tf(
+            "url.connections_no_ranges",
+            &[("count", &detail.connections)],
         )
     };
     let resume = match &detail.validator {
-        Some(validator) => format!("Resume identity: {validator}"),
-        None if detail.ranged => "Resume identity: none; a resume restarts from byte 0".into(),
-        None => "Resume: not possible; a retry restarts from byte 0".into(),
+        Some(validator) => tf("url.resume_identity", &[("validator", validator)]),
+        None if detail.ranged => t("url.resume_none").into(),
+        None => t("url.resume_impossible").into(),
     };
     let file = match &detail.file {
-        Some(name) if matches!(job.state, JobState::Complete) => format!("File: {name}"),
-        Some(name) => format!("File: {name} (written as {name}.part until complete)"),
-        None => "File: — (named by the server's first response)".into(),
+        Some(name) if matches!(job.state, JobState::Complete) => {
+            tf("url.file_complete", &[("name", name)])
+        }
+        Some(name) => tf("url.file_partial", &[("name", name)]),
+        None => t("url.file_unnamed").into(),
+    };
+    let sha256 = match detail.sha256.as_deref() {
+        Some(digest) => tf("url.sha256", &[("digest", &digest)]),
+        None => t("url.sha256_none").into(),
     };
     vec![
         clean_label(&job.name, 160),
-        format!(
-            "State: {:?}    Size: {size}    Downloaded: {} ({percent})",
-            job.state,
-            format_bytes(detail.done)
+        tf(
+            "url.state",
+            &[
+                ("state", &state_text(job.state)),
+                ("size", &size),
+                ("done", &format_bytes(detail.done)),
+                ("percent", &percent),
+            ],
         ),
-        format!(
-            "Down: {}    ETA: {}",
-            rate_text(job.down_bps),
-            eta_text(job)
+        tf(
+            "url.rates",
+            &[("down", &rate_text(job.down_bps)), ("eta", &eta_text(job))],
         ),
         connections,
-        format!("URL: {}", clean_label(&detail.url, 160)),
-        format!("Destination: {}", clean_label(&detail.destination, 160)),
+        tf("url.address", &[("url", &clean_label(&detail.url, 160))]),
+        tf(
+            "url.destination",
+            &[("path", &clean_label(&detail.destination, 160))],
+        ),
         file,
         resume,
-        format!(
-            "SHA-256: {}",
-            detail.sha256.as_deref().unwrap_or("not requested")
+        sha256,
+        tf(
+            "url.last_error",
+            &[("error", &detail.error.as_deref().unwrap_or(unknown()))],
         ),
-        format!("Last error: {}", detail.error.as_deref().unwrap_or("—")),
         detail
             .note
             .as_deref()
-            .map(|note| format!("Note: {note}"))
+            .map(|note| tf("url.note", &[("note", &note)]))
             .unwrap_or_default(),
     ]
     .into_iter()
@@ -2613,30 +2860,40 @@ fn current_file(files: &[FileRow]) -> &str {
         .filter(|file| file.wanted && file.verified_bytes < file.length)
         .min_by_key(|file| file.rank)
         .map(|file| file.path.as_str())
-        .unwrap_or("—")
+        .unwrap_or(unknown())
 }
 
 /// Listener, DHT and router-mapping state under the mapping checkbox. The
 /// mapping status is the driver's own; it never carries the external address.
 fn settings_reachability(view: &SessionView) -> String {
     let mapping = if view.port_mapping {
-        format!("Router port mapping: {}.", view.port_mapping_status)
+        tf(
+            "settings.mapping_on",
+            &[("status", &view.port_mapping_status)],
+        )
     } else {
-        "Router port mapping is off; nothing is sent to the router. Forward this port on your router to accept incoming peers.".to_string()
+        t("settings.mapping_off").to_string()
     };
-    format!(
-        "{}. DHT: {}. {mapping}",
-        listen_text(&view.listen),
-        view.dht_nodes
-            .map_or("off".to_string(), |nodes| format!("{nodes} nodes")),
+    let dht = view
+        .dht_nodes
+        .map_or(t("settings.dht_off").to_string(), |nodes| {
+            tf("settings.dht_nodes", &[("count", &nodes)])
+        });
+    tf(
+        "settings.reachability",
+        &[
+            ("listen", &listen_text(&view.listen)),
+            ("dht", &dht),
+            ("mapping", &mapping),
+        ],
     )
 }
 
 fn listen_text(state: &ListenState) -> String {
     match state {
-        ListenState::Starting => "Listen: starting".into(),
-        ListenState::Bound(address) => format!("Listen: {address}"),
-        ListenState::Failed(error) => format!("Listen failed: {error}"),
+        ListenState::Starting => t("status.listen_starting").into(),
+        ListenState::Bound(address) => tf("status.listen_bound", &[("address", address)]),
+        ListenState::Failed(error) => tf("status.listen_failed", &[("detail", error)]),
     }
 }
 
@@ -2651,24 +2908,35 @@ fn paint_tracker(
     let seeds = tracker
         .seeds
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "—".into());
+        .unwrap_or_else(|| unknown().into());
     let peers = tracker
         .peers
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "—".into());
-    let error = tracker.last_error.as_deref().unwrap_or("—");
+        .unwrap_or_else(|| unknown().into());
+    let error = tracker.last_error.as_deref().unwrap_or(unknown());
     ui.label_styled(
         Rect::new(rect.x + 8, rect.y, rect.w - 16, rect.h / 2),
-        &format!("{}    {}", clean_label(&tracker.label, 80), tracker.origin),
+        &tf(
+            "trackers.row_heading",
+            &[
+                ("label", &clean_label(&tracker.label, 80)),
+                ("origin", &tracker.origin),
+            ],
+        ),
         *body,
         INK,
         Align::Left,
     );
     ui.label_styled(
         Rect::new(rect.x + 8, rect.y + rect.h / 2, rect.w - 16, rect.h / 2),
-        &format!(
-            "seeds {seeds}    peers {peers}    {}    {error}",
-            cooldown_text(elapsed_s, tracker.manual_due_s)
+        &tf(
+            "trackers.row_detail",
+            &[
+                ("seeds", &seeds),
+                ("peers", &peers),
+                ("cooldown", &cooldown_text(elapsed_s, tracker.manual_due_s)),
+                ("error", &error),
+            ],
         ),
         *small,
         MUTED,
@@ -2719,6 +2987,8 @@ pub struct App {
     desktop: Desktop,
     /// Asks the host for another frame; see the end of `render`.
     waker: Option<Waker>,
+    foreground: crate::foreground::Foreground,
+    window_icon: crate::window_icon::WindowIcon,
 }
 
 impl App {
@@ -2735,6 +3005,8 @@ impl App {
             input: Input::new(),
             desktop: Desktop::new(client, activator, ui, store),
             waker: None,
+            foreground: crate::foreground::Foreground::default(),
+            window_icon: crate::window_icon::WindowIcon::default(),
         }
     }
 
@@ -2752,6 +3024,8 @@ impl PixelApp for App {
         self.desktop
             .activator
             .set_waker(Arc::new(move || activate.wake()));
+        let picked = waker.clone();
+        self.desktop.pickers.wake = Some(Arc::new(move || picked.wake()));
         let redraw = waker;
         self.input
             .attach_clipboard(liminalkit_shell::clipboard::ClipboardWorker::new(
@@ -2759,8 +3033,21 @@ impl PixelApp for App {
             ));
     }
 
+    fn on_native_window(&mut self, window: &winit::window::Window) {
+        self.foreground.remember(window);
+        self.desktop.pickers.owner = self.foreground.hwnd();
+        self.window_icon.apply(self.foreground.hwnd());
+    }
+
+    fn on_scale(&mut self, _scale: Scale) {
+        // A monitor with another scale wants other icon sizes.
+        self.window_icon.apply(self.foreground.hwnd());
+    }
+
     fn render(&mut self, buffer: &mut WindowBuffer, s: Scale) {
-        self.desktop.pump();
+        if self.desktop.pump() {
+            self.foreground.raise();
+        }
         let view = self.desktop.client.view();
         self.desktop.sync_selection(&view);
         let title = app_title(&view.snapshot.jobs);
@@ -3076,7 +3363,7 @@ mod tests {
             (width, height),
             (UiState::default().width, UiState::default().height)
         );
-        let socket = root.0.join("runtime/instance.sock");
+        let socket = root.0.join("runtime").join(crate::activate::ENDPOINT);
         assert!(socket.exists(), "the listener is up before close");
         app.on_exit();
         drop(app);
@@ -3190,31 +3477,42 @@ mod tests {
             note: None,
             state: JobState::Downloading,
         };
+        use crate::text::tf;
+        use crate::workflow::{format_bytes, state_text, unknown};
         let lines = super::url_detail_lines(&job, &detail);
-        assert!(lines[1].contains("Size: —"), "{}", lines[1]);
-        assert!(lines[1].contains("(—)"), "{}", lines[1]);
-        assert!(lines.iter().any(|line| line.contains("no ranges")));
-        assert!(lines.iter().any(|line| line.contains("stream.part")));
+        let state = tf(
+            "url.state",
+            &[
+                ("state", &state_text(job.state)),
+                ("size", &unknown()),
+                ("done", &format_bytes(4096)),
+                ("percent", &unknown()),
+            ],
+        );
+        assert_eq!(lines[1], state);
+        let no_ranges = tf("url.connections_no_ranges", &[("count", &1)]);
+        assert!(lines.contains(&no_ranges), "{lines:?}");
+        let partial = tf("url.file_partial", &[("name", &"stream")]);
+        assert!(lines.contains(&partial), "{lines:?}");
         let (progress, _) = super::progress_parts(&job);
-        assert_eq!(progress, "—");
+        assert_eq!(progress, unknown());
     }
 
     #[test]
     fn settings_line_shows_the_live_port_mapping_state() {
         let mut view = crate::worker::SessionView::idle(Limits::default(), "t.txt".into());
         view.listen = crate::worker::ListenState::Bound("0.0.0.0:51234".parse().unwrap());
+        use crate::text::{t, tf};
         let off = super::settings_reachability(&view);
-        assert!(off.contains("Router port mapping is off"), "{off}");
-        assert!(off.contains("Forward this port"), "{off}");
-        assert!(!off.contains("No UPnP"), "{off}");
+        assert!(off.ends_with(t("settings.mapping_off")), "{off}");
+        assert!(off.starts_with(&super::listen_text(&view.listen)), "{off}");
         view.port_mapping = true;
         view.port_mapping_status = "mapped by NAT-PMP as external port 51234 (TCP and UDP)".into();
         let on = super::settings_reachability(&view);
-        assert!(
-            on.ends_with(
-                "Router port mapping: mapped by NAT-PMP as external port 51234 (TCP and UDP)."
-            ),
-            "{on}"
+        let mapping = tf(
+            "settings.mapping_on",
+            &[("status", &view.port_mapping_status)],
         );
+        assert!(on.ends_with(&mapping), "{on}");
     }
 }

@@ -9,14 +9,41 @@ license.workspace = true
 templartorrent-core = { path = "../../crates/templartorrent-core" }
 templartorrent-storage = { path = "../../crates/templartorrent-storage" }
 templartorrent-rbit-adapter = { path = "../rbit-adapter" }
+# liminalkit's default branch, unpinned: `cargo update` takes its newest
+# commit. The Windows text clipboard (Ctrl+V) needs f0ea79c or later.
 liminalkit-raster = { git = "https://github.com/liminalism/liminalkit" }
 liminalkit-shell = { git = "https://github.com/liminalism/liminalkit" }
 liminalkit-text = { git = "https://github.com/liminalism/liminalkit" }
 liminalkit-ui = { git = "https://github.com/liminalism/liminalkit" }
 liminalkit-windowing = { git = "https://github.com/liminalism/liminalkit" }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
-libc = "0.2.190"
 maxminddb = "0.32"
+# The window type `PixelApp::on_native_window` passes; already in the graph
+# through liminalkit-windowing (same 0.30 line).
+winit = "0.30"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+# Native folder and .torrent pickers (IFileOpenDialog). Windows only: on Linux
+# rfd needs GTK or an XDG portal stack, so Linux keeps the in-app browser.
+rfd = { version = "0.17.2", default-features = false }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Inflates the bundled DB-IP database at compile time (already in the graph).
+[build-dependencies]
+flate2 = "1.1.10"
 
 [dev-dependencies]
 rbit = "=0.2.2"

@@ -7,27 +7,17 @@ use templartorrent_core::{
     sequence::SKIP,
 };
 
-pub const USAGE: &str = "\
-usage: templartorrent [--font FILE] [--geoip-db FILE] [--allow-local-trackers]
-                      [--allow-local-urls] [--] [MAGNET | FILE.torrent | URL]...
+use crate::text::{t, tf};
 
-A second launch forwards each magnet, .torrent path or http(s) URL to the
-running instance and exits. The running instance opens the Add dialog; it does
-not start a transfer until Add is confirmed.
+#[cfg(windows)]
+pub const FONT_CANDIDATES: &[&str] = &[
+    r"C:\Windows\Fonts\segoeui.ttf",
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\tahoma.ttf",
+    r"C:\Windows\Fonts\verdana.ttf",
+];
 
-URL downloads refuse loopback, private, link-local and other local addresses
-unless --allow-local-urls (or the matching setting) is on, as
---allow-local-trackers does for tracker URLs.
-
-Peer country lookup uses --geoip-db FILE, $TEMPLARTORRENT_GEOIP_DB, or
-~/.local/share/templartorrent/GeoLite2-Country.mmdb. Without a database,
-peers show -- for the country.
-
-Jobs, limits and peer preferences are saved under
-$XDG_DATA_HOME/templartorrent/session (default ~/.local/share) and restored
-on the next launch after a disk recheck. Removing a job deletes its record.
-";
-
+#[cfg(not(windows))]
 pub const FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -48,6 +38,10 @@ pub const PUBLIC_TRACKER_CAP: usize = 12;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
     Help,
+    /// Windows: register as a magnet and .torrent handler for this user.
+    Register,
+    /// Windows: remove that registration.
+    Unregister,
     Run {
         font: Option<PathBuf>,
         geoip_db: Option<PathBuf>,
@@ -75,19 +69,21 @@ where
         }
         match arg.as_str() {
             "--help" | "-h" => return Ok(Launch::Help),
+            "--register" => return Ok(Launch::Register),
+            "--unregister" => return Ok(Launch::Unregister),
             "--" => positional = true,
             "--allow-local-trackers" => allow_local_trackers = true,
             "--allow-local-urls" => allow_local_urls = true,
             "--font" => {
-                let path = args.next().ok_or("missing path after --font")?;
+                let path = args.next().ok_or(t("cli.missing_font_path"))?;
                 font = Some(PathBuf::from(path));
             }
             "--geoip-db" => {
-                let path = args.next().ok_or("missing path after --geoip-db")?;
+                let path = args.next().ok_or(t("cli.missing_geoip_path"))?;
                 geoip_db = Some(PathBuf::from(path));
             }
             other if other.starts_with('-') => {
-                return Err(format!("unknown argument {other}"));
+                return Err(tf("cli.unknown_argument", &[("argument", &other)]));
             }
             other => push_payload(&mut payloads, other.to_string()),
         }
@@ -192,8 +188,17 @@ pub fn resolve_font(explicit: Option<&Path>) -> Result<PathBuf, String> {
         return if path.is_file() {
             Ok(path.to_path_buf())
         } else {
-            Err("font file was not found".into())
+            Err(t("cli.font_not_found").into())
         };
+    }
+    #[cfg(windows)]
+    if let Some(windir) = std::env::var_os("WINDIR").filter(|dir| !dir.is_empty()) {
+        for name in ["segoeui.ttf", "arial.ttf", "tahoma.ttf", "verdana.ttf"] {
+            let path = PathBuf::from(&windir).join("Fonts").join(name);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
     }
     for candidate in FONT_CANDIDATES {
         let path = Path::new(candidate);
@@ -204,7 +209,7 @@ pub fn resolve_font(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = font_from_fontconfig() {
         return Ok(path);
     }
-    Err("no font was found; pass --font with a static TrueType file".into())
+    Err(t("cli.no_font").into())
 }
 
 /// Ask fontconfig for its default sans-serif face. This covers systems whose
@@ -232,38 +237,83 @@ fn font_from_fontconfig() -> Option<PathBuf> {
 pub fn country_text(country: Option<[u8; 2]>) -> String {
     country
         .map(|code| String::from_utf8_lossy(&code).into_owned())
-        .unwrap_or_else(|| "--".into())
+        .unwrap_or_else(|| t("peers.country_unknown").into())
 }
 
 pub fn preference_text(preference: PeerPreference) -> &'static str {
     match preference {
-        PeerPreference::Prefer => "Prefer",
-        PeerPreference::Normal => "Normal",
-        PeerPreference::Avoid => "Avoid",
-        PeerPreference::Block => "Block",
+        PeerPreference::Prefer => t("peers.preference_prefer"),
+        PeerPreference::Normal => t("peers.preference_normal"),
+        PeerPreference::Avoid => t("peers.preference_avoid"),
+        PeerPreference::Block => t("peers.preference_block"),
     }
 }
 
 /// Shown above the peer list. Preference is local: it changes which peers we
 /// unchoke, keep and pipeline; it cannot make a remote client send faster.
-pub const PREFERENCE_NOTE: [&str; 2] = [
-    "Applies to the selected peer's IP address for this job.",
-    "Block closes it and refuses reconnection; blocking the only supplier can stall completion.",
-];
+pub fn preference_note() -> [&'static str; 2] {
+    [t("peers.note_ip"), t("peers.note_block")]
+}
 
-/// `$XDG_DATA_HOME/templartorrent` or `~/.local/share/templartorrent`.
-pub fn data_dir() -> PathBuf {
+/// The display name of a job state, for the job list and Details.
+pub fn state_text(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => t("state.queued"),
+        // A magnet whose info dictionary is still being fetched from peers.
+        JobState::Metadata => t("state.metadata"),
+        JobState::Checking => t("state.checking"),
+        JobState::Downloading => t("state.downloading"),
+        JobState::Complete => t("state.complete"),
+        JobState::Seeding => t("state.seeding"),
+        JobState::Paused => t("state.paused"),
+        JobState::Removing => t("state.removing"),
+        JobState::Error => t("state.error"),
+    }
+}
+
+/// The user's home directory: `$HOME`, or `%USERPROFILE%` on Windows.
+pub fn home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()));
+    home.map(PathBuf::from)
+}
+
+/// Base for per-user data: `$XDG_DATA_HOME`, else `%LOCALAPPDATA%` on
+/// Windows, else `~/.local/share`.
+pub fn data_home() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"));
-    base.join("templartorrent")
+        .filter(|base| !base.is_empty())
+        .map(PathBuf::from);
+    #[cfg(windows)]
+    let base = base.or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|base| !base.is_empty())
+            .map(PathBuf::from)
+    });
+    base.or_else(|| home_dir().map(|home| home.join(".local/share")))
+}
+
+/// `$XDG_DATA_HOME/templartorrent`, `%LOCALAPPDATA%/templartorrent` on
+/// Windows, or `~/.local/share/templartorrent`.
+pub fn data_dir() -> PathBuf {
+    data_home()
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("templartorrent")
 }
 
 pub fn public_tracker_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .filter(|base| !base.is_empty())
+        .map(PathBuf::from);
+    #[cfg(windows)]
+    let base = base.or_else(|| {
+        std::env::var_os("APPDATA")
+            .filter(|base| !base.is_empty())
+            .map(PathBuf::from)
+    });
+    let base = base
+        .or_else(|| home_dir().map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("templartorrent").join("public-trackers.txt")
 }
@@ -290,7 +340,7 @@ pub fn load_public_trackers(path: &Path) -> Vec<String> {
 pub fn normalize_magnet(text: &str) -> Result<String, &'static str> {
     let mut text = text.trim();
     if text.is_empty() {
-        return Err("magnet is empty");
+        return Err(t("error.magnet_empty"));
     }
     let bytes = text.as_bytes();
     if bytes.len() >= 2 {
@@ -303,16 +353,16 @@ pub fn normalize_magnet(text: &str) -> Result<String, &'static str> {
         }
     }
     if text.is_empty() {
-        return Err("magnet is empty");
+        return Err(t("error.magnet_empty"));
     }
     if text.len() > 16 * 1024 {
-        return Err("magnet exceeds 16 KiB limit");
+        return Err(t("error.magnet_too_long"));
     }
     if text.contains(['\n', '\r', '\0']) {
-        return Err("magnet must be one line");
+        return Err(t("error.magnet_one_line"));
     }
     if text.len() < 8 || !text.as_bytes()[..8].eq_ignore_ascii_case(b"magnet:?") {
-        return Err("magnet must start with magnet:?");
+        return Err(t("error.magnet_prefix"));
     }
     let mut canonical = String::from("magnet:?");
     canonical.push_str(&text[8..]);
@@ -338,7 +388,7 @@ pub const MAX_URL_BATCH: usize = templartorrent_rbit_adapter::http::MAX_BATCH;
 pub fn classify_source(text: &str) -> Result<AddSource, String> {
     let text = text.trim();
     if text.is_empty() {
-        return Err("paste a magnet or an http(s) URL".into());
+        return Err(t("error.source_empty").into());
     }
     if looks_like_magnet(text) {
         // A pasted magnet may carry an unencoded space in its name; a second
@@ -347,7 +397,7 @@ pub fn classify_source(text: &str) -> Result<AddSource, String> {
             is_magnet_prefix(token) || token.starts_with("http://") || token.starts_with("https://")
         });
         if another {
-            return Err("add magnets one at a time, separately from URLs".into());
+            return Err(t("error.magnet_mixed").into());
         }
         // Quoted, bracketed and differently cased prefixes become `magnet:?`.
         return normalize_magnet(text)
@@ -355,21 +405,24 @@ pub fn classify_source(text: &str) -> Result<AddSource, String> {
             .map_err(str::to_string);
     }
     if text.len() > 64 * 1024 {
-        return Err("the URL list exceeds 64 KiB".into());
+        return Err(t("error.url_list_too_long").into());
     }
     let mut urls: Vec<String> = Vec::new();
     for token in text.split_whitespace() {
         if token.starts_with("magnet:?") {
-            return Err("add magnets one at a time, separately from URLs".into());
+            return Err(t("error.magnet_mixed").into());
         }
         let parsed = templartorrent_rbit_adapter::http::parse_url(token)
-            .map_err(|reason| format!("{token}: {reason}"))?;
+            .map_err(|reason| tf("error.url_invalid", &[("url", &token), ("detail", &reason)]))?;
         if urls.contains(&parsed.url) {
             continue;
         }
         urls.push(parsed.url);
         if urls.len() > MAX_URL_BATCH {
-            return Err(format!("at most {MAX_URL_BATCH} URLs per Add"));
+            return Err(tf(
+                "error.url_batch_too_large",
+                &[("count", &MAX_URL_BATCH)],
+            ));
         }
     }
     Ok(AddSource::Urls(urls))
@@ -381,16 +434,18 @@ pub fn parse_optional_sha256(text: &str) -> Result<Option<[u8; 32]>, &'static st
     if text.is_empty() {
         return Ok(None);
     }
-    templartorrent_rbit_adapter::http::parse_sha256(text).map(Some)
+    templartorrent_rbit_adapter::http::parse_sha256(text)
+        .map(Some)
+        .map_err(|_| t("error.sha256_invalid"))
 }
 
 pub fn validate_destination(text: &str) -> Result<(), &'static str> {
     let text = text.trim();
     if text.is_empty() {
-        return Err("choose a destination folder");
+        return Err(t("error.destination_empty"));
     }
     if text.contains('\0') {
-        return Err("destination contains a null");
+        return Err(t("error.destination_null"));
     }
     Ok(())
 }
@@ -408,112 +463,126 @@ pub struct LimitForm<'a> {
 }
 
 pub fn parse_limits(form: LimitForm<'_>) -> Result<Limits, &'static str> {
+    use LimitField::*;
     Ok(Limits {
-        download_jobs: parse_usize(form.download_jobs, "download jobs", 10_000)?,
-        seed_jobs: parse_usize(form.seed_jobs, "seed jobs", 10_000)?,
-        upload_peer_slots: parse_usize(form.upload_slots, "upload peer slots", 10_000)?,
-        connections_total: parse_usize(form.connections, "max connections", 100_000)?,
-        connections_per_job: parse_usize(form.per_job, "max per job", 100_000)?,
-        download_kb_s: parse_u64(form.down_kb, "download kB/s")?,
-        upload_kb_s: parse_u64(form.up_kb, "upload kB/s")?,
+        download_jobs: parse_usize(form.download_jobs, DownloadJobs, 10_000)?,
+        seed_jobs: parse_usize(form.seed_jobs, SeedJobs, 10_000)?,
+        upload_peer_slots: parse_usize(form.upload_slots, UploadSlots, 10_000)?,
+        connections_total: parse_usize(form.connections, Connections, 100_000)?,
+        connections_per_job: parse_usize(form.per_job, PerJob, 100_000)?,
+        download_kb_s: parse_u64(form.down_kb, DownKb)?,
+        upload_kb_s: parse_u64(form.up_kb, UpKb)?,
         payload_budget_bytes: parse_memory(form.memory_mib)?,
     })
 }
 
-fn parse_usize(text: &str, label: &str, max: usize) -> Result<usize, &'static str> {
-    let value = parse_u64(text, label)?;
-    let value = usize::try_from(value).map_err(|_| too_large(label))?;
+/// Which Limits field a validation message is about.
+#[derive(Clone, Copy)]
+enum LimitField {
+    DownloadJobs,
+    SeedJobs,
+    UploadSlots,
+    Connections,
+    PerJob,
+    DownKb,
+    UpKb,
+    Memory,
+}
+
+fn parse_usize(text: &str, field: LimitField, max: usize) -> Result<usize, &'static str> {
+    let value = parse_u64(text, field)?;
+    let value = usize::try_from(value).map_err(|_| too_large(field))?;
     if value > max {
-        return Err(too_large(label));
+        return Err(too_large(field));
     }
     Ok(value)
 }
 
-fn parse_u64(text: &str, label: &str) -> Result<u64, &'static str> {
+fn parse_u64(text: &str, field: LimitField) -> Result<u64, &'static str> {
     let text = text.trim();
     if text.is_empty() {
-        return Err(empty(label));
+        return Err(empty(field));
     }
     if !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(not_numeric(label));
+        return Err(not_numeric(field));
     }
-    text.parse().map_err(|_| too_large(label))
+    text.parse().map_err(|_| too_large(field))
 }
 
 fn parse_memory(text: &str) -> Result<usize, &'static str> {
-    let mib = parse_u64(text, "payload memory")?;
+    let mib = parse_u64(text, LimitField::Memory)?;
     if mib == 0 {
-        return Err("payload memory must be at least 1 MiB");
+        return Err(t("limits.memory_too_small"));
     }
     if mib > 8192 {
-        return Err("payload memory is limited to 8192 MiB");
+        return Err(t("limits.memory_over_cap"));
     }
     Ok((mib as usize) * 1024 * 1024)
 }
 
-fn empty(label: &str) -> &'static str {
-    match label {
-        "download jobs" => "download jobs is empty",
-        "seed jobs" => "seed jobs is empty",
-        "upload peer slots" => "upload peer slots is empty",
-        "max connections" => "max connections is empty",
-        "max per job" => "max per job is empty",
-        "download kB/s" => "download kB/s is empty",
-        "upload kB/s" => "upload kB/s is empty",
-        _ => "payload memory is empty",
+fn empty(field: LimitField) -> &'static str {
+    match field {
+        LimitField::DownloadJobs => t("limits.download_jobs_empty"),
+        LimitField::SeedJobs => t("limits.seed_jobs_empty"),
+        LimitField::UploadSlots => t("limits.upload_slots_empty"),
+        LimitField::Connections => t("limits.connections_empty"),
+        LimitField::PerJob => t("limits.per_job_empty"),
+        LimitField::DownKb => t("limits.down_kb_empty"),
+        LimitField::UpKb => t("limits.up_kb_empty"),
+        LimitField::Memory => t("limits.memory_empty"),
     }
 }
 
-fn not_numeric(label: &str) -> &'static str {
-    match label {
-        "download jobs" => "download jobs must be a whole number",
-        "seed jobs" => "seed jobs must be a whole number",
-        "upload peer slots" => "upload peer slots must be a whole number",
-        "max connections" => "max connections must be a whole number",
-        "max per job" => "max per job must be a whole number",
-        "download kB/s" => "download kB/s must be a whole number",
-        "upload kB/s" => "upload kB/s must be a whole number",
-        _ => "payload memory must be a whole number",
+fn not_numeric(field: LimitField) -> &'static str {
+    match field {
+        LimitField::DownloadJobs => t("limits.download_jobs_not_number"),
+        LimitField::SeedJobs => t("limits.seed_jobs_not_number"),
+        LimitField::UploadSlots => t("limits.upload_slots_not_number"),
+        LimitField::Connections => t("limits.connections_not_number"),
+        LimitField::PerJob => t("limits.per_job_not_number"),
+        LimitField::DownKb => t("limits.down_kb_not_number"),
+        LimitField::UpKb => t("limits.up_kb_not_number"),
+        LimitField::Memory => t("limits.memory_not_number"),
     }
 }
 
-fn too_large(label: &str) -> &'static str {
-    match label {
-        "download jobs" => "download jobs is too large",
-        "seed jobs" => "seed jobs is too large",
-        "upload peer slots" => "upload peer slots is too large",
-        "max connections" => "max connections is too large",
-        "max per job" => "max per job is too large",
-        "download kB/s" => "download kB/s is too large",
-        "upload kB/s" => "upload kB/s is too large",
-        _ => "payload memory is too large",
+fn too_large(field: LimitField) -> &'static str {
+    match field {
+        LimitField::DownloadJobs => t("limits.download_jobs_too_large"),
+        LimitField::SeedJobs => t("limits.seed_jobs_too_large"),
+        LimitField::UploadSlots => t("limits.upload_slots_too_large"),
+        LimitField::Connections => t("limits.connections_too_large"),
+        LimitField::PerJob => t("limits.per_job_too_large"),
+        LimitField::DownKb => t("limits.down_kb_too_large"),
+        LimitField::UpKb => t("limits.up_kb_too_large"),
+        LimitField::Memory => t("limits.memory_too_large"),
     }
 }
 
 pub fn rank_label(rank: u32, wanted: bool, verified: u64, length: u64) -> String {
     if !wanted {
-        return "Skipped".into();
+        return t("files.rank_skipped").into();
     }
     if verified >= length {
-        return "Complete".into();
+        return t("files.rank_complete").into();
     }
     if rank == SKIP {
-        return "Skipped".into();
+        return t("files.rank_skipped").into();
     }
-    format!("Auto: {}", ordinal(rank + 1))
+    tf("files.rank_auto", &[("position", &ordinal(rank + 1))])
 }
 
 fn ordinal(n: u32) -> String {
-    let suffix = match n % 100 {
-        11..=13 => "th",
+    let values: &[(&str, &dyn std::fmt::Display)] = &[("n", &n)];
+    match n % 100 {
+        11..=13 => tf("files.ordinal_th", values),
         _ => match n % 10 {
-            1 => "st",
-            2 => "nd",
-            3 => "rd",
-            _ => "th",
+            1 => tf("files.ordinal_st", values),
+            2 => tf("files.ordinal_nd", values),
+            3 => tf("files.ordinal_rd", values),
+            _ => tf("files.ordinal_th", values),
         },
-    };
-    format!("{n}{suffix}")
+    }
 }
 
 pub fn priority_order(ranks: &[u32]) -> Vec<usize> {
@@ -538,31 +607,41 @@ pub fn move_file(ranks: &[u32], index: usize, earlier: bool) -> Option<Vec<usize
     Some(order)
 }
 
+/// The mark shown for a value that is unknown or not applicable.
+pub fn unknown() -> &'static str {
+    t("common.unknown")
+}
+
+/// A whole percentage, e.g. `42%`.
+pub fn percent_text(percent: u64) -> String {
+    tf("units.percent", &[("value", &percent)])
+}
+
 pub fn rate_text(bytes_per_second: u64) -> String {
     if bytes_per_second == 0 {
-        "—".into()
+        unknown().into()
     } else {
-        format!("{} kB/s", bytes_per_second / 1000)
+        tf("units.kb_per_s", &[("value", &(bytes_per_second / 1000))])
     }
 }
 
 /// Block round trip for the peer row. Sub-millisecond samples stay visible.
 pub fn rtt_text(rtt_us: Option<u64>) -> String {
     match rtt_us {
-        None => "—".into(),
-        Some(us) if us / 1000 == 0 => "<1 ms".into(),
-        Some(us) => format!("{} ms", us / 1000),
+        None => unknown().into(),
+        Some(us) if us / 1000 == 0 => t("units.ms_below_one").into(),
+        Some(us) => tf("units.ms", &[("value", &(us / 1000))]),
     }
 }
 
 pub fn eta_text(row: &TorrentRow) -> String {
     if row.wanted_bytes == 0 || matches!(row.state, JobState::Paused | JobState::Queued) {
-        return "—".into();
+        return unknown().into();
     }
     match row.eta_seconds() {
-        None => "—".into(),
-        Some(0) => "done".into(),
-        Some(seconds) => format!("{seconds} s"),
+        None => unknown().into(),
+        Some(0) => t("units.eta_done").into(),
+        Some(seconds) => tf("units.seconds", &[("value", &seconds)]),
     }
 }
 
@@ -570,14 +649,15 @@ pub fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * 1024 * 1024;
+    let scaled = |unit: u64| format!("{:.1}", bytes as f64 / unit as f64);
     if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+        tf("units.gib", &[("value", &scaled(GIB))])
     } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+        tf("units.mib", &[("value", &scaled(MIB))])
     } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+        tf("units.kib", &[("value", &scaled(KIB))])
     } else {
-        format!("{bytes} B")
+        tf("units.bytes", &[("value", &bytes)])
     }
 }
 
@@ -593,52 +673,71 @@ pub fn job_line(row: &TorrentRow) -> String {
         .saturating_mul(100)
         .checked_div(row.wanted_bytes)
     {
-        Some(percent) => format!("{percent}%"),
-        None => "—".to_string(),
+        Some(percent) => percent_text(percent),
+        None => unknown().to_string(),
     };
-    format!(
-        "{}    {}    {}    {}    {} / {}    {:?}",
-        clean_label(&row.name, 60),
-        progress,
-        rate_text(row.down_bps),
-        rate_text(row.up_bps),
-        row.connected_seeds,
-        row.connected_peers,
-        row.state
+    tf(
+        "jobs.line",
+        &[
+            ("name", &clean_label(&row.name, 60)),
+            ("progress", &progress),
+            ("down", &rate_text(row.down_bps)),
+            ("up", &rate_text(row.up_bps)),
+            ("seeds", &row.connected_seeds),
+            ("peers", &row.connected_peers),
+            ("state", &state_text(row.state)),
+        ],
     )
 }
 
 pub fn speed_cap(kb_s: u64) -> String {
     if kb_s == 0 {
-        "unlimited".into()
+        t("units.unlimited").into()
     } else {
-        format!("{kb_s} kB/s")
+        tf("units.kb_per_s", &[("value", &kb_s)])
     }
 }
 
 pub fn cooldown_text(now_s: u64, due_s: u64) -> String {
     if now_s >= due_s {
-        "ready".into()
+        t("trackers.ready").into()
     } else {
-        format!("cooldown {} s", due_s - now_s)
+        tf("trackers.cooldown", &[("seconds", &(due_s - now_s))])
     }
 }
 
+/// The window title: the active download's name, a count of active jobs,
+/// or of seeding jobs. Same rules as the core `window_title`, with every
+/// word from the messages file.
 pub fn app_title(jobs: &[TorrentRow]) -> String {
-    let title = templartorrent_core::model::window_title(jobs);
-    if title == "TemplarTorrent" {
-        let seeding = jobs
-            .iter()
-            .filter(|job| job.state == JobState::Seeding)
-            .count();
-        if seeding > 0 {
-            return format!("{seeding} seeding — TemplarTorrent");
-        }
+    let mut active = jobs.iter().filter(|job| {
+        matches!(
+            job.state,
+            JobState::Downloading | JobState::Metadata | JobState::Checking
+        )
+    });
+    if let Some(first) = active.next() {
+        let others = active.count();
+        return if others == 0 {
+            tf(
+                "title.one_active",
+                &[("name", &clean_label(&first.name, 160))],
+            )
+        } else {
+            tf("title.many_active", &[("count", &(others + 1))])
+        };
     }
-    title
+    let seeding = jobs
+        .iter()
+        .filter(|job| job.state == JobState::Seeding)
+        .count();
+    if seeding > 0 {
+        return tf("title.seeding", &[("count", &seeding)]);
+    }
+    t("title.app").into()
 }
 
-/// How often the displayed payload rate is recomputed.
+// How often the displayed payload rate is recomputed.
 pub const RATE_SAMPLE_MS: u64 = 3_000;
 
 /// Smoothed payload rate carried between driver steps. Bytes accumulate until
@@ -735,13 +834,21 @@ mod tests {
         form.memory_mib = "0";
         assert_eq!(
             parse_limits(form).unwrap_err(),
-            "payload memory must be at least 1 MiB"
+            t("limits.memory_too_small")
         );
         form.memory_mib = "48";
         form.down_kb = "";
-        assert_eq!(parse_limits(form).unwrap_err(), "download kB/s is empty");
+        assert_eq!(parse_limits(form).unwrap_err(), t("limits.down_kb_empty"));
         form.down_kb = "fast";
-        assert!(parse_limits(form).unwrap_err().contains("whole number"));
+        assert_eq!(
+            parse_limits(form).unwrap_err(),
+            t("limits.down_kb_not_number")
+        );
+        form.down_kb = "99999999999999999999999";
+        assert_eq!(
+            parse_limits(form).unwrap_err(),
+            t("limits.down_kb_too_large")
+        );
     }
 
     #[test]
@@ -761,13 +868,18 @@ mod tests {
 
     #[test]
     fn ranks_and_order_follow_the_file_policy() {
-        assert_eq!(rank_label(0, true, 0, 10), "Auto: 1st");
-        assert_eq!(rank_label(1, true, 0, 10), "Auto: 2nd");
-        assert_eq!(rank_label(2, true, 0, 10), "Auto: 3rd");
-        assert_eq!(rank_label(10, true, 0, 10), "Auto: 11th");
-        assert_eq!(rank_label(0, false, 0, 10), "Skipped");
-        assert_eq!(rank_label(SKIP, true, 0, 10), "Skipped");
-        assert_eq!(rank_label(SKIP, true, 10, 10), "Complete");
+        let auto = |key: &'static str, n: u32| {
+            let position = tf(key, &[("n", &n)]);
+            tf("files.rank_auto", &[("position", &position)])
+        };
+        assert_eq!(rank_label(0, true, 0, 10), auto("files.ordinal_st", 1));
+        assert_eq!(rank_label(1, true, 0, 10), auto("files.ordinal_nd", 2));
+        assert_eq!(rank_label(2, true, 0, 10), auto("files.ordinal_rd", 3));
+        assert_eq!(rank_label(10, true, 0, 10), auto("files.ordinal_th", 11));
+        assert_eq!(rank_label(20, true, 0, 10), auto("files.ordinal_st", 21));
+        assert_eq!(rank_label(0, false, 0, 10), t("files.rank_skipped"));
+        assert_eq!(rank_label(SKIP, true, 0, 10), t("files.rank_skipped"));
+        assert_eq!(rank_label(SKIP, true, 10, 10), t("files.rank_complete"));
         let ranks = [1, 0, SKIP];
         assert_eq!(move_file(&ranks, 1, true), None);
         assert_eq!(move_file(&ranks, 0, true), Some(vec![0, 1, 2]));
@@ -825,25 +937,42 @@ mod tests {
                     ]
                 );
             }
-            Launch::Help => panic!("help"),
+            other => panic!("{other:?}"),
         }
     }
 
     #[test]
     fn unknown_rates_and_eta_use_an_em_dash() {
         let idle = row(JobState::Downloading, 100, 10, 0);
-        assert_eq!(rate_text(0), "—");
-        assert_eq!(rtt_text(None), "—");
-        assert_eq!(rtt_text(Some(0)), "<1 ms");
-        assert_eq!(rtt_text(Some(999)), "<1 ms");
-        assert_eq!(rtt_text(Some(5_000)), "5 ms");
-        assert_eq!(eta_text(&idle), "—");
-        assert!(job_line(&idle).contains("—"));
+        assert_eq!(rate_text(0), unknown());
+        assert_eq!(rtt_text(None), unknown());
+        assert_eq!(rtt_text(Some(0)), t("units.ms_below_one"));
+        assert_eq!(rtt_text(Some(999)), t("units.ms_below_one"));
+        assert_eq!(rtt_text(Some(5_000)), tf("units.ms", &[("value", &5)]));
+        assert_eq!(eta_text(&idle), unknown());
+        assert!(job_line(&idle).contains(unknown()));
         let done = row(JobState::Complete, 100, 100, 0);
-        assert_eq!(eta_text(&done), "done");
-        assert_eq!(app_title(&[]), "TemplarTorrent");
+        assert_eq!(eta_text(&done), t("units.eta_done"));
+        assert_eq!(app_title(&[]), t("title.app"));
         let seeding = row(JobState::Seeding, 100, 100, 0);
-        assert_eq!(app_title(&[seeding]), "1 seeding — TemplarTorrent");
+        assert_eq!(
+            app_title(std::slice::from_ref(&seeding)),
+            tf("title.seeding", &[("count", &1)])
+        );
+        let active = row(JobState::Downloading, 100, 10, 0);
+        assert_eq!(
+            app_title(&[active.clone(), seeding]),
+            tf("title.one_active", &[("name", &"episode")])
+        );
+        assert_eq!(
+            app_title(&[active.clone(), active]),
+            tf("title.many_active", &[("count", &2)])
+        );
+        assert_eq!(format_bytes(512), tf("units.bytes", &[("value", &512)]));
+        assert_eq!(
+            format_bytes(3 * 1024 * 1024 / 2),
+            tf("units.mib", &[("value", &"1.5")])
+        );
     }
 
     #[test]
@@ -872,7 +1001,7 @@ mod tests {
                     vec!["--font".to_string(), "magnet:?xt=urn:btih:abc".to_string()]
                 );
             }
-            Launch::Help => panic!("help"),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -902,21 +1031,19 @@ mod tests {
                 .contains("scheme")
         );
         assert!(
-            classify_source("magnet:?xt=urn:btih:aa http://b.example/g")
-                .unwrap_err()
-                .contains("one at a time")
+            classify_source("magnet:?xt=urn:btih:aa http://b.example/g").unwrap_err()
+                == t("error.magnet_mixed")
         );
         let many: Vec<String> = (0..MAX_URL_BATCH + 1)
             .map(|i| format!("http://h.example/{i}"))
             .collect();
         assert!(
-            classify_source(&many.join(" "))
-                .unwrap_err()
-                .contains("at most")
+            classify_source(&many.join(" ")).unwrap_err()
+                == tf("error.url_batch_too_large", &[("count", &MAX_URL_BATCH)])
         );
         assert_eq!(parse_optional_sha256("  "), Ok(None));
         assert!(parse_optional_sha256(&"0".repeat(64)).unwrap().is_some());
-        assert!(parse_optional_sha256("abc").is_err());
+        assert_eq!(parse_optional_sha256("abc"), Err(t("error.sha256_invalid")));
         let launch =
             parse_args(["--allow-local-urls".into(), "https://h.example/x".into()]).unwrap();
         assert!(matches!(
@@ -935,7 +1062,7 @@ mod tests {
             Launch::Run { geoip_db, .. } => {
                 assert_eq!(geoip_db, Some(PathBuf::from("/data/country.mmdb")));
             }
-            Launch::Help => panic!("help"),
+            other => panic!("{other:?}"),
         }
         assert!(parse_args(["--geoip-db".into()]).is_err());
     }
@@ -948,16 +1075,28 @@ mod tests {
 
     #[test]
     fn unknown_countries_render_as_a_double_dash() {
-        assert_eq!(country_text(None), "--");
+        assert_eq!(country_text(None), t("peers.country_unknown"));
         assert_eq!(country_text(Some(*b"US")), "US");
     }
 
     #[test]
     fn preference_labels_match_the_four_choices() {
-        assert_eq!(preference_text(PeerPreference::Prefer), "Prefer");
-        assert_eq!(preference_text(PeerPreference::Normal), "Normal");
-        assert_eq!(preference_text(PeerPreference::Avoid), "Avoid");
-        assert_eq!(preference_text(PeerPreference::Block), "Block");
-        assert!(PREFERENCE_NOTE[1].contains("stall completion"));
+        assert_eq!(
+            preference_text(PeerPreference::Prefer),
+            t("peers.preference_prefer")
+        );
+        assert_eq!(
+            preference_text(PeerPreference::Normal),
+            t("peers.preference_normal")
+        );
+        assert_eq!(
+            preference_text(PeerPreference::Avoid),
+            t("peers.preference_avoid")
+        );
+        assert_eq!(
+            preference_text(PeerPreference::Block),
+            t("peers.preference_block")
+        );
+        assert_eq!(preference_note()[1], t("peers.note_block"));
     }
 }

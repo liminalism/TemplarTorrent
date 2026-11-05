@@ -1,0 +1,3 @@
+# The index is read with a fixed 3-byte stride (two letters and LF); never CRLF it.
+flags-4x3.txt text eol=lf
+flags-4x3.png binary

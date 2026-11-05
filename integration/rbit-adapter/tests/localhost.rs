@@ -135,8 +135,8 @@ fn build_fixture_files(specs: &[(String, usize)]) -> Fixture {
     for (index, (name, length)) in specs.iter().enumerate() {
         // Multi-file torrents root paths under the torrent name.
         assert_eq!(
-            files[index].0,
-            format!("localhost-fixture/{name}"),
+            std::path::Path::new(&files[index].0),
+            std::path::Path::new("localhost-fixture").join(name),
             "file {index} name mismatch"
         );
         assert_eq!(
@@ -1289,7 +1289,14 @@ fn job_files(fixture: &Fixture) -> Vec<(Vec<String>, u64)> {
     fixture
         .files
         .iter()
-        .map(|(path, length)| (path.split('/').map(str::to_string).collect(), *length))
+        .map(|(path, length)| {
+            (
+                path.split(std::path::is_separator)
+                    .map(str::to_string)
+                    .collect(),
+                *length,
+            )
+        })
         .collect()
 }
 

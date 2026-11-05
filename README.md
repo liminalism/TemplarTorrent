@@ -119,6 +119,10 @@ ln -s /path/to/GeoLite2-Country.mmdb ~/.local/share/templartorrent/
 GeoLite2 data is a MaxMind product under its own license and attribution
 terms; check them before redistributing any database file.
 
+Known countries also get a small flag beside the code, from an embedded
+atlas of the MIT-licensed lipis/flag-icons artwork (see
+`integration/templartorrent/assets/flags/`).
+
 ## Workspace
 
 | Crate | Role |

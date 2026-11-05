@@ -1,0 +1,16 @@
+# Development-only converter: renders icons/vector-detail.svg into the
+# multi-size Windows icon the client embeds as a resource. Not a member of the
+# root workspace and not linked by any shipped crate, so resvg never enters
+# the release dependency graph. See integration/templartorrent/assets/icon/.
+[package]
+name = "app-icon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+resvg = { version = "0.49", default-features = false }
+
+# Its own workspace, so the root workspace neither builds nor locks it.
+[workspace]

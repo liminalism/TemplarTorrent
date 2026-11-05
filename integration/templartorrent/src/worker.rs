@@ -13,11 +13,13 @@ use templartorrent_rbit_adapter::driver::{Driver, ExistingData, PeerEncryption};
 use templartorrent_rbit_adapter::http::{
     IDLE_TIMEOUT, UrlConfig, UrlDetail, UrlManager, UrlRecord,
 };
+use templartorrent_rbit_adapter::portmap;
 use tokio::sync::{mpsc, watch};
 
 use crate::geo::GeoDb;
 use crate::persist::{SessionStore, Settings};
 use crate::space;
+use crate::text::{t, tf};
 use crate::workflow;
 
 const QUEUE: usize = 64;
@@ -143,7 +145,7 @@ impl SessionView {
             files: Vec::new(),
             peers: Vec::new(),
             trackers: Vec::new(),
-            geo_status: "starting".into(),
+            geo_status: t("geo.starting").into(),
             elapsed_s: 0,
             acks: Vec::new(),
             allow_local_trackers: false,
@@ -153,7 +155,7 @@ impl SessionView {
             dht_nodes: None,
             encryption: PeerEncryption::default(),
             port_mapping: false,
-            port_mapping_status: "off".into(),
+            port_mapping_status: port_mapping_text(&portmap::Status::Off),
             url_detail: None,
             allow_local_urls: false,
         }
@@ -337,7 +339,7 @@ impl WorkerHandle {
                     .expect("current-thread runtime");
                 runtime.block_on(run_session(config, rx, stop_rx, shared));
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| tf("worker.thread_failed", &[("detail", &error)]))?;
         Ok(Self {
             tx,
             stop,
@@ -350,8 +352,8 @@ impl WorkerHandle {
 
     pub fn try_request(&self, request: Request) -> Result<(), &'static str> {
         self.tx.try_send(request).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => "command queue is full",
-            mpsc::error::TrySendError::Closed(_) => "session command channel is closed",
+            mpsc::error::TrySendError::Full(_) => t("status.queue_full"),
+            mpsc::error::TrySendError::Closed(_) => t("status.channel_closed"),
         })
     }
 
@@ -509,7 +511,7 @@ async fn run_session(
                         // Production only: loopback test sessions never
                         // contact the public DHT.
                         if let Err(error) = driver.enable_dht(bound.port()).await {
-                            memory.note = Some(format!("DHT unavailable: {}", error.0));
+                            memory.note = Some(tf("note.dht_unavailable", &[("detail", &error.0)]));
                         }
                     }
                     let urls = url_manager(&driver, config.allow_local_urls);
@@ -540,7 +542,7 @@ async fn run_session(
         && let Engine::Live { driver, .. } = &engine
         && let Err(error) = save_settings(driver, &memory)
     {
-        memory.note = Some(format!("session not saved: {error}"));
+        memory.note = Some(tf("note.session_not_saved", &[("detail", &error)]));
     }
     loop {
         if *stop.borrow() {
@@ -569,8 +571,20 @@ async fn run_session(
         match &mut engine {
             Engine::Live { driver, urls, .. } => {
                 urls.tick();
-                if let Err(error) = driver.step(Duration::from_millis(200)).await {
-                    memory.note = Some(error.0.to_string());
+                match driver.step(Duration::from_millis(200)).await {
+                    Ok(report) => {
+                        if let Some(store) = memory.store.as_ref() {
+                            for id in report.resolved {
+                                if let Err(error) = save_job(driver, store, id) {
+                                    memory.note =
+                                        Some(tf("note.session_not_saved", &[("detail", &error)]));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        memory.note = Some(tf("note.driver_error", &[("detail", &error.0)]));
+                    }
                 }
                 urls.tick();
                 // Names, sizes, completions and failures are saved as they
@@ -578,7 +592,7 @@ async fn run_session(
                 if let Some(store) = memory.store.as_ref()
                     && let Err(error) = save_urls(store, &urls.take_dirty())
                 {
-                    memory.note = Some(format!("URL records not saved: {error}"));
+                    memory.note = Some(tf("note.urls_not_saved", &[("detail", &error)]));
                 }
             }
             Engine::Down(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -597,11 +611,11 @@ async fn run_session(
         if let Some(store) = memory.store.as_ref()
             && let Err(error) = save_urls(store, &records)
         {
-            memory.note = Some(format!("URL records not saved: {error}"));
+            memory.note = Some(tf("note.urls_not_saved", &[("detail", &error)]));
         }
         driver.shutdown().await;
         if let Some(error) = flush_error {
-            memory.note = Some(format!("resume bitmap not saved: {error}"));
+            memory.note = Some(tf("note.resume_not_saved", &[("detail", &error)]));
         }
     }
 }
@@ -635,11 +649,11 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
             memory.port_mapping = settings.port_mapping;
             urls.set_max_active(settings.limits.download_jobs);
             if driver.set_limits(settings.limits).await.is_err() {
-                notes.push("saved limits were rejected".to_string());
+                notes.push(t("note.limits_rejected").to_string());
             }
         }
         Ok(None) => {}
-        Err(error) => notes.push(format!("settings not loaded: {error}")),
+        Err(error) => notes.push(tf("note.settings_not_loaded", &[("detail", &error)])),
     }
     let (records, errors) = store.load_jobs();
     let mut restored = 0usize;
@@ -649,7 +663,7 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
         let resume = match store.load_resume(&record.info_hash) {
             Ok(resume) => resume,
             Err(error) => {
-                notes.push(format!("resume bitmap ignored: {error}"));
+                notes.push(tf("note.resume_ignored", &[("detail", &error)]));
                 None
             }
         };
@@ -662,12 +676,12 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
                 if let Ok(scan) = driver.resume_scan(id)
                     && let Some(reason) = scan.note
                 {
-                    notes.push(format!("resume bitmap not trusted: {reason}"));
+                    notes.push(tf("note.resume_not_trusted", &[("detail", &reason)]));
                 }
             }
             Err(error) => {
                 skipped += 1;
-                first_skip.get_or_insert_with(|| format!("saved job skipped: {}", error.0));
+                first_skip.get_or_insert_with(|| tf("note.job_skipped", &[("detail", &error.0)]));
             }
         }
     }
@@ -681,19 +695,21 @@ async fn restore_session(engine: &mut Engine, memory: &mut Memory) {
             Ok(_) => restored += 1,
             Err(error) => {
                 skipped += 1;
-                first_skip.get_or_insert_with(|| format!("saved URL job skipped: {error}"));
+                first_skip.get_or_insert_with(|| tf("note.url_job_skipped", &[("detail", &error)]));
             }
         }
     }
-    if restored > 0 || skipped > 0 {
-        let mut note = format!("Restored {restored} saved job(s)");
-        if skipped > 0 {
-            note.push_str(&format!(
-                "; {skipped} skipped: {}",
-                first_skip.unwrap_or_default()
-            ));
-        }
-        notes.push(note);
+    if skipped > 0 {
+        notes.push(tf(
+            "note.restored_skipped",
+            &[
+                ("restored", &restored),
+                ("skipped", &skipped),
+                ("reason", &first_skip.unwrap_or_default()),
+            ],
+        ));
+    } else if restored > 0 {
+        notes.push(tf("note.restored", &[("restored", &restored)]));
     }
     if !notes.is_empty() {
         memory.note = Some(notes.join(". "));
@@ -709,11 +725,16 @@ async fn apply_port_mapping(engine: &mut Engine, memory: &mut Memory) {
     if !memory.port_mapping {
         driver.disable_port_mapping().await;
     } else if let Err(error) = driver.enable_port_mapping() {
-        memory.note = Some(format!("Port mapping unavailable: {}", error.0));
+        memory.note = Some(tf("note.port_mapping_unavailable", &[("detail", &error.0)]));
     }
 }
 
 fn save_job(driver: &mut Driver, store: &SessionStore, id: TorrentId) -> Result<(), String> {
+    // A magnet without metadata has no record yet; it is saved once its
+    // metadata is installed (`DriverReport::resolved`).
+    if driver.awaiting_metadata(id) {
+        return Ok(());
+    }
     let record = driver.export_job(id).map_err(|error| error.0.to_string())?;
     store.save_job(&record)?;
     match driver.export_resume(id) {
@@ -745,7 +766,7 @@ async fn maybe_flush_resumes(engine: &mut Engine, memory: &mut Memory) {
     if let Some(store) = memory.store.as_ref()
         && let Err(error) = save_urls(store, &changed)
     {
-        memory.note = Some(format!("URL records not saved: {error}"));
+        memory.note = Some(tf("note.urls_not_saved", &[("detail", &error)]));
     }
     let verified = driver
         .snapshot()
@@ -764,7 +785,7 @@ async fn maybe_flush_resumes(engine: &mut Engine, memory: &mut Memory) {
     };
     match saved {
         Ok(()) => memory.resume_verified = verified,
-        Err(error) => memory.note = Some(format!("resume bitmap not saved: {error}")),
+        Err(error) => memory.note = Some(tf("note.resume_not_saved", &[("detail", &error)])),
     }
 }
 
@@ -823,7 +844,7 @@ fn persist_after(
         Command::Reannounce { .. } | Command::Inspect { .. } | Command::Shutdown => Ok(()),
     };
     if let Err(error) = result {
-        memory.note = Some(format!("session not saved: {error}"));
+        memory.note = Some(tf("note.session_not_saved", &[("detail", &error)]));
     }
 }
 
@@ -886,7 +907,7 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
             dht_nodes: None,
             encryption: memory.encryption,
             port_mapping: memory.port_mapping,
-            port_mapping_status: "off".into(),
+            port_mapping_status: port_mapping_text(&portmap::Status::Off),
             url_detail: None,
             allow_local_urls: memory.allow_local_urls,
         },
@@ -949,7 +970,7 @@ fn capture(engine: &mut Engine, memory: &mut Memory, shared: &Shared) -> Session
                 dht_nodes: driver.dht_nodes(),
                 encryption: memory.encryption,
                 port_mapping: memory.port_mapping,
-                port_mapping_status: driver.port_mapping_status().describe(),
+                port_mapping_status: port_mapping_text(&driver.port_mapping_status()),
                 url_detail,
                 allow_local_urls: memory.allow_local_urls,
             }
@@ -1042,7 +1063,12 @@ fn tracker_rows(driver: &Driver, id: TorrentId) -> Vec<TrackerView> {
         .into_iter()
         .map(|tracker| TrackerView {
             label: tracker.label,
-            origin: tracker.origin.to_string(),
+            // The driver's origin is a token; the words come from the file.
+            origin: match tracker.origin {
+                "original" => t("trackers.origin_original").to_string(),
+                "added" => t("trackers.origin_added").to_string(),
+                other => other.to_string(),
+            },
             seeds: tracker.seeds,
             peers: tracker.peers,
             manual_due_s: tracker.manual_due_s,
@@ -1157,7 +1183,7 @@ async fn dispatch(
             if let Engine::Live { driver, .. } = engine {
                 driver.set_allow_local_trackers(allow);
                 if let Err(error) = save_settings(driver, memory) {
-                    memory.note = Some(format!("session not saved: {error}"));
+                    memory.note = Some(tf("note.session_not_saved", &[("detail", &error)]));
                 }
             }
             false
@@ -1167,7 +1193,7 @@ async fn dispatch(
             if let Engine::Live { driver, urls, .. } = engine {
                 urls.set_allow_local(allow);
                 if let Err(error) = save_settings(driver, memory) {
-                    memory.note = Some(format!("session not saved: {error}"));
+                    memory.note = Some(tf("note.session_not_saved", &[("detail", &error)]));
                 }
             }
             false
@@ -1177,7 +1203,7 @@ async fn dispatch(
             if let Engine::Live { driver, .. } = engine {
                 driver.set_peer_encryption(encryption);
                 if let Err(error) = save_settings(driver, memory) {
-                    memory.note = Some(format!("session not saved: {error}"));
+                    memory.note = Some(tf("note.session_not_saved", &[("detail", &error)]));
                 }
             }
             false
@@ -1188,7 +1214,7 @@ async fn dispatch(
             if let Engine::Live { driver, .. } = engine
                 && let Err(error) = save_settings(driver, memory)
             {
-                memory.note = Some(format!("session not saved: {error}"));
+                memory.note = Some(tf("note.session_not_saved", &[("detail", &error)]));
             }
             false
         }
@@ -1196,8 +1222,8 @@ async fn dispatch(
             memory.listen_port = port;
             if let Engine::Live { driver, .. } = engine {
                 memory.note = Some(match save_settings(driver, memory) {
-                    Ok(()) => format!("Listen port {port} applies after a restart."),
-                    Err(error) => format!("session not saved: {error}"),
+                    Ok(()) => tf("note.listen_port_restart", &[("port", &port)]),
+                    Err(error) => tf("note.session_not_saved", &[("detail", &error)]),
                 });
             }
             false
@@ -1222,36 +1248,48 @@ async fn run_command(
     torrent: Option<&[u8]>,
 ) -> Result<Option<TorrentId>, String> {
     let Engine::Live { driver, urls, .. } = engine else {
-        return Err("the session driver did not start".into());
+        return Err(t("worker.driver_not_started").into());
     };
+    // Text from the URL manager and the driver is wrapped in a client
+    // message, so the sentence around it comes from the messages file.
+    let url_failed = |error: String| tf("worker.url_add_failed", &[("detail", &error)]);
+    let failed = |error: String| tf("worker.command_failed", &[("detail", &error)]);
     match command {
         Command::AddUrl {
             url,
             destination,
             sha256,
-        } => return urls.add(url, destination, *sha256).await.map(Some),
+        } => {
+            return urls
+                .add(url, destination, *sha256)
+                .await
+                .map(Some)
+                .map_err(url_failed);
+        }
         Command::Pause(id) if UrlManager::is_url_id(*id) => {
-            return urls.pause(*id).await.map(|()| None);
+            return urls.pause(*id).await.map(|()| None).map_err(failed);
         }
         Command::Resume(id) if UrlManager::is_url_id(*id) => {
-            return urls.resume(*id).map(|()| None);
+            return urls.resume(*id).map(|()| None).map_err(failed);
         }
         Command::Retry(id) => {
             if !UrlManager::is_url_id(*id) {
-                return Err("only URL downloads can be retried".into());
+                return Err(t("worker.retry_url_only").into());
             }
-            return urls.retry(*id).map(|()| None);
+            return urls.retry(*id).map(|()| None).map_err(failed);
         }
         Command::Cancel(id) => {
             if !UrlManager::is_url_id(*id) {
-                return Err(
-                    "only URL downloads can be cancelled; pause the torrent instead".into(),
-                );
+                return Err(t("worker.cancel_url_only").into());
             }
-            return urls.cancel(*id).await.map(|()| None);
+            return urls.cancel(*id).await.map(|()| None).map_err(failed);
         }
         Command::Remove { id, delete_data } if UrlManager::is_url_id(*id) => {
-            return urls.remove(*id, *delete_data).await.map(|_| None);
+            return urls
+                .remove(*id, *delete_data)
+                .await
+                .map(|_| None)
+                .map_err(failed);
         }
         Command::SetLimits(limits) => urls.set_max_active(limits.download_jobs),
         _ => {}
@@ -1265,7 +1303,7 @@ async fn run_command(
             let existing = if destination.is_dir() {
                 ExistingData::Recheck
             } else if destination.exists() {
-                return Err("destination must be a directory".into());
+                return Err(t("worker.destination_not_dir").into());
             } else {
                 ExistingData::Refuse
             };
@@ -1274,19 +1312,20 @@ async fn run_command(
                     .add_torrent(bytes, destination, existing)
                     .await
                     .map(Some)
-                    .map_err(|error| error.0.to_string());
+                    .map_err(|error| tf("worker.add_failed", &[("detail", &error.0)]));
             }
+            // The job is listed at once, fetching metadata in the background;
+            // the step loop saves its record when the metadata is installed.
             return driver
-                .add_magnet_with_discovery(
+                .start_magnet_with_discovery(
                     source,
                     destination,
                     existing,
                     &[],
                     *public_magnet_bootstrap,
                 )
-                .await
                 .map(Some)
-                .map_err(|error| error.0.to_string());
+                .map_err(|error| tf("worker.add_failed", &[("detail", &error.0)]));
         }
         Command::Pause(id) => driver.pause(*id).await,
         Command::Resume(id) => driver.resume(*id).await,
@@ -1316,7 +1355,41 @@ async fn run_command(
             unreachable!("routed to the URL manager above")
         }
     };
-    outcome.map(|()| None).map_err(|error| error.0.to_string())
+    outcome
+        .map(|()| None)
+        .map_err(|error| failed(error.0.to_string()))
+}
+
+/// The router mapping state for the Settings dialog, without the external
+/// address. The method names are protocol names and stay as written.
+fn port_mapping_text(status: &portmap::Status) -> String {
+    match status {
+        portmap::Status::Off => t("settings.mapping_state_off").into(),
+        portmap::Status::Probing => t("settings.mapping_state_probing").into(),
+        portmap::Status::Mapped {
+            method,
+            port,
+            external,
+            ..
+        } => {
+            let method = match method {
+                portmap::Method::NatPmp => "NAT-PMP",
+                portmap::Method::Upnp => "UPnP",
+            };
+            let values: &[(&str, &dyn std::fmt::Display)] = &[("method", &method), ("port", port)];
+            let private = external.is_some_and(|address| {
+                !crate::geo::is_routable_ip(&std::net::IpAddr::V4(*address.ip()))
+            });
+            if private {
+                tf("settings.mapping_state_mapped_private", values)
+            } else {
+                tf("settings.mapping_state_mapped", values)
+            }
+        }
+        portmap::Status::Failed(reason) => {
+            tf("settings.mapping_state_failed", &[("detail", reason)])
+        }
+    }
 }
 
 fn push_ack(acks: &mut Vec<Ack>, ack: Ack) {
@@ -1327,7 +1400,7 @@ fn push_ack(acks: &mut Vec<Ack>, ack: Ack) {
 }
 
 fn list_dir(path: &Path) -> Result<Vec<String>, String> {
-    let read = std::fs::read_dir(path).map_err(|_| "could not read that folder".to_string())?;
+    let read = std::fs::read_dir(path).map_err(|_| t("add.browse_read_failed").to_string())?;
     let mut names = Vec::new();
     for entry in read {
         if names.len() == 200 {
@@ -1366,20 +1439,21 @@ fn read_torrent(path: &Path) -> Result<(String, Vec<u8>), String> {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"));
     if !torrent {
-        return Err("file name must end in .torrent".into());
+        return Err(t("add.torrent_extension").into());
     }
     use std::io::Read;
     let mut file =
-        std::fs::File::open(path).map_err(|_| "could not open the torrent file".to_string())?;
+        std::fs::File::open(path).map_err(|_| t("add.torrent_open_failed").to_string())?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "could not read the torrent file".to_string())?;
+        .map_err(|_| t("add.torrent_read_failed").to_string())?;
     if bytes.len() > 16 * 1024 * 1024 {
-        return Err("torrent file exceeds 16 MiB limit".into());
+        return Err(t("add.torrent_too_large").into());
     }
-    let magnet = Driver::magnet_from_torrent_bytes(&bytes).map_err(|error| error.0.to_string())?;
+    let magnet = Driver::magnet_from_torrent_bytes(&bytes)
+        .map_err(|error| tf("add.torrent_invalid", &[("detail", &error.0)]))?;
     Ok((magnet, bytes))
 }
 
@@ -1392,6 +1466,16 @@ mod tests {
     use super::*;
     use templartorrent_core::model::{InspectorTab, PeerPreference};
     use templartorrent_rbit_adapter::driver::JobRecord;
+
+    /// A message filled with `values`, cut before its first unfilled
+    /// placeholder: the fixed text a note starts with.
+    fn lead(key: &'static str, values: &[(&str, &dyn std::fmt::Display)]) -> String {
+        let text = tf(key, values);
+        match text.find('{') {
+            Some(end) => text[..end].to_string(),
+            None => text,
+        }
+    }
 
     fn rate_job(down_bps: u64) -> templartorrent_core::model::TorrentRow {
         templartorrent_core::model::TorrentRow {
@@ -1452,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_without_a_geo_database_reports_not_loaded() {
+    fn capture_without_a_user_geo_database_uses_the_bundled_one() {
         let mut memory = Memory {
             allow_local: false,
             allow_local_urls: false,
@@ -1483,7 +1567,7 @@ mod tests {
         let view = capture(&mut engine, &mut memory, &shared);
         assert!(view.peers.is_empty());
         assert!(
-            view.geo_status.contains("not loaded"),
+            view.geo_status.contains(crate::geo::BUNDLED_ATTRIBUTION),
             "{}",
             view.geo_status
         );
@@ -1576,6 +1660,106 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Add returns as soon as the magnet is admitted: the row is listed while
+    /// its tracker is still silent, and later commands are not held behind it.
+    #[test]
+    fn magnet_add_is_listed_at_once_and_does_not_block_other_commands() {
+        // A loopback "tracker" that accepts and never answers.
+        let tracker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tracker.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in tracker.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let destination = std::env::temp_dir().join(format!(
+            "templartorrent-worker-pending-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir(&destination);
+        let mut handle = WorkerHandle::start(WorkerConfig {
+            allow_local_trackers: true,
+            ..config()
+        })
+        .unwrap();
+        let magnet = format!(
+            "magnet:?xt=urn:btih:{}&dn=Pending%20Fixture&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
+            "ab".repeat(20)
+        );
+        let started = Instant::now();
+        handle
+            .try_request(Request::Command {
+                seq: 1,
+                command: Command::Add {
+                    source: magnet,
+                    destination: destination.clone(),
+                    public_magnet_bootstrap: false,
+                },
+            })
+            .unwrap();
+        let ack = handle.wait_ack(1, Duration::from_secs(5)).expect("add ack");
+        assert!(ack.accepted, "{}", ack.message);
+        // The tracker holds its announce for ANNOUNCE_TIMEOUT (10 s).
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let row = loop {
+            let view = handle.view();
+            if let Some(row) = view
+                .snapshot
+                .jobs
+                .iter()
+                .find(|job| &*job.name == "Pending Fixture")
+            {
+                break row.clone();
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "row not listed");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(row.state, JobState::Metadata);
+        assert_eq!(row.wanted_bytes, 0);
+        handle
+            .try_request(Request::Command {
+                seq: 2,
+                command: Command::SetLimits(Limits {
+                    download_jobs: 2,
+                    ..Limits::default()
+                }),
+            })
+            .unwrap();
+        let ack = handle
+            .wait_ack(2, Duration::from_secs(5))
+            .expect("limits ack");
+        assert!(ack.accepted, "{}", ack.message);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        handle
+            .try_request(Request::Command {
+                seq: 3,
+                command: Command::Remove {
+                    id: row.id,
+                    delete_data: true,
+                },
+            })
+            .unwrap();
+        let ack = handle
+            .wait_ack(3, Duration::from_secs(5))
+            .expect("remove ack");
+        assert!(ack.accepted, "{}", ack.message);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle
+            .view()
+            .snapshot
+            .jobs
+            .iter()
+            .any(|job| job.id == row.id)
+        {
+            assert!(Instant::now() < deadline, "removed row still listed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!destination.exists());
+        handle.shutdown();
+    }
+
     #[test]
     fn restores_saved_jobs_and_settings_then_removes_the_record() {
         let base = std::env::temp_dir().join(format!(
@@ -1661,8 +1845,11 @@ mod tests {
         assert_eq!(view.limits.download_jobs, 2);
         assert!(view.allow_local_trackers);
         let note = view.note.clone().unwrap();
-        assert!(note.contains("Restored 1"), "{note}");
-        assert!(note.contains("1 skipped"), "{note}");
+        let restored = lead(
+            "note.restored_skipped",
+            &[("restored", &1), ("skipped", &1)],
+        );
+        assert!(note.contains(&restored), "{note}");
         handle
             .try_request(Request::Command {
                 seq: 1,
@@ -1784,7 +1971,7 @@ mod tests {
                 && view
                     .note
                     .as_ref()
-                    .is_some_and(|note| note.contains("Restored"))
+                    .is_some_and(|note| note.contains(&tf("note.restored", &[("restored", &1)])))
             {
                 break view.note.unwrap();
             }
@@ -1796,7 +1983,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(
-            !note.contains("not trusted") && !note.contains("ignored"),
+            !note.contains(&lead("note.resume_not_trusted", &[]))
+                && !note.contains(&lead("note.resume_ignored", &[])),
             "{note}"
         );
         handle.shutdown();
@@ -2061,15 +2249,16 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        let refused = |view: &SessionView| {
-            view.port_mapping && view.port_mapping_status.starts_with("not mapped: ")
-        };
+        let failed = lead("settings.mapping_state_failed", &[]);
+        let refused =
+            |view: &SessionView| view.port_mapping && view.port_mapping_status.starts_with(&failed);
+        let off = t("settings.mapping_state_off");
         let mut handle = start_worker();
         let view = wait(&handle, &|view| {
             matches!(view.listen, ListenState::Bound(_))
         });
         assert!(!view.port_mapping, "off by default");
-        assert_eq!(view.port_mapping_status, "off");
+        assert_eq!(view.port_mapping_status, off);
         handle.try_request(Request::SetPortMapping(true)).unwrap();
         let view = wait(&handle, &refused);
         assert!(
@@ -2085,7 +2274,7 @@ mod tests {
         wait(&handle, &refused);
         handle.try_request(Request::SetPortMapping(false)).unwrap();
         wait(&handle, &|view| {
-            !view.port_mapping && view.port_mapping_status == "off"
+            !view.port_mapping && view.port_mapping_status == off
         });
         assert!(!store.load_settings().unwrap().unwrap().port_mapping);
         handle.shutdown();

@@ -120,3 +120,50 @@ No C, assembly or `-sys` crate enters the graph, and `cargo tree --workspace
 -i ring` still prints nothing. num-bigint is not constant-time; MSE is
 traffic obfuscation keyed by a public info hash, not confidentiality, so
 timing side channels on its ephemeral exponent are not a concern here.
+
+## Country flag graphics, 2026-11-05
+
+The Peers tab draws a flag beside each peer's country code from
+`integration/templartorrent/assets/flags/flags-4x3.png` (109,880 bytes, 256
+cells of 32x24) and its index `flags-4x3.txt`. The artwork is
+lipis/flag-icons 7.6.0, commit `ac7e0eb3259eb62aa6100c435607e2fe03896a97`,
+MIT, Copyright (c) 2013 Panayiotis Lipiridis; the notice is
+`assets/flags/LICENSE-flag-icons` and must accompany binary distributions.
+No runtime dependency is added: the client decodes the embedded PNG with
+`liminalkit_raster::png` and draws it with `Painter::draw_image`, and nothing
+is fetched at runtime. The SVGs are rasterised offline by
+`tools/flag-atlas`, its own Cargo workspace depending on `resvg` 0.49
+(no default features); no shipped crate depends on it, so the release graph
+does not change. Regeneration steps are in `assets/flags/README.md`. Flags
+are decoration only: the ISO code stays in the row text, and a code with no
+flag draws none.
+
+## Windows port additions, 2026-11-05
+
+No crate below is new to the lockfile unless stated; each was already in the
+graph through another dependency and is now named directly.
+
+- `windows-sys` 0.61.2 (Windows target only): storage identity and
+  delete-on-close (`templartorrent-storage`), free space, registry
+  registration, console attach, foreground and message box (client). Each
+  unsafe call carries a SAFETY comment; liminalkit stays free of unsafe.
+- `socket2` 0.6.5 (rbit-adapter): clears `IPV6_V6ONLY` so the `[::]`
+  listener accepts IPv4 peers on Windows.
+- `winit` 0.30 (client): names the window type passed to
+  `PixelApp::on_native_window`; the same version liminalkit-windowing uses.
+- `flate2` 1.1.10, build dependency of the client: inflates the bundled
+  country database at compile time. Not linked into the binary.
+- `rfd` 0.17.2, **new**, Windows target only, default features off: the
+  native folder and `.torrent` pickers (IFileOpenDialog). On Windows it
+  depends only on `log`, `raw-window-handle` and `windows-sys`, all already
+  present. Linux keeps the in-app browser, because rfd there needs GTK or an
+  XDG portal (zbus) stack. `block2` entered the lockfile for rfd's macOS
+  target only.
+- liminalkit-shell enables `arboard` (already its Linux clipboard crate) on
+  Windows without `image-data`; its Windows dependencies `clipboard-win` and
+  `error-code` were already in the lockfile.
+
+Bundled data: `integration/templartorrent/assets/geo/dbip-country-lite-2026-11.mmdb.gz`,
+DB-IP IP to Country Lite, CC BY 4.0. Attribution ("IP Geolocation by DB-IP")
+is shown in the Peers tab whenever it is in use. Details and checksum are in
+`assets/geo/README.md`.
