@@ -5,7 +5,7 @@ build {
     tool "akr 0.6.2"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:8010bb8c61b3af90fa30e8502cbc6d3770f18467ca89bceaf779b0515d9dd290"
+    source_graph "sha256:2d7452ad8f9d6966add3baea786b7350095ce230f2db44faba304b78cba9be1b"
 }
 
 source ".akr/project.akr" {
@@ -29,8 +29,8 @@ source ".akr/records/templartorrent/milestones.akr" {
 }
 
 source ".akr/records/templartorrent/observations.akr" {
-    hash "sha256:a499790549fd5d19a3c9f30295d69369fdacbd238058ad42311d4c1b0eb23e43"
-    records 21
+    hash "sha256:528c836ada5f4ce3d6381100498e47124d8c59a2b4ae6994e354a3579a33f828"
+    records 22
 }
 
 source ".akr/records/templartorrent/papercuts.akr" {
@@ -643,6 +643,12 @@ resolution @templartorrent.observation.complete-piece-status/16 {
 }
 
 resolution @templartorrent.observation.windows-network-defaults/1 {
+    slot derived_from
+    to @templartorrent.evidence.windows-port/1
+    hash "sha256:2d514e030347585532790269fbb0b1aa73b7f71cb771948958e82f0a18724f0a"
+}
+
+resolution @templartorrent.observation.windows-network-defaults/2 {
     slot derived_from
     to @templartorrent.evidence.windows-port/1
     hash "sha256:2d514e030347585532790269fbb0b1aa73b7f71cb771948958e82f0a18724f0a"
@@ -1489,8 +1495,13 @@ seal @templartorrent.observation.internet-download-stall/3 {
 }
 
 seal @templartorrent.observation.windows-network-defaults/1 {
+    state superseded
+    hash "sha256:9e0d6e1a8b2f2a2dd419076b7908359afeaba9802c1d2ef7439f7873fd896d6e"
+}
+
+seal @templartorrent.observation.windows-network-defaults/2 {
     state verified
-    hash "sha256:792cfb04af573363f718c34fae77f2e7bb1f6653a0604cb4b2abc7bc459c4c6a"
+    hash "sha256:811e33a9be1f46c9a5b2cad917fd7ee5a56fa10233744ca4fe4a7fc4b318de33"
 }
 
 seal @templartorrent.papercut.a-multi-file-patch-for-allocation-telemetry/1 {
