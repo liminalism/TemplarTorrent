@@ -31,7 +31,8 @@ bounded payload, command acknowledgment and foreground activation.
   forwarder calls `AllowSetForegroundWindow` and the running window restores and
   raises itself.
 - Clipboard: Ctrl+V uses liminalkit-shell's Windows backend (arboard /
-  clipboard-win), on liminalkit branch `windows-clipboard`.
+  clipboard-win), in liminalkit `f0ea79c` and later; the client follows
+  liminalkit's default branch.
 
 No registry script is supplied that would point at a nonexistent production binary.
 Implement association install/uninstall transactionally in the packaging stage;

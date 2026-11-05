@@ -9,6 +9,8 @@ license.workspace = true
 templartorrent-core = { path = "../../crates/templartorrent-core" }
 templartorrent-storage = { path = "../../crates/templartorrent-storage" }
 templartorrent-rbit-adapter = { path = "../rbit-adapter" }
+# liminalkit's default branch, unpinned: `cargo update` takes its newest
+# commit. The Windows text clipboard (Ctrl+V) needs f0ea79c or later.
 liminalkit-raster = { git = "https://github.com/liminalism/liminalkit" }
 liminalkit-shell = { git = "https://github.com/liminalism/liminalkit" }
 liminalkit-text = { git = "https://github.com/liminalism/liminalkit" }
